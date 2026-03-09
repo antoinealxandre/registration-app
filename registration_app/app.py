@@ -140,73 +140,71 @@ def catmull_rom_chain(points: list, n_interp: int = 8) -> list:
     return result
 
 
-def _project_stl_to_pyvista(
-    points_xyz: np.ndarray,
-    ct_affine: np.ndarray,
-    voxel_mm: np.ndarray,
-    ap_axis: int,
+def _render_stl_mask(
+    mesh_points: np.ndarray,    # (N, 3) coordonnées monde en mm
+    mesh_faces: np.ndarray,     # (F, 3) indices de sommets (int)
+    inv_ct_affine: np.ndarray,  # inverse de l'affine NIfTI du CT
+    ct_shape: tuple,            # forme du volume CT (nx, ny, nz)
+    ap_axis: int,               # axe antéro-postérieur dans l'espace voxel
     lao_deg: float,
     cran_deg: float,
     output_size: int,
-    reg_result: dict,
 ) -> np.ndarray:
     """
-    Projette le maillage STL (coordonnées mm monde, RAS/LPS) en espace PyVista
-    aligné sur la fluoroscopie.
+    Projette un maillage STL en masque binaire 2D (float32) dans le MÊME
+    espace pixel que generate_drr / project_mask_3d.
 
-    Pipeline identique à generate_drr / project_mask_3d :
-      1. STL world mm → voxel ijk via inv(ct_affine)   ← corrige tous les flips
-      2. Rotations C-arm
-      3. col = vox_keep0 * mm0,  row = -vox_keep1 * mm1  (équiv. flipud(proj.T))
-      4. Scale + transform DRR→fluoro
+    Pipeline :
+      1. World mm → voxel ijk  (via inv_ct_affine)
+      2. Centrage sur le milieu du volume CT
+         (scipy.ndimage.rotate pivote autour du centre du tableau)
+      3. Rotations C-arm identiques à project_mask_3d
+      4. Projection 2D :
+             col = (v_keep0 / n_keep0 + 0.5) * output_size
+             row = (0.5  - v_keep1 / n_keep1) * output_size
+         Ce mapping est la forme fermée de :
+             zoom(integral, (ratio,1)) → .T → flipud → cv2.resize
+      5. Rastérisation des triangles (cv2.fillPoly)
+
+    Retourne : float32 (output_size, output_size) — 0/1.
+    Ne tient PAS compte du recalage (appliquer apply_full_transform ensuite).
     """
-    # 1. World mm → voxel ijk (même espace que le DRR)
-    inv_aff = np.linalg.inv(ct_affine)
-    pts = points_xyz.astype(np.float64)
-    pts_h = np.hstack([pts, np.ones((len(pts), 1))])
-    pts = (inv_aff @ pts_h.T).T[:, :3]          # (N,3) voxel ijk
-    pts -= pts.mean(axis=0, keepdims=True)
+    # 1. World mm → voxel ijk
+    pts_h = np.hstack([mesh_points.astype(np.float64),
+                       np.ones((len(mesh_points), 1))])
+    vox = (inv_ct_affine @ pts_h.T).T[:, :3]
 
-    # 2. Rotations C-arm (même ordre/axes que scipy.ndimage.rotate dans generate_drr)
+    # 2. Centrage sur le volume CT
+    ct_center = (np.asarray(ct_shape[:3], np.float64) - 1.0) / 2.0
+    vox -= ct_center
+
+    # 3. Rotations C-arm
     if abs(lao_deg) > 1e-6:
-        a = np.deg2rad(lao_deg); c, s = np.cos(a), np.sin(a)
-        pts = pts @ np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], np.float64).T
+        a = np.deg2rad(lao_deg); cc, ss = np.cos(a), np.sin(a)
+        vox = vox @ np.array([[cc, -ss, 0.0],
+                               [ss,  cc, 0.0],
+                               [0.0, 0.0, 1.0]], np.float64).T
     if abs(cran_deg) > 1e-6:
-        a = np.deg2rad(cran_deg); c, s = np.cos(a), np.sin(a)
-        pts = pts @ np.array([[1, 0, 0], [0, c, -s], [0, s, c]], np.float64).T
+        a = np.deg2rad(cran_deg); cc, ss = np.cos(a), np.sin(a)
+        vox = vox @ np.array([[1.0, 0.0,  0.0],
+                               [0.0,  cc, -ss],
+                               [0.0,  ss,  cc]], np.float64).T
 
-    # 3. Projection 2D identique à np.flipud(integral.T)
-    #    integral = vol.sum(axis=ap_axis)  shape (n_keep0, n_keep1)
-    #    integral.T    shape (n_keep1, n_keep0)  → rows=keep1, cols=keep0
-    #    flipud        images row 0 = max keep1 index  →  row = -keep1
+    # 4. Projection 2D
     keep = [i for i in range(3) if i != ap_axis]
-    col = pts[:, keep[0]] * float(voxel_mm[keep[0]])   # mm, axe horizontal
-    row = -pts[:, keep[1]] * float(voxel_mm[keep[1]])  # mm, axe vertical inversé
+    n0 = float(ct_shape[keep[0]])
+    n1 = float(ct_shape[keep[1]])
+    col = (vox[:, keep[0]] / n0 + 0.5) * output_size
+    row = (0.5 - vox[:, keep[1]] / n1) * output_size
 
-    xy = np.column_stack([col, row])
-    mn, mx = xy.min(axis=0), xy.max(axis=0)
-    span = np.maximum(mx - mn, 1e-6)
-    s2d = (output_size - 1) * 0.92 / float(max(span[0], span[1]))
-    xy = (xy - mn) * s2d + output_size * 0.04
+    # 5. Rastérisation des triangles
+    pts2d = np.column_stack([col, row]).astype(np.float32)
+    canvas = np.zeros((output_size, output_size), np.uint8)
+    for face in mesh_faces:
+        tri = pts2d[face].astype(np.int32).reshape(1, 3, 2)
+        cv2.fillPoly(canvas, tri, 1)
 
-    # 4. Transform DRR → Fluoroscopie
-    a = np.deg2rad(reg_result['angle']); c, s = np.cos(a), np.sin(a)
-    sc = reg_result.get('scale', 1.0)
-    cx, cy = float(reg_result['center'][0]), float(reg_result['center'][1])
-    x, y = xy[:, 0] - cx, xy[:, 1] - cy
-    xf = sc * (c * x - s * y) + cx + reg_result['tx']
-    yf = sc * (s * x + c * y) + cy + reg_result['ty']
-
-    # 5. Profondeur AP : même échelle que X,Y, centrée, devant le plan fluoro
-    depth_mm = pts[:, ap_axis] * float(voxel_mm[ap_axis])
-    z = depth_mm * s2d * sc
-    z = (z - z.mean()) + output_size * 0.30
-
-    # 6. Flip X uniquement : corrige le miroir gauche/droite du STL
-    #    (le recalage 2D est correct, seul l'axe X est inversé dans l'espace PyVista)
-    xf = (output_size - 1) - xf
-
-    return np.column_stack([xf, yf, z]).astype(np.float32)
+    return canvas.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -937,70 +935,152 @@ _SEG_PALETTE = [
 ]
 
 class SegOverlayWindow(QDialog):
-    """Fenêtre dédiée : fluoroscopie recalée + segmentations CT projetées, toggle par structure."""
+    """Fenêtre optimisée : fluoroscopie recalée + segmentations, contrôles avancés."""
 
     def __init__(self, fluoro: np.ndarray, proj_masks: dict, result: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Segmentations 2D — Vue fluoroscopie recalée')
-        self.resize(720, 820)
+        self.resize(1200, 800)
         self.setStyleSheet(STYLE)
         self._fluoro = np.clip(fluoro, 0, 1).astype(np.float32)
         self._proj_masks = proj_masks
         self._result = result
-        self._alpha = 0.40
+        self._alpha_global = 0.40
+        self._alpha_per_struct = {}
+        self._zoom = 1.0
+        self._pan_x, self._pan_y = 0, 0
         names = list(proj_masks.keys())
         self._colors = {n: _SEG_PALETTE[i % len(_SEG_PALETTE)] for i, n in enumerate(names)}
         self._chks: dict = {}
+        self._opacity_sliders = {}
+        self._line_width = 2
+        self._full_image = None  # Cache pour les rendus sans zoom/pan
         self._build_ui()
         self._render()
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8); root.setSpacing(6)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8); root.setSpacing(10)
 
-        # Image
-        self._lbl = QLabel()
-        self._lbl.setAlignment(Qt.AlignCenter)
-        self._lbl.setMinimumSize(512, 512)
-        self._lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._lbl.setStyleSheet(f'background:{DARK_BG};border-radius:4px;')
-        root.addWidget(self._lbl, 1)
+        # ── Panneau gauche : image ────────────────────────────────────────────
+        left = QVBoxLayout()
+        self._img_label = QLabel()
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setMinimumSize(480, 480)
+        self._img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._img_label.setStyleSheet(f'background:{DARK_BG};border-radius:4px;border:2px solid {BORDER};')
+        self._img_label.wheelEvent = self._wheel_zoom
+        self._img_label.mousePressEvent = self._pan_start
+        self._img_label.mouseMoveEvent = self._pan_move
+        self._img_label.mouseReleaseEvent = self._pan_end
+        self._pan_active = False
+        self._pan_start_pos = None
+        left.addWidget(self._img_label, 1)
 
-        # Alpha slider
-        row_a = QHBoxLayout()
-        row_a.addWidget(QLabel('Transparence :'))
+        # Zoom + reset
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel('Zoom :'))
+        self._zoom_slider = QSlider(Qt.Horizontal); self._zoom_slider.setRange(50, 400); self._zoom_slider.setValue(100)
+        self._zoom_slider.valueChanged.connect(lambda v: (setattr(self, '_zoom', v/100), self._render()))
+        zoom_row.addWidget(self._zoom_slider)
+        self._lbl_zoom = QLabel('100%'); self._lbl_zoom.setMinimumWidth(40)
+        zoom_row.addWidget(self._lbl_zoom)
+        btn_rst = QPushButton('Réinitialiser'); btn_rst.clicked.connect(self._reset_view)
+        zoom_row.addWidget(btn_rst)
+        left.addLayout(zoom_row)
+
+        # ── Panneau droit : contrôles et structures ────────────────────────────
+        right = QVBoxLayout()
+
+        # Transparence globale
+        trans_grp = QGroupBox('Affichage global')
+        trans_l = QVBoxLayout(trans_grp)
+        hrow = QHBoxLayout()
+        hrow.addWidget(QLabel('Transparence :'))
         sl_a = QSlider(Qt.Horizontal); sl_a.setRange(0, 100); sl_a.setValue(40)
-        sl_a.valueChanged.connect(lambda v: (setattr(self, '_alpha', v/100), self._render()))
-        row_a.addWidget(sl_a)
-        root.addLayout(row_a)
+        sl_a.valueChanged.connect(lambda v: (setattr(self, '_alpha_global', v/100), self._render()))
+        hrow.addWidget(sl_a)
+        trans_l.addLayout(hrow)
 
-        # Checkboxes panel
-        grp = QGroupBox('STRUCTURES — activer / désactiver')
-        grp_l = QVBoxLayout(grp)
+        # Épaisseur contours
+        lw_row = QHBoxLayout()
+        lw_row.addWidget(QLabel('Épaisseur contours :'))
+        sl_lw = QSlider(Qt.Horizontal); sl_lw.setRange(1, 8); sl_lw.setValue(2)
+        sl_lw.valueChanged.connect(lambda v: (setattr(self, '_line_width', v), self._render()))
+        lw_row.addWidget(sl_lw)
+        trans_l.addLayout(lw_row)
 
+        trans_grp.setMaximumHeight(90)
+        right.addWidget(trans_grp)
+
+        # Structures avec checkboxes, couleurs et sliders d'opacité
+        struct_grp = QGroupBox('STRUCTURES')
+        struct_l = QVBoxLayout(struct_grp)
+
+        # All / None buttons
         hdr = QHBoxLayout()
         btn_all  = QPushButton('Toutes');  btn_all.clicked.connect(self._select_all)
         btn_none = QPushButton('Aucune');  btn_none.clicked.connect(self._select_none)
         hdr.addWidget(btn_all); hdr.addWidget(btn_none); hdr.addStretch()
-        grp_l.addLayout(hdr)
+        struct_l.addLayout(hdr)
 
-        # Scroll area for many structures
+        # Scroll area pour les structures
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(220); scroll.setStyleSheet(f'background:{PANEL_BG};border:none;')
+        scroll.setStyleSheet(f'QScrollArea{{background:{PANEL_BG};border:none;}}')
         inner = QWidget(); inner.setStyleSheet(f'background:{PANEL_BG};')
-        gl = QGridLayout(inner); gl.setSpacing(4)
+        inner_l = QVBoxLayout(inner); inner_l.setSpacing(6); inner_l.setContentsMargins(4,4,4,4)
 
-        for i, name in enumerate(self._proj_masks.keys()):
+        for name in self._proj_masks.keys():
             r, g, b = self._colors[name]
-            chk = QCheckBox(name); chk.setChecked(True)
-            chk.setStyleSheet(f'QCheckBox{{color: rgb({r},{g},{b});}}')
+            row = QHBoxLayout(); row.setSpacing(4)
+            
+            # Checkbox
+            chk = QCheckBox(); chk.setChecked(True)
             chk.toggled.connect(self._render)
             self._chks[name] = chk
-            gl.addWidget(chk, i // 2, i % 2)
+            row.addWidget(chk)
 
+            # Swatch couleur
+            swatch = QLabel()
+            swatch.setFixedSize(20, 20)
+            swatch.setStyleSheet(f'background:rgb({r},{g},{b});border-radius:3px;border:1px solid white;')
+            row.addWidget(swatch)
+
+            # Nom
+            lbl_name = QLabel(name); lbl_name.setMinimumWidth(80)
+            row.addWidget(lbl_name)
+
+            # Opacité per-struct
+            sl_op = QSlider(Qt.Horizontal); sl_op.setRange(0, 100); sl_op.setValue(100)
+            sl_op.setMaximumWidth(80)
+            sl_op.valueChanged.connect(lambda v, n=name: (
+                self._alpha_per_struct.__setitem__(n, v/100), self._render()))
+            self._opacity_sliders[name] = sl_op
+            self._alpha_per_struct[name] = 1.0
+            row.addWidget(sl_op)
+
+            lbl_pct = QLabel('100%'); lbl_pct.setMinimumWidth(30); lbl_pct.setAlignment(Qt.AlignRight)
+            row.addWidget(lbl_pct)
+            sl_op.valueChanged.connect(lambda v, lp=lbl_pct: lp.setText(f'{v}%'))
+
+            row.addStretch()
+            inner_l.addLayout(row)
+
+        inner_l.addStretch()
         scroll.setWidget(inner)
-        grp_l.addWidget(scroll)
-        root.addWidget(grp)
+        struct_l.addWidget(scroll)
+        right.addWidget(struct_grp)
+
+        # Boutons d'action
+        btn_row = QHBoxLayout()
+        btn_export = QPushButton('Exporter'); btn_export.clicked.connect(self._export_image)
+        btn_close = QPushButton('Fermer'); btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_export); btn_row.addWidget(btn_close)
+        right.addLayout(btn_row)
+
+        # Layout principal
+        root.addLayout(left, 2)
+        root.addLayout(right, 1)
 
     def _select_all(self):
         for chk in self._chks.values(): chk.setChecked(True)
@@ -1008,7 +1088,42 @@ class SegOverlayWindow(QDialog):
     def _select_none(self):
         for chk in self._chks.values(): chk.setChecked(False)
 
+    def _wheel_zoom(self, e):
+        delta = e.angleDelta().y()
+        if delta > 0: self._zoom = min(self._zoom * 1.1, 4.0)
+        else: self._zoom = max(self._zoom / 1.1, 0.5)
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(int(self._zoom * 100))
+        self._zoom_slider.blockSignals(False)
+        self._render()
+        e.accept()
+
+    def _pan_start(self, e):
+        self._pan_active = True
+        self._pan_start_pos = (e.x(), e.y())
+
+    def _pan_move(self, e):
+        if not self._pan_active or self._pan_start_pos is None: return
+        dx = (e.x() - self._pan_start_pos[0]) * 0.5
+        dy = (e.y() - self._pan_start_pos[1]) * 0.5
+        self._pan_x += dx
+        self._pan_y += dy
+        self._pan_start_pos = (e.x(), e.y())
+        self._render()
+
+    def _pan_end(self, e):
+        self._pan_active = False
+
+    def _reset_view(self):
+        self._zoom = 1.0
+        self._pan_x, self._pan_y = 0, 0
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.blockSignals(False)
+        self._render()
+
     def _render(self):
+        S = int(self._fluoro.shape[0])
         fl = (self._fluoro * 255).astype(np.uint8)
         rgb = cv2.cvtColor(fl, cv2.COLOR_GRAY2RGB).astype(np.float32)
 
@@ -1017,21 +1132,54 @@ class SegOverlayWindow(QDialog):
                 continue
             warped = apply_full_transform(mask.astype(np.float32), self._result)
             r, g, b = self._colors[name]
+            struct_alpha = self._alpha_per_struct.get(name, 1.0)
             ov = rgb.copy(); ov[warped > 0.5] = [r, g, b]
-            rgb = cv2.addWeighted(rgb, 1 - self._alpha, ov, self._alpha, 0)
+            blend_alpha = self._alpha_global * struct_alpha
+            rgb = cv2.addWeighted(rgb, 1 - blend_alpha, ov, blend_alpha, 0)
+            
+            # Contours
             m8 = (warped * 255).astype(np.uint8)
             cnts, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             rgb8 = np.clip(rgb, 0, 255).astype(np.uint8)
-            cv2.drawContours(rgb8, cnts, -1, (r, g, b), 2)
+            cv2.drawContours(rgb8, cnts, -1, (r, g, b), self._line_width, lineType=cv2.LINE_AA)
             rgb = rgb8.astype(np.float32)
 
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-        lw = max(16, self._lbl.width()); lh = max(16, self._lbl.height())
-        side = min(lw, lh)
-        rgb_r = cv2.resize(rgb, (side, side), interpolation=cv2.INTER_LINEAR)
+        self._full_image = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        # Appliquer zoom et pan
+        h, w = self._full_image.shape[:2]
+        if abs(self._zoom - 1.0) > 0.01 or abs(self._pan_x) > 0.5 or abs(self._pan_y) > 0.5:
+            M = cv2.getRotationMatrix2D((w*0.5, h*0.5), 0, self._zoom)
+            M[0, 2] += self._pan_x
+            M[1, 2] += self._pan_y
+            rgb_t = cv2.warpAffine(self._full_image, M, (w, h),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=(20,20,46))
+        else:
+            rgb_t = self._full_image
+
+        # Affichage dans le label
+        lw = max(48, self._img_label.width()); lh = max(48, self._img_label.height())
+        rgb_r = cv2.resize(rgb_t, (lw, lh), interpolation=cv2.INTER_LINEAR)
         h2, w2 = rgb_r.shape[:2]
         qi = QImage(rgb_r.data, w2, h2, w2 * 3, QImage.Format_RGB888)
-        self._lbl.setPixmap(QPixmap.fromImage(qi).copy())
+        self._img_label.setPixmap(QPixmap.fromImage(qi).copy())
+
+        # Mettre à jour l'affichage du zoom
+        self._lbl_zoom.setText(f'{self._zoom*100:.0f}%')
+
+    def _export_image(self):
+        if self._full_image is None: return
+        p, _ = QFileDialog.getSaveFileName(
+            self, 'Exporter image', '',
+            'PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tiff)')
+        if not p: return
+        try:
+            rgb_bgr = cv2.cvtColor(self._full_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(p, rgb_bgr)
+            QMessageBox.information(self, 'Export', f'Sauvegardé :\n{p}')
+        except Exception as ex:
+            QMessageBox.warning(self, 'Erreur', f'Export échoué : {ex}')
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._render()
@@ -1688,68 +1836,19 @@ class MainWindow(QMainWindow):
         self.result_panel.set_data(fig_fl, fig_drr_reg, contours)
 
     def open_overlay(self):
-        """Affiche le STL recalé sur la fluoroscopie dans une fenêtre PyVista.
-        Projection directe (instantanée) — même géométrie que le DRR.
-        """
-        if self.result is None:       self._err('Lancez d\'abord le recalage'); return
-        if self.fluoro_image is None: self._err('Aucune fluoroscopie chargée'); return
-        if not self.full_stl_path:   self._err('Chargez un STL d\'abord'); return
-        if pv is None:               self._err('pyvista non installé (pip install pyvista)'); return
+        """Ouvre la fenêtre 2D d'analyse des segmentations recalées."""
+        if self.result is None:
+            self._err('Lancez d\'abord le recalage'); return
+        if self.fluoro_image is None:
+            self._err('Aucune fluoroscopie chargée'); return
+        if not self.proj_masks:
+            self._err('Aucune segmentation projetée — générez le DRR et annotez'); return
         try:
-            # ── 1. Lire le maillage ───────────────────────────────────────────
-            mesh = pv.read(self.full_stl_path).triangulate().clean()
-            if mesh.n_points == 0: raise ValueError('STL vide ou invalide')
-
-            # ── 2. Projeter le STL en espace PyVista aligné sur la fluoro ────
-            if self.ct_aff is None:
-                raise RuntimeError('CT non chargé — impossible de projeter le STL')
-            mesh.points = _project_stl_to_pyvista(
-                mesh.points,
-                ct_affine=self.ct_aff,
-                voxel_mm=self.voxel_mm,
-                ap_axis=self.ap_axis,
-                lao_deg=self.sp_lao.value(),
-                cran_deg=self.sp_cran.value(),
-                output_size=self.sp_size.value(),
-                reg_result=self.result,
-            )
-
-            # ── 3. Texture fluoroscopie (VTK : rangée 0 = bas → rangée 0 numpy
-            #       apparaît en haut avec up=(0,-1,0) )
-            fl = np.clip(self.fluoro_image, 0, 1)
-            h, w = fl.shape[:2]
-            tex = pv.numpy_to_texture(
-                cv2.cvtColor((fl * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
-            )
-
-            # ── 4. Plan portant la texture (Z=0) ─────────────────────────────
-            plane = pv.Plane(
-                center=(w * 0.5, h * 0.5, 0.0),
-                direction=(0, 0, 1),
-                i_size=float(w), j_size=float(h),
-                i_resolution=1, j_resolution=1,
-            )
-
-            # ── 5. Rendu PyVista ──────────────────────────────────────────────
-            pl = pv.Plotter(window_size=(960, 960),
-                            title='Fluoroscopie + STL recalé')
-            pl.add_mesh(plane, texture=tex, lighting=False)
-            pl.add_mesh(mesh, color='tomato', opacity=0.45, smooth_shading=True)
-            pl.add_axes()
-            pl.enable_parallel_projection()
-            # Caméra au-dessus (Z+), up=(0,-1,0) : coordonnées image = coordonnées monde
-            pl.camera_position = [
-                (w * 0.5, h * 0.5, max(w, h) * 2.5),
-                (w * 0.5, h * 0.5, 0.0),
-                (0.0, -1.0, 0.0),
-            ]
-            self._status(f'PyVista ouvert — '
-                         f'tx={self.result["tx"]:+.1f} ty={self.result["ty"]:+.1f} '
-                         f'θ={self.result["angle"]:+.2f}° s={self.result.get("scale",1):.3f}')
-            pl.show()
+            win = SegOverlayWindow(self.fluoro_image, self.proj_masks, self.result, parent=self)
+            win.exec_()
         except Exception as ex:
             import traceback
-            self._err(f'PyVista échoué : {ex}\n{traceback.format_exc()}')
+            self._err(f'Fenêtre échouée : {ex}\n{traceback.format_exc()}')
 
     def export_results(self):
         if self.result is None: self._err('Lancez d\'abord le recalage'); return
