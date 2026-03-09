@@ -1,0 +1,11 @@
+numpy
+nibabel
+scipy
+opencv-python
+scikit-image
+matplotlib
+PyQt5
+pyqtgraph
+SimpleITK
+pandas
+pyvista

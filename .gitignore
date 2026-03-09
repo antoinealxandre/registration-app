@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project outputs and local data
+data/
+outputs/
+script/
+registration_app/__pycache__/
+
+# Medical imaging / heavy binaries
+*.nii
+*.nii.gz
+*.nrrd
+*.dcm
+*.stl
+*.vtk
+*.vtp
+*.mhd
+*.raw
