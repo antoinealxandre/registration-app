@@ -9,12 +9,11 @@ import numpy as np
 import cv2
 import nibabel as nib
 import pandas as pd
-from skimage import measure
 
 try:
-    import pyvista as pv
-except Exception:
-    pv = None
+    import pydicom
+except ImportError:
+    pydicom = None
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -140,73 +139,6 @@ def catmull_rom_chain(points: list, n_interp: int = 8) -> list:
     return result
 
 
-def _render_stl_mask(
-    mesh_points: np.ndarray,    # (N, 3) coordonnées monde en mm
-    mesh_faces: np.ndarray,     # (F, 3) indices de sommets (int)
-    inv_ct_affine: np.ndarray,  # inverse de l'affine NIfTI du CT
-    ct_shape: tuple,            # forme du volume CT (nx, ny, nz)
-    ap_axis: int,               # axe antéro-postérieur dans l'espace voxel
-    lao_deg: float,
-    cran_deg: float,
-    output_size: int,
-) -> np.ndarray:
-    """
-    Projette un maillage STL en masque binaire 2D (float32) dans le MÊME
-    espace pixel que generate_drr / project_mask_3d.
-
-    Pipeline :
-      1. World mm → voxel ijk  (via inv_ct_affine)
-      2. Centrage sur le milieu du volume CT
-         (scipy.ndimage.rotate pivote autour du centre du tableau)
-      3. Rotations C-arm identiques à project_mask_3d
-      4. Projection 2D :
-             col = (v_keep0 / n_keep0 + 0.5) * output_size
-             row = (0.5  - v_keep1 / n_keep1) * output_size
-         Ce mapping est la forme fermée de :
-             zoom(integral, (ratio,1)) → .T → flipud → cv2.resize
-      5. Rastérisation des triangles (cv2.fillPoly)
-
-    Retourne : float32 (output_size, output_size) — 0/1.
-    Ne tient PAS compte du recalage (appliquer apply_full_transform ensuite).
-    """
-    # 1. World mm → voxel ijk
-    pts_h = np.hstack([mesh_points.astype(np.float64),
-                       np.ones((len(mesh_points), 1))])
-    vox = (inv_ct_affine @ pts_h.T).T[:, :3]
-
-    # 2. Centrage sur le volume CT
-    ct_center = (np.asarray(ct_shape[:3], np.float64) - 1.0) / 2.0
-    vox -= ct_center
-
-    # 3. Rotations C-arm
-    if abs(lao_deg) > 1e-6:
-        a = np.deg2rad(lao_deg); cc, ss = np.cos(a), np.sin(a)
-        vox = vox @ np.array([[cc, -ss, 0.0],
-                               [ss,  cc, 0.0],
-                               [0.0, 0.0, 1.0]], np.float64).T
-    if abs(cran_deg) > 1e-6:
-        a = np.deg2rad(cran_deg); cc, ss = np.cos(a), np.sin(a)
-        vox = vox @ np.array([[1.0, 0.0,  0.0],
-                               [0.0,  cc, -ss],
-                               [0.0,  ss,  cc]], np.float64).T
-
-    # 4. Projection 2D
-    keep = [i for i in range(3) if i != ap_axis]
-    n0 = float(ct_shape[keep[0]])
-    n1 = float(ct_shape[keep[1]])
-    col = (vox[:, keep[0]] / n0 + 0.5) * output_size
-    row = (0.5 - vox[:, keep[1]] / n1) * output_size
-
-    # 5. Rastérisation des triangles
-    pts2d = np.column_stack([col, row]).astype(np.float32)
-    canvas = np.zeros((output_size, output_size), np.uint8)
-    for face in mesh_faces:
-        tri = pts2d[face].astype(np.int32).reshape(1, 3, 2)
-        cv2.fillPoly(canvas, tri, 1)
-
-    return canvas.astype(np.float32)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Zone de depot (Drag & Drop)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,7 +150,7 @@ class DropZone(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setMinimumHeight(70)
-        self._lbl = QLabel('Deposer vos fichiers ici\nCT / Segmentation / Images / STL')
+        self._lbl = QLabel('Deposer vos fichiers ici\nCT / Segmentation / Images')
         self._lbl.setAlignment(Qt.AlignCenter)
         self._lbl.setWordWrap(True)
         lay = QVBoxLayout(self)
@@ -295,6 +227,10 @@ class CollapsibleSection(QWidget):
         self._open = not self._open
         self._arrow.setText(self._arrow_char())
         self._update_visibility()
+
+    def set_open(self, opened: bool):
+        if self._open != opened:
+            self.toggle()
 
     def _update_visibility(self):
         self._content.setVisible(self._open)
@@ -455,7 +391,7 @@ class AnnotationCanvas(QLabel):
         self._img_np  = None
         self._size    = 512
         self._masks   = {k: None for k in STRUCT}
-        self._active  = 'heart'
+        self._active  = 'vertebrae'
         self._history = {k: [] for k in STRUCT}
 
         self._tool    = 'pencil'
@@ -500,6 +436,23 @@ class AnnotationCanvas(QLabel):
             if m is None or m.sum()==0: continue
             out=m.copy() if out is None else np.clip(out+m,0,1)
         return out
+
+    def set_mask(self, struct: str, mask: np.ndarray):
+        """Injecte un masque externe (ex: projection CT) dans un slot de structure."""
+        if struct not in self._masks:
+            return
+        s = self._size
+        if mask.shape != (s, s):
+            mask = cv2.resize(mask.astype(np.float32), (s, s), interpolation=cv2.INTER_LINEAR)
+        mask = (mask > 0.5).astype(np.float32)
+        # Push current state to history for this struct
+        cur = self._masks[struct]
+        if cur is not None:
+            h = self._history[struct]; h.append(cur.copy())
+            if len(h) > 30: h.pop(0)
+        self._masks[struct] = mask
+        self._refresh()
+        self.mask_updated.emit()
 
     def undo(self):
         h=self._history[self._active]
@@ -881,31 +834,45 @@ class WorkerThread(QThread):
             import traceback; self.error.emit(f'{ex}\n{traceback.format_exc()}')
 
     def _drr(self):
-        self.progress.emit(10,'Génération DRR…')
-        ct_vol = self.kw['ct_vol']
-        ap_ax  = self.kw['ap_axis']
-        # Slab AP : permet de cibler vertèbres ou cœur selon profondeur
-        slab_c = self.kw.get('slab_c', 50.0) / 100.0
-        slab_w = self.kw.get('slab_w', 100.0) / 100.0
-        n = ct_vol.shape[ap_ax]
-        c_idx = int(n * slab_c)
-        half  = max(1, int(n * slab_w / 2))
-        s0, s1 = max(0, c_idx - half), min(n, c_idx + half)
-        sl = [slice(None)] * 3; sl[ap_ax] = slice(s0, s1)
-        ct_slab = ct_vol[tuple(sl)]
-        drr=generate_drr(ct_slab, self.kw['voxel_mm'], ap_axis=ap_ax,
-                          lao_deg=self.kw['lao_deg'],cran_deg=self.kw['cran_deg'],
-                          output_size=self.kw['output_size'],hu_min=-500,hu_max=2000,invert=True)
-        self.progress.emit(60,'Projection segmentations…')
-        masks_out={}
-        for name,mask in self.kw.get('masks',{}).items():
-            if mask is None or mask.sum()==0: continue
-            mask_slab = mask[tuple(sl)]
-            if mask_slab.sum()==0: continue
-            masks_out[name]=project_mask_3d(mask_slab,self.kw['voxel_mm'],ap_axis=ap_ax,
-                                             lao_deg=self.kw['lao_deg'],cran_deg=self.kw['cran_deg'],
-                                             output_size=self.kw['output_size'])
-        self.progress.emit(100,'DRR prêt'); self.result.emit({'drr':drr,'masks':masks_out})
+        def pcb(pct, msg):
+            self.progress.emit(pct, msg)
+
+        pcb(5, 'Génération DRR (DiffDRR cone-beam)…')
+        ct_path = self.kw['ct_path']
+        renderer = self.kw.get('renderer', 'siddon')
+        drr = generate_drr(
+            ct_path=ct_path,
+            lao_deg=self.kw['lao_deg'],
+            cran_deg=self.kw['cran_deg'],
+            table_angle=self.kw.get('table_angle', 0.0),
+            output_size=self.kw['output_size'],
+            sid_mm=self.kw.get('sid_mm', 1020.0),
+            sod_mm=self.kw.get('sod_mm', 510.0),
+            fov_mm=self.kw.get('fov_mm'),
+            renderer=renderer,
+            progress_cb=pcb,
+        )
+        pcb(80, 'Projection segmentations…')
+        masks_out = {}
+        ct_aff = self.kw.get('ct_aff')
+        for name, mask in self.kw.get('masks', {}).items():
+            if mask is None or mask.sum() == 0:
+                continue
+            masks_out[name] = project_mask_3d(
+                mask_3d=mask,
+                ct_affine=ct_aff,
+                ct_path=ct_path,
+                lao_deg=self.kw['lao_deg'],
+                cran_deg=self.kw['cran_deg'],
+                table_angle=self.kw.get('table_angle', 0.0),
+                output_size=self.kw['output_size'],
+                sid_mm=self.kw.get('sid_mm', 1020.0),
+                sod_mm=self.kw.get('sod_mm', 510.0),
+                fov_mm=self.kw.get('fov_mm'),
+                renderer=renderer,
+            )
+        pcb(100, 'DRR prêt')
+        self.result.emit({'drr': drr, 'masks': masks_out})
 
     def _reg(self):
         elastic = self.kw.get('elastic', False)
@@ -1186,6 +1153,278 @@ class SegOverlayWindow(QDialog):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Lecture DICOM fluoroscopie — extraction des paramètres géométriques
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_dicom_fluoro(path: str):
+    """
+    Lit un DICOM de fluoroscopie (XA mono ou multi-frames) et extrait les
+    paramètres géométriques complets du C-arm.
+
+    Retourne (img_uint8, meta) avec meta contenant :
+        lao, cran       – angles positionneur [deg]
+        sid_mm, sod_mm  – distances source-détecteur / source-patient [mm]
+        magnification   – facteur de grossissement (SID/SOD)
+        pixel_mm        – ImagerPixelSpacing [mm/px]
+        fov_mm          – champ de vue à l'isocentre [mm]
+        fov_dim_mm      – (float,float) FieldOfViewDimensions au détecteur [mm]
+        intensifier_mm  – IntensifierSize [mm]
+        table_angle     – angle de la table [deg]
+        arm_l, arm_p, arm_c – angles bras L/P/C (tags GE privés)
+        patient_pos     – PatientPosition (HFS, FFS, …)
+        shutter         – dict (left,right,upper,lower) bords du shutter [px]
+        collimator      – dict (left,right,upper,lower) bords du collimateur [px]
+        fov_shape        – forme du FOV (RECTANGLE, ROUND, …)
+        fov_origin       – (int,int) FieldOfViewOrigin [px]
+        rows, cols, n_frames, frame_used
+        manufacturer, model
+    """
+    if pydicom is None:
+        raise RuntimeError('pydicom non disponible — installez-le : pip install pydicom')
+
+    ds = pydicom.dcmread(path)
+    arr = ds.pixel_array  # (frames, H, W) ou (H, W)
+
+    # ── Sélection de la frame (multi-frame XA) ────────────────────────────
+    if arr.ndim == 3:
+        n_frames = arr.shape[0]
+        rep = int(getattr(ds, 'RepresentativeFrameNumber', (n_frames + 1) // 2))
+        frame_idx = max(0, min(rep - 1, n_frames - 1))  # 1-based → 0-based
+        frame = arr[frame_idx].astype(np.float32)
+    else:
+        n_frames, frame_idx = 1, 0
+        frame = arr.astype(np.float32)
+
+    # ── Normalisation ────────────────────────────────────────────────────────
+    fmin, fmax = frame.min(), frame.max()
+    if fmax > fmin:
+        frame = (frame - fmin) / (fmax - fmin)
+    img_uint8 = (frame * 255).astype(np.uint8)
+
+    # ── Helper lecture tags ───────────────────────────────────────────────────
+    def _get(tag, default):
+        val = getattr(ds, tag, None)
+        if val is None:
+            return default
+        try:
+            v = float(str(val).split('\\')[0])
+            return v
+        except Exception:
+            return default
+
+    def _get_str(tag, default=''):
+        val = getattr(ds, tag, None)
+        return str(val).strip() if val is not None else default
+
+    def _get_multi(tag):
+        """Retourne une liste de floats depuis un tag DS multi-value."""
+        val = getattr(ds, tag, None)
+        if val is None:
+            return None
+        try:
+            return [float(v) for v in str(val).split('\\')]
+        except Exception:
+            return None
+
+    def _get_private(group, elem, default=None):
+        """Lit un tag privé (ex: [0019,1001])."""
+        try:
+            de = ds[group, elem]
+            return float(de.value)
+        except Exception:
+            return default
+
+    # ── Angles positionneur ──────────────────────────────────────────────────
+    lao  = _get('PositionerPrimaryAngle',   0.0)
+    cran = _get('PositionerSecondaryAngle', 0.0)
+
+    # ── Distances et grossissement ───────────────────────────────────────────
+    sid  = _get('DistanceSourceToDetector', 1000.0)
+    sod  = _get('DistanceSourceToPatient',  750.0)
+    mag  = _get('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
+
+    # ── Pixel spacing ────────────────────────────────────────────────────────
+    ips = _get_multi('ImagerPixelSpacing')
+    pixel_mm = ips[0] if ips else 0.2
+
+    # ── Dimensions détecteur / FOV ───────────────────────────────────────────
+    rows = int(getattr(ds, 'Rows', img_uint8.shape[0]))
+    cols = int(getattr(ds, 'Columns', img_uint8.shape[1]))
+    fov_dim = _get_multi('FieldOfViewDimensions')           # au détecteur
+    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    intensifier_mm = _get('IntensifierSize', 0.0)
+    fov_shape = _get_str('FieldOfViewShape', '')
+    fov_origin_raw = _get_multi('FieldOfViewOrigin')
+    fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
+
+    # Champ de vue à l'isocentre (corrigé du grossissement)
+    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+
+    # ── Table ────────────────────────────────────────────────────────────────
+    table_angle = _get('TableAngle', 0.0)
+
+    # ── Angles bras (tags privés GE) ─────────────────────────────────────────
+    arm_l = _get_private(0x0019, 0x1001, None)
+    arm_p = _get_private(0x0019, 0x1002, None)
+    arm_c = _get_private(0x0019, 0x1003, None)
+
+    # ── Patient position ─────────────────────────────────────────────────────
+    patient_pos = _get_str('PatientPosition', 'HFS')
+
+    # ── Shutter / Collimateur ────────────────────────────────────────────────
+    shutter = {
+        'left':  int(_get('ShutterLeftVerticalEdge',  0)),
+        'right': int(_get('ShutterRightVerticalEdge', cols)),
+        'upper': int(_get('ShutterUpperHorizontalEdge', 0)),
+        'lower': int(_get('ShutterLowerHorizontalEdge', rows)),
+    }
+    collimator = {
+        'left':  int(_get('CollimatorLeftVerticalEdge',  0)),
+        'right': int(_get('CollimatorRightVerticalEdge', cols)),
+        'upper': int(_get('CollimatorUpperHorizontalEdge', 0)),
+        'lower': int(_get('CollimatorLowerHorizontalEdge', rows)),
+    }
+
+    # ── Fabricant / Modèle ───────────────────────────────────────────────────
+    manufacturer = _get_str('Manufacturer', '')
+    model = _get_str('ManufacturerModelName', '')
+
+    meta = dict(
+        lao=lao, cran=cran,
+        sid_mm=sid, sod_mm=sod,
+        magnification=mag,
+        pixel_mm=pixel_mm,
+        fov_mm=fov_mm,
+        fov_dim_mm=fov_dim_mm,
+        intensifier_mm=intensifier_mm,
+        fov_shape=fov_shape,
+        fov_origin=fov_origin,
+        table_angle=table_angle,
+        arm_l=arm_l, arm_p=arm_p, arm_c=arm_c,
+        patient_pos=patient_pos,
+        shutter=shutter,
+        collimator=collimator,
+        rows=rows, cols=cols,
+        n_frames=n_frames, frame_used=frame_idx + 1,
+        manufacturer=manufacturer, model=model,
+    )
+    return img_uint8, meta
+
+
+def read_metadata_csv(path: str):
+    """
+    Lit un CSV de métadonnées DICOM exporté par 3D Slicer
+    (colonnes : Tag, Name, Value, VR, Length).
+    Retourne un dict compatible avec read_dicom_fluoro.meta.
+    """
+    import re as _re
+    df = pd.read_csv(path)
+    # Si le header ressemble à un tag DICOM, le CSV n'a pas d'en-tête → re-lire
+    if _re.match(r'\[?[0-9a-fA-F]{8}\]?$', str(df.columns[0]).strip()):
+        df = pd.read_csv(path, header=None,
+                         names=['Tag', 'Name', 'Value', 'VR', 'Length'][:None])
+        # Ajuster si le nombre de colonnes diffère
+        if len(df.columns) < 3:
+            raise ValueError(f'CSV metadata : au moins 3 colonnes attendues, {len(df.columns)} trouvées')
+    # Normalise les noms de colonnes
+    cols_lower = {c.strip().lower(): c for c in df.columns}
+    name_col = cols_lower.get('name', cols_lower.get('keyword', df.columns[1]))
+    val_col  = cols_lower.get('value', df.columns[2])
+
+    lookup = {}
+    for _, row in df.iterrows():
+        key = str(row[name_col]).strip()
+        val = str(row[val_col]).strip()
+        if key:
+            lookup[key] = val
+
+    def _f(key, default=0.0):
+        v = lookup.get(key)
+        if v is None:
+            return default
+        try:
+            return float(v.split('\\')[0].split(',')[0].strip())
+        except Exception:
+            return default
+
+    def _flist(key):
+        v = lookup.get(key)
+        if v is None:
+            return None
+        try:
+            parts = v.replace('\\', ',').split(',')
+            return [float(p.strip()) for p in parts if p.strip()]
+        except Exception:
+            return None
+
+    lao  = _f('PositionerPrimaryAngle', 0.0)
+    cran = _f('PositionerSecondaryAngle', 0.0)
+    sid  = _f('DistanceSourceToDetector', 1000.0)
+    sod  = _f('DistanceSourceToPatient', 750.0)
+    mag  = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
+
+    ips = _flist('ImagerPixelSpacing')
+    pixel_mm = ips[0] if ips else 0.2
+
+    rows = int(_f('Rows', 1000))
+    cols = int(_f('Columns', 1000))
+    fov_dim = _flist('FieldOfViewDimensions')
+    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    intensifier_mm = _f('IntensifierSize', 0.0)
+
+    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+
+    table_angle = _f('TableAngle', 0.0)
+    arm_l = _f('AngleValueLArm', None) if 'AngleValueLArm' in lookup else None
+    arm_p = _f('AngleValuePArm', None) if 'AngleValuePArm' in lookup else None
+    arm_c = _f('AngleValueCArm', None) if 'AngleValueCArm' in lookup else None
+
+    patient_pos = lookup.get('PatientPosition', 'HFS')
+
+    shutter = {
+        'left':  int(_f('ShutterLeftVerticalEdge', 0)),
+        'right': int(_f('ShutterRightVerticalEdge', cols)),
+        'upper': int(_f('ShutterUpperHorizontalEdge', 0)),
+        'lower': int(_f('ShutterLowerHorizontalEdge', rows)),
+    }
+    collimator = {
+        'left':  int(_f('CollimatorLeftVerticalEdge', 0)),
+        'right': int(_f('CollimatorRightVerticalEdge', cols)),
+        'upper': int(_f('CollimatorUpperHorizontalEdge', 0)),
+        'lower': int(_f('CollimatorLowerHorizontalEdge', rows)),
+    }
+
+    n_frames = int(_f('NumberOfFrames', 1))
+    frame_used = int(_f('RepresentativeFrameNumber', (n_frames + 1) // 2))
+
+    manufacturer = lookup.get('Manufacturer', '')
+    model = lookup.get('ManufacturerModelName', '')
+    fov_shape = lookup.get('FieldOfViewShape', '')
+    fov_origin_raw = _flist('FieldOfViewOrigin')
+    fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
+
+    return dict(
+        lao=lao, cran=cran,
+        sid_mm=sid, sod_mm=sod,
+        magnification=mag,
+        pixel_mm=pixel_mm,
+        fov_mm=fov_mm,
+        fov_dim_mm=fov_dim_mm,
+        intensifier_mm=intensifier_mm,
+        fov_shape=fov_shape,
+        fov_origin=fov_origin,
+        table_angle=table_angle,
+        arm_l=arm_l, arm_p=arm_p, arm_c=arm_c,
+        patient_pos=patient_pos,
+        shutter=shutter,
+        collimator=collimator,
+        rows=rows, cols=cols,
+        n_frames=n_frames, frame_used=frame_used,
+        manufacturer=manufacturer, model=model,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Fenêtre principale
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1196,9 +1435,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1280, 800)
         self.setStyleSheet(STYLE)
         self.ct_vol = self.voxel_mm = self.ct_aff = None
+        self.ct_path = None
         self.ap_axis = 1
         self.seg_masks = {}; self.proj_masks = {}; self.drr_image = None
-        self.full_stl_path = ''; self.full_stl_name = ''
+        self.dicom_meta = {}
         self.fluoro_image = None; self.result = None
         self._loaded_images = []; self._pending_csv = None
         self._build_ui()
@@ -1265,10 +1505,10 @@ class MainWindow(QMainWindow):
 
         self.lbl_ct = QLabel('CT : --'); self.lbl_ct.setObjectName('dim'); self.lbl_ct.setWordWrap(True)
         self.lbl_seg = QLabel('Seg : --'); self.lbl_seg.setObjectName('dim'); self.lbl_seg.setWordWrap(True)
-        self.lbl_stl = QLabel('STL : --'); self.lbl_stl.setObjectName('dim'); self.lbl_stl.setWordWrap(True)
+        self.lbl_fluoro_meta = QLabel('Fluoro : --'); self.lbl_fluoro_meta.setObjectName('dim'); self.lbl_fluoro_meta.setWordWrap(True)
         sec_data.addWidget(self.lbl_ct)
         sec_data.addWidget(self.lbl_seg)
-        sec_data.addWidget(self.lbl_stl)
+        sec_data.addWidget(self.lbl_fluoro_meta)
         ll.addWidget(sec_data)
 
         # ── IMAGES ────────────────────────────────────────────────────────────
@@ -1285,7 +1525,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(self._sec_images)
 
         # ── PARAMETRES DRR ────────────────────────────────────────────────────
-        sec_drr = CollapsibleSection('PARAMETRES DRR', starts_open=False)
+        self.sec_drr = sec_drr = CollapsibleSection('PARAMETRES DRR', starts_open=False)
         drr_grid = QWidget(); drr_grid.setStyleSheet('background:transparent;')
         gdl = QGridLayout(drr_grid)
         gdl.setContentsMargins(0, 0, 0, 0); gdl.setSpacing(5)
@@ -1295,21 +1535,17 @@ class MainWindow(QMainWindow):
             l = QLabel(t); l.setObjectName('mid'); return l
 
         gdl.addWidget(_lbl('LAO/RAO (deg)'), 0, 0)
-        self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-90, 90); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(5)
+        self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-90, 90); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
         gdl.addWidget(self.sp_lao, 0, 1)
         gdl.addWidget(_lbl('Cran/Caud (deg)'), 1, 0)
-        self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-45, 45); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(5)
+        self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-45, 45); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
         gdl.addWidget(self.sp_cran, 1, 1)
-        gdl.addWidget(_lbl('Resolution (px)'), 2, 0)
-        self.sp_size = QSpinBox(); self.sp_size.setRange(256, 1024); self.sp_size.setValue(512); self.sp_size.setSingleStep(64)
-        gdl.addWidget(self.sp_size, 2, 1)
-        gdl.addWidget(_lbl('Centre slab (%)'), 3, 0)
-        self.sp_slab_c = QDoubleSpinBox(); self.sp_slab_c.setRange(5, 95); self.sp_slab_c.setValue(50); self.sp_slab_c.setSingleStep(5); self.sp_slab_c.setSuffix(' %')
-        gdl.addWidget(self.sp_slab_c, 3, 1)
-        gdl.addWidget(_lbl('Epaisseur slab (%)'), 4, 0)
-        self.sp_slab_w = QDoubleSpinBox(); self.sp_slab_w.setRange(5, 100); self.sp_slab_w.setValue(100); self.sp_slab_w.setSingleStep(5); self.sp_slab_w.setSuffix(' %')
-        gdl.addWidget(self.sp_slab_w, 4, 1)
-
+        gdl.addWidget(_lbl('Table (deg)'), 2, 0)
+        self.sp_table = QDoubleSpinBox(); self.sp_table.setRange(-45, 45); self.sp_table.setValue(0); self.sp_table.setSingleStep(0.5)
+        gdl.addWidget(self.sp_table, 2, 1)
+        gdl.addWidget(_lbl('Resolution (px)'), 3, 0)
+        self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
+        gdl.addWidget(self.sp_size, 3, 1)
         sec_drr.addWidget(drr_grid)
         self.btn_drr = QPushButton('Generer DRR'); self.btn_drr.setObjectName('primary')
         self.btn_drr.clicked.connect(self.generate_drr); self.btn_drr.setEnabled(False)
@@ -1319,23 +1555,16 @@ class MainWindow(QMainWindow):
         # ── ANNOTATION ────────────────────────────────────────────────────────
         sec_ann = CollapsibleSection('ANNOTATION', starts_open=True)
 
-        r0 = QHBoxLayout(); r0.setSpacing(6); r0.setContentsMargins(0, 0, 0, 0)
-        r0.addWidget(_lbl('Structure :'))
-        self.cb_struct = QComboBox()
-        for k, info in STRUCT.items():
-            self.cb_struct.addItem(info['label'], k)
-        self.cb_struct.setCurrentIndex(1)
-        self.cb_struct.currentIndexChanged.connect(self._on_struct)
-        r0.addWidget(self.cb_struct, 1)
-        sec_ann.addLayout(r0)
+        hint_wf = QLabel('➤ DRR : contours vertebres auto-injectes depuis la segmentation CT\n➤ Fluoroscopie : annoter manuellement les vertebres visibles')
+        hint_wf.setObjectName('dim'); hint_wf.setWordWrap(True)
+        sec_ann.addWidget(hint_wf)
 
-        r1 = QHBoxLayout(); r1.setSpacing(6); r1.setContentsMargins(0, 0, 0, 0)
-        r1.addWidget(_lbl('Annoter :'))
-        self.cb_canvas = QComboBox()
-        self.cb_canvas.addItems(['Image fixe', 'Image mobile'])
-        self.cb_canvas.currentIndexChanged.connect(self._on_canvas)
-        r1.addWidget(self.cb_canvas, 1)
-        sec_ann.addLayout(r1)
+        self.chk_use_seg = QCheckBox('Utiliser la segmentation CT (contours auto sur DRR)')
+        self.chk_use_seg.setChecked(True)
+        self.chk_use_seg.setToolTip(
+            'Coche : les masques de segmentation 3D sont auto-projetes sur le DRR apres generation.\n'
+            'Decoche : le DRR est genere vierge, annoter manuellement les vertebres.')
+        sec_ann.addWidget(self.chk_use_seg)
 
         tr = QHBoxLayout(); tr.setSpacing(6); tr.setContentsMargins(0, 0, 0, 0)
         self.btn_pencil = QPushButton('Crayon'); self.btn_pencil.setObjectName('tool'); self.btn_pencil.setCheckable(True); self.btn_pencil.setChecked(True)
@@ -1368,14 +1597,6 @@ class MainWindow(QMainWindow):
 
         # ── RECALAGE ──────────────────────────────────────────────────────────
         sec_reg = CollapsibleSection('RECALAGE', starts_open=True)
-        sec_reg.addWidget(_lbl('Structures pour le recalage :'))
-        self.chk_structs = {}
-        for k, info in STRUCT.items():
-            chk = QCheckBox(info['label']); chk.setChecked(k in ('heart', 'vertebrae'))
-            chk.setStyleSheet(f'QCheckBox{{color:{info["hex"]};}}'
-                              f'QCheckBox::indicator{{width:13px;height:13px;border:1px solid {BORDER2};border-radius:3px;background:{CARD_BG};}}'
-                              f'QCheckBox::indicator:checked{{background:{info["hex"]};border-color:{info["hex"]};}}')
-            self.chk_structs[k] = chk; sec_reg.addWidget(chk)
 
         self.btn_reg = QPushButton('Lancer le recalage'); self.btn_reg.setObjectName('success')
         self.btn_reg.setEnabled(False); self.btn_reg.clicked.connect(self.run_registration)
@@ -1425,12 +1646,6 @@ class MainWindow(QMainWindow):
         # ── ACTIONS ──────────────────────────────────────────────────────────
         sec_act = CollapsibleSection('ACTIONS', starts_open=True)
 
-        self.btn_overlay = QPushButton('Vue 3D (STL)')
-        self.btn_overlay.setObjectName('primary')
-        self.btn_overlay.setEnabled(False)
-        self.btn_overlay.clicked.connect(self.open_overlay)
-        sec_act.addWidget(self.btn_overlay)
-
         self.btn_seg_overlay = QPushButton('Segmentations 2D')
         self.btn_seg_overlay.setObjectName('primary')
         self.btn_seg_overlay.setEnabled(False)
@@ -1460,7 +1675,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.result_panel, 'Resultat')
 
         for cv in [self.cv_fl, self.cv_drr]:
-            cv.set_tool('pencil'); cv.set_active('heart')
+            cv.set_tool('pencil'); cv.set_active('vertebrae')
 
         root.addWidget(self.tabs, 1)
         self.setStatusBar(QStatusBar())
@@ -1482,11 +1697,6 @@ class MainWindow(QMainWindow):
                'rectangle':'Cliquer-glisser pour dessiner un rectangle'}
         self._status(hints.get(tool,''))
 
-    def _on_struct(self,idx):
-        k=self.cb_struct.itemData(idx)
-        for cv in [self.cv_fl,self.cv_drr]: cv.set_active(k)
-
-    def _on_canvas(self,idx): self.tabs.setCurrentIndex(idx)
     def _on_pen(self,v): self.lbl_pen.setText(f'{v}px'); [cv.set_pen_radius(v) for cv in [self.cv_fl,self.cv_drr]]
     def _undo(self): self._active_cv().undo()
     def _clear_all(self): self._active_cv().clear_all()
@@ -1497,7 +1707,7 @@ class MainWindow(QMainWindow):
         p,_=QFileDialog.getSaveFileName(self,'Sauvegarder','mask.png','PNG (*.png)')
         if p: cv2.imwrite(p,(m*255).astype(np.uint8)); self._status(f'Masque sauvegardé → {p}')
 
-    def _active_cv(self): return self.cv_fl if self.cb_canvas.currentIndex()==0 else self.cv_drr
+    def _active_cv(self): return self.cv_fl if self.tabs.currentIndex()==0 else self.cv_drr
 
     def _on_mask_upd(self):
         has_fl  = self.cv_fl.get_mask()  is not None and self.cv_fl.get_mask().sum()  > 0
@@ -1509,16 +1719,44 @@ class MainWindow(QMainWindow):
     def _on_files_dropped(self, files):
         csv_files = []
         nifti_files = []
+        meta_csv_files = []
         other_files = []
         for f in files:
             ext = os.path.splitext(f)[1].lower()
             if f.lower().endswith('.nii.gz') or ext == '.nii':
                 nifti_files.append(f)
             elif ext == '.csv':
-                csv_files.append(f)
+                # Distinguer les CSV de labels (segmentation) des CSV de métadonnées DICOM
+                try:
+                    df_peek = pd.read_csv(f, nrows=5)
+                    cols_lower = [c.strip().lower() for c in df_peek.columns]
+                    # Heuristique : colonnes nommées tag/vr OU contenu 1ère colonne = tags DICOM
+                    is_meta = 'tag' in cols_lower or 'vr' in cols_lower
+                    if not is_meta:
+                        import re
+                        first_vals = df_peek.iloc[:, 0].astype(str).tolist()
+                        col0_name = str(df_peek.columns[0]).strip()
+                        all_vals = [col0_name] + first_vals
+                        if any(re.match(r'\[?[0-9a-fA-F]{8}\]?$', v.strip()) for v in all_vals):
+                            is_meta = True
+                    if is_meta:
+                        meta_csv_files.append(f)
+                    else:
+                        csv_files.append(f)
+                except Exception:
+                    csv_files.append(f)
             else:
                 other_files.append(f)
         csv_path = csv_files[0] if csv_files else self._pending_csv
+        # Charger les métadonnées DICOM depuis CSV si présent
+        if meta_csv_files:
+            try:
+                meta = read_metadata_csv(meta_csv_files[0])
+                self.dicom_meta = meta
+                self._apply_dicom_meta(meta)
+                self._status(f'Metadonnees DICOM chargees depuis CSV : {os.path.basename(meta_csv_files[0])}')
+            except Exception as ex:
+                self._err(f'Lecture CSV metadonnees echouee : {ex}')
         def is_seg(fp):
             n = os.path.basename(fp).lower()
             return any(kw in n for kw in ('seg', 'label', 'mask'))
@@ -1533,18 +1771,20 @@ class MainWindow(QMainWindow):
             self._pending_csv = csv_path
         for f in other_files:
             ext = os.path.splitext(f)[1].lower()
-            if ext == '.stl':
-                self.load_full_stl(f)
-            elif ext in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.dcm'):
+            if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.dcm'):
+                self._add_image(f)
+            elif ext == '':
+                # Fichier sans extension — probablement un DICOM (IM0, IM1…)
                 self._add_image(f)
         self._status(f'{len(files)} fichier(s) charge(s)')
 
     def _on_browse(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, 'Selectionner des fichiers', '',
-            'Tous (*.nii *.nii.gz *.csv *.stl *.png *.jpg *.jpeg *.bmp *.tiff *.tif *.dcm);;'
+            'Tous (*.nii *.nii.gz *.csv *.png *.jpg *.jpeg *.bmp *.tiff *.tif *.dcm *);;'
             'NIfTI (*.nii *.nii.gz);;Images (*.png *.jpg *.jpeg *.tiff *.bmp *.dcm);;'
-            'CSV (*.csv);;STL (*.stl)')
+            'DICOM (*.dcm *);;'
+            'CSV labels/meta (*.csv)')
         if files:
             self._on_files_dropped(files)
 
@@ -1556,7 +1796,11 @@ class MainWindow(QMainWindow):
                 df = pd.read_csv(csv_path)
                 c = df.columns.tolist()
                 for _, row in df.iterrows():
-                    idx = int(row[c[0]]); name = str(row[c[1]]).strip()
+                    try:
+                        idx = int(row[c[0]])
+                    except (ValueError, TypeError):
+                        continue  # skip non-integer rows (metadata CSV loaded by mistake)
+                    name = str(row[c[1]]).strip()
                     if not name or idx == 0: continue
                     m = (sv == idx).astype(np.uint8)
                     if m.sum() == 0: continue
@@ -1581,26 +1825,24 @@ class MainWindow(QMainWindow):
                 return
         ext = os.path.splitext(path)[1].lower()
         img = None
-        if ext == '.dcm':
+        dicom_meta = None
+        # Tenter DICOM pour .dcm ou fichiers sans extension (ex: IM0)
+        is_dicom_ext = ext == '.dcm' or ext == ''
+        if is_dicom_ext and pydicom is not None:
             try:
-                import pydicom
-                ds = pydicom.dcmread(path)
-                arr = ds.pixel_array.astype(np.float32)
-                arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-                img = (arr * 255).astype(np.uint8)
+                img, dicom_meta = read_dicom_fluoro(path)
                 if img.ndim == 3:
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            except Exception as ex:
-                self._err(f'Lecture DICOM echouee : {ex}'); return
-        else:
+            except Exception:
+                img = None  # fallback to cv2
+        if img is None:
             img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             self._err(f'Impossible de charger : {name}'); return
-        s = self.sp_size.value()
-        img = cv2.resize(img, (s, s), interpolation=cv2.INTER_LANCZOS4)
         img_float = img.astype(np.float32) / 255.0
         idx = len(self._loaded_images)
-        entry = {'path': path, 'name': name, 'array': img_float, 'role': None, 'card': None}
+        entry = {'path': path, 'name': name, 'array': img_float, 'role': None, 'card': None,
+                 'dicom_meta': dicom_meta}
         self._loaded_images.append(entry)
         self.lbl_no_images.hide()
         card = ImageCard(idx, name, img_float)
@@ -1624,10 +1866,21 @@ class MainWindow(QMainWindow):
         img = self._loaded_images[index]['array']
         name = self._loaded_images[index]['name']
         if role == 'fixed':
-            self.fluoro_image = img
+            self.fluoro_image = img           # résolution native conservée
             self.cv_fl.set_image(img)
             self.tabs.setCurrentIndex(0)
-            self._status(f'Image fixe : {name}')
+            # Auto-remplir les paramètres DRR depuis les métadonnées DICOM
+            meta = self._loaded_images[index].get('dicom_meta')
+            if meta:
+                self.dicom_meta = meta
+                self._apply_dicom_meta(meta)
+                self._status(f'Fluoro DICOM chargee — LAO={meta["lao"]:+.1f}deg  '
+                              f'CRAN={meta["cran"]:+.1f}deg  FOV={meta["fov_mm"]:.0f}mm — '
+                              'parametres DRR auto-remplis')
+            else:
+                self.dicom_meta = {}
+                self.lbl_fluoro_meta.setText(f'Fluoro : {name}')
+                self._status(f'Image fixe : {name}')
         elif role == 'mobile':
             self.drr_image = img
             self.proj_masks = {}
@@ -1635,6 +1888,31 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(1, 'Mobile')
             self.tabs.setCurrentIndex(1)
             self._status(f'Image mobile : {name}')
+
+    def _apply_dicom_meta(self, meta):
+        """Remplit les spinboxes et labels UI depuis un dict de métadonnées."""
+        self.sp_lao.setValue(meta['lao'])
+        self.sp_cran.setValue(meta['cran'])
+        self.sp_table.setValue(meta.get('table_angle', 0.0))
+
+        fov = meta['fov_mm']
+        # Label résumé dans DONNEES
+        arm_str = ''
+        if meta.get('arm_l') is not None:
+            arm_str = f'\nBras : L={meta["arm_l"]:.1f}  P={meta["arm_p"]:.1f}  C={meta["arm_c"]:.1f}'
+        lbl = (f'Fluoro DICOM : {meta["cols"]}x{meta["rows"]}px | '
+               f'{meta["pixel_mm"]:.3f} mm/px\n'
+               f'LAO={meta["lao"]:+.1f}deg  CRAN={meta["cran"]:+.1f}deg  '
+               f'Table={meta.get("table_angle", 0):+.1f}deg\n'
+               f'SID={meta["sid_mm"]:.0f}mm  SOD={meta["sod_mm"]:.0f}mm  '
+               f'Mag={meta.get("magnification", 1):.3f}\n'
+               f'FOV isoctr={fov:.1f}mm  '
+               f'[frame {meta["frame_used"]}/{meta["n_frames"]}]'
+               f'{arm_str}')
+        self.lbl_fluoro_meta.setText(lbl)
+
+        # Ouvrir automatiquement la section PARAMETRES DRR
+        self.sec_drr.set_open(True)
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -1645,9 +1923,11 @@ class MainWindow(QMainWindow):
         if not p: return
         try:
             self.ct_vol,self.voxel_mm,self.ct_aff,_,self.ap_axis,codes=load_ct(p)
-            self.ct_codes = codes   # ('R'/'L', 'A'/'P', 'S'/'I') — utilisé pour l'orientation STL
+            self.ct_path = p
+            self.ct_codes = codes
             self.lbl_ct.setText(f'CT: {os.path.basename(p)}\n  {self.ct_vol.shape} | {self.voxel_mm.round(2)} mm | AP={self.ap_axis} {codes}')
-            self.btn_drr.setEnabled(True); self._status(f'CT chargé — axe AP={self.ap_axis} ({codes})')
+            self.btn_drr.setEnabled(True)
+            self._status(f'CT chargé — axe AP={self.ap_axis} ({codes})')
         except Exception as ex: self._err(str(ex))
 
     def load_seg(self):
@@ -1682,24 +1962,26 @@ class MainWindow(QMainWindow):
         except Exception as ex: self._err(str(ex))
 
     def load_fluoro(self):
-        p,_=QFileDialog.getOpenFileName(self,'Fluoroscopie','','Images (*.png *.jpg *.tiff *.bmp)')
+        p,_=QFileDialog.getOpenFileName(self,'Fluoroscopie','','Images & DICOM (*.png *.jpg *.tiff *.bmp *.dcm)')
         if not p: return
-        img=cv2.imread(p,cv2.IMREAD_GRAYSCALE)
-        if img is None: self._err('Impossible de charger'); return
-        s=self.sp_size.value()
-        img=cv2.resize(img,(s,s),interpolation=cv2.INTER_LANCZOS4)
-        self.fluoro_image=img.astype(np.float32)/255.0
-        self.cv_fl.set_image(self.fluoro_image); self.lbl_fl.setText(f'Fluoro: {os.path.basename(p)}\n  {img.shape}')
-        self.tabs.setCurrentIndex(0)
-        self._status('Fluoroscopie chargée — sélectionner la structure et dessiner son contour')
+        self._add_image(p)
+        # Assigner automatiquement comme image fixe si pas encore fait
+        for i, e in enumerate(self._loaded_images):
+            if e['path'] == p and e['role'] != 'fixed':
+                self._assign_image(i, 'fixed')
+                if e['card']:
+                    e['card'].set_role_external('fixed')
+                break
 
     def generate_drr(self):
-        if self.ct_vol is None: self._err('Charger un CT d\'abord'); return
+        if self.ct_path is None: self._err('Charger un CT d\'abord'); return
         self.btn_drr.setEnabled(False)
-        kw=dict(ct_vol=self.ct_vol,voxel_mm=self.voxel_mm,ap_axis=self.ap_axis,
-                lao_deg=self.sp_lao.value(),cran_deg=self.sp_cran.value(),
-                output_size=self.sp_size.value(),masks=self.seg_masks,
-                slab_c=self.sp_slab_c.value(),slab_w=self.sp_slab_w.value())
+        kw=dict(ct_path=self.ct_path, ct_aff=self.ct_aff,
+                lao_deg=self.sp_lao.value(), cran_deg=self.sp_cran.value(),
+                table_angle=self.sp_table.value(),
+                output_size=self.sp_size.value(), masks=self.seg_masks,
+                fov_mm=self.dicom_meta.get('fov_mm'),
+                renderer='siddon')
         self.worker=WorkerThread('drr',kw)
         self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
         self.worker.error.connect(self._on_err); self.worker.start()
@@ -1708,43 +1990,38 @@ class MainWindow(QMainWindow):
         self.drr_image=res['drr']; self.proj_masks=res.get('masks',{})
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
-        self.tabs.setCurrentIndex(1); self._status('DRR genere -- annoter les memes structures dans l\'onglet Mobile')
-
-    def load_full_stl(self, path=None):
-        p = path
-        if not p:
-            p,_=QFileDialog.getOpenFileName(self,'STL complet','','STL (*.stl)')
-        if not p: return
-        try:
-            if pv is None:
-                raise RuntimeError('PyVista non disponible. Installez pyvista.')
-            mesh = pv.read(p)
-            if mesh is None or mesh.n_points == 0:
-                raise ValueError('STL vide ou illisible')
-            self.full_stl_path = p
-            self.full_stl_name = os.path.basename(p)
-            self.lbl_stl.setText(f'STL: {self.full_stl_name}\n  {mesh.n_cells:,} cells | {mesh.n_points:,} pts')
-            self.btn_overlay.setEnabled(self.result is not None and self.fluoro_image is not None)
-            self._status('STL chargé — prêt pour la vue PyVista après recalage')
-        except Exception as ex:
-            self._err(f'Chargement STL échoué : {ex}')
+        # Auto-injecter les masques de segmentation projetes sur le canvas DRR
+        if self.chk_use_seg.isChecked():
+            if 'vertebrae' in self.proj_masks and self.proj_masks['vertebrae'] is not None:
+                self.cv_drr.set_mask('vertebrae', self.proj_masks['vertebrae'])
+            elif self.proj_masks:
+                # Fusionner toutes les structures disponibles en un seul masque vertebres
+                fused = None
+                for m in self.proj_masks.values():
+                    if m is None or m.sum() == 0: continue
+                    fused = m.copy() if fused is None else np.clip(fused + m, 0, 1)
+                if fused is not None:
+                    self.cv_drr.set_mask('vertebrae', fused)
+        self.tabs.setCurrentIndex(1); self._status('DRR genere — contours vertebres injectes auto, annoter la fluoroscopie')
 
     def load_xray(self):
-        p,_=QFileDialog.getOpenFileName(self,'X-Ray image mobile','','Images (*.png *.jpg *.jpeg *.tiff *.bmp *.dcm)')
+        p,_=QFileDialog.getOpenFileName(self,'X-Ray image mobile','','Images (*.png *.jpg *.jpeg *.tiff *.bmp *.dcm *);;All (*)')
         if not p: return
-        # Support DICOM simple via pydicom si disponible, sinon OpenCV
         img=None
-        if p.lower().endswith('.dcm'):
+        ext = os.path.splitext(p)[1].lower()
+        is_dcm = ext in ('.dcm', '.ima')
+        if not is_dcm and ext == '' and pydicom is not None:
             try:
-                import pydicom
-                ds=pydicom.dcmread(p)
-                arr=ds.pixel_array.astype(np.float32)
-                # Normaliser
-                arr=(arr-arr.min())/(arr.max()-arr.min()+1e-8)
-                img=(arr*255).astype(np.uint8)
-                if img.ndim==3: img=cv2.cvtColor(img,cv2.COLOR_RGB2GRAY)
+                pydicom.dcmread(p, stop_before_pixels=True)
+                is_dcm = True
+            except Exception:
+                pass
+        if is_dcm:
+            try:
+                img, _ = read_dicom_fluoro(p)
+                if img.ndim == 3: img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             except Exception as ex:
-                self._err(f'Lecture DICOM échouée : {ex}'); return
+                self._err(f'Lecture DICOM echouee : {ex}'); return
         else:
             img=cv2.imread(p,cv2.IMREAD_GRAYSCALE)
         if img is None: self._err('Impossible de charger l\'image'); return
@@ -1759,17 +2036,16 @@ class MainWindow(QMainWindow):
         self._status('X-Ray chargé — dessiner les structures dans l\'onglet X-Ray')
 
     def run_registration(self):
-        def fused(cv):
-            out=None
-            for k in STRUCT:
-                if not self.chk_structs[k].isChecked(): continue
-                m=cv.get_mask(k)
-                if m is None or m.sum()==0: continue
-                out=m.copy() if out is None else np.clip(out+m,0,1)
-            return out
-        mf=fused(self.cv_fl); md=fused(self.cv_drr)
-        if mf is None or mf.sum()==0: self._err('Aucune structure annotée sur la fluoroscopie'); return
-        if md is None or md.sum()==0: self._err('Aucune structure annotée sur le DRR'); return
+        mf = self.cv_fl.get_mask('vertebrae')
+        md = self.cv_drr.get_mask('vertebrae')
+        if mf is None or mf.sum()==0: self._err('Annoter les vertebres sur la fluoroscopie avant le recalage'); return
+        if md is None or md.sum()==0: self._err('Aucun masque vertebres sur le DRR (generez le DRR d\'abord)'); return
+        # Normaliser les deux masques à la même taille de travail pour le recalage
+        reg_size = self.sp_size.value()
+        if mf.shape[0] != reg_size:
+            mf = cv2.resize(mf, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
+        if md.shape[0] != reg_size:
+            md = cv2.resize(md, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
         self.btn_reg.setEnabled(False)
         kw=dict(moving=md, fixed=mf, elastic=self.chk_elastic.isChecked())
         self.worker=WorkerThread('register',kw)
@@ -1789,7 +2065,6 @@ class MainWindow(QMainWindow):
         self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
         self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
         self._build_result(res); self.tabs.setCurrentIndex(2)
-        self.btn_overlay.setEnabled(bool(self.full_stl_path) and self.fluoro_image is not None)
         self.btn_seg_overlay.setEnabled(bool(self.proj_masks) and self.fluoro_image is not None)
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
 
@@ -1803,7 +2078,7 @@ class MainWindow(QMainWindow):
 
         # ── Contours à superposer ─────────────────────────────────────────────
         contours = []
-        ct_cols={'vertebrae':(80,220,130),'heart':(240,80,90),'aorta':(80,190,240)}
+        ct_cols = {'vertebrae': (80, 220, 130)}
 
         # Contours annotation fluoro (couleurs struct)
         for struct,info in STRUCT.items():
@@ -1835,21 +2110,6 @@ class MainWindow(QMainWindow):
 
         self.result_panel.set_data(fig_fl, fig_drr_reg, contours)
 
-    def open_overlay(self):
-        """Ouvre la fenêtre 2D d'analyse des segmentations recalées."""
-        if self.result is None:
-            self._err('Lancez d\'abord le recalage'); return
-        if self.fluoro_image is None:
-            self._err('Aucune fluoroscopie chargée'); return
-        if not self.proj_masks:
-            self._err('Aucune segmentation projetée — générez le DRR et annotez'); return
-        try:
-            win = SegOverlayWindow(self.fluoro_image, self.proj_masks, self.result, parent=self)
-            win.exec_()
-        except Exception as ex:
-            import traceback
-            self._err(f'Fenêtre échouée : {ex}\n{traceback.format_exc()}')
-
     def export_results(self):
         if self.result is None: self._err('Lancez d\'abord le recalage'); return
         folder=QFileDialog.getExistingDirectory(self,'Dossier export')
@@ -1862,14 +2122,23 @@ class MainWindow(QMainWindow):
         if self.drr_image is not None:
             cv2.imwrite(os.path.join(folder,'drr.png'),(self.drr_image*255).astype(np.uint8))
         with open(os.path.join(folder,'result.json'),'w') as f:
-            json.dump({'tx_px':float(self.result['tx']),'ty_px':float(self.result['ty']),
+            export = {'tx_px':float(self.result['tx']),'ty_px':float(self.result['ty']),
                        'angle_deg':float(self.result['angle']),
                        'scale':float(self.result.get('scale',1.0)),
                        'iou':float(self.result['iou']),
                        'dice':float(self.result['dice']),
                        'lao_deg':self.sp_lao.value(),
                        'cran_deg':self.sp_cran.value(),
-                       'ap_axis':int(self.ap_axis)},f,indent=2)
+                       'table_angle':self.sp_table.value(),
+                       'ap_axis':int(self.ap_axis)}
+            if self.dicom_meta:
+                # Ajouter les infos DICOM sérialisables
+                for k in ('sid_mm','sod_mm','magnification','pixel_mm',
+                          'fov_mm','intensifier_mm','patient_pos',
+                          'manufacturer','model'):
+                    if k in self.dicom_meta:
+                        export[f'dicom_{k}'] = self.dicom_meta[k]
+            json.dump(export, f, indent=2)
         self._status(f'Exporté → {folder}')
         QMessageBox.information(self,'Export',f'Sauvegardé dans :\n{folder}')
 
@@ -1891,6 +2160,10 @@ class MainWindow(QMainWindow):
     def _status(self,msg): self.statusBar().showMessage(msg)
     def _err(self,msg): self.statusBar().showMessage(msg); QMessageBox.warning(self,'Erreur',msg)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dialogue de comparaison 3 DRR
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     app=QApplication(sys.argv)
