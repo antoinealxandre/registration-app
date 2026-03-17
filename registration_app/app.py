@@ -925,174 +925,234 @@ _SEG_PALETTE = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dialogue de matching vertèbres
+# Panneau de résultats détection YOLO
 # ══════════════════════════════════════════════════════════════════════════════
 
-class VertebraMatchDialog(QDialog):
-    """
-    Dialogue pour sélectionner quelles vertèbres garder quand les
-    détections fluoro et DRR n'ont pas le même nombre.
-    Deux modes : automatique (par position) ou manuel (checkboxes).
-    """
+_YOLO_BOX_PALETTE = [
+    (80, 220, 130), (255, 100, 100), (100, 180, 255),
+    (255, 200, 80), (200, 130, 255), (130, 255, 200),
+    (255, 160, 100), (100, 255, 255), (255, 100, 200),
+    (200, 255, 100),
+]
 
-    def __init__(self, det_fl: dict, det_drr: dict, parent=None):
+
+class YoloDetectionPanel(QDialog):
+    """
+    Panneau affichant l'image avec les détections YOLO style,
+    et un panneau latéral listant chaque détection avec checkbox,
+    confiance, classe, dimensions.
+    Retourne la liste des indices sélectionnés via get_selection().
+    """
+    def __init__(self, det_result: dict, target: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Matching des vertèbres détectées')
-        self.setMinimumSize(700, 500)
+        self.setWindowTitle(f'Détections YOLO — {target.upper()}')
+        self.resize(1100, 700)
         self.setStyleSheet(STYLE)
-        self._det_fl = det_fl
-        self._det_drr = det_drr
-        self._sel_fl = []
-        self._sel_drr = []
+        self._det = det_result
+        self._target = target
+        self._boxes = det_result['boxes']
+        self._infer_img = det_result['infer_img']
+        self._mask = det_result['mask']
+        self._selected = list(range(len(self._boxes)))  # all selected by default
+        self._chk_list = []
         self._build_ui()
+        self._render_image()
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setSpacing(8)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8); root.setSpacing(10)
 
-        boxes_fl = self._det_fl['boxes']
-        boxes_drr = self._det_drr['boxes']
-        n_fl, n_drr = len(boxes_fl), len(boxes_drr)
+        # ── Left: image with detections ───────────────────────────────────────
+        left = QVBoxLayout()
+        self._img_label = QLabel()
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setMinimumSize(500, 500)
+        self._img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._img_label.setStyleSheet(f'background:{DARK_BG};border-radius:6px;border:2px solid {BORDER};')
+        left.addWidget(self._img_label, 1)
 
-        info = QLabel(
-            f'Fluoro : {n_fl} vertèbre(s)   |   DRR : {n_drr} vertèbre(s)\n'
-            f'Choisissez les vertèbres à garder pour le recalage.')
-        info.setObjectName('dim'); info.setWordWrap(True)
-        root.addWidget(info)
+        # Info bar
+        info = QLabel(f'{self._target.upper()}  —  {len(self._boxes)} détection(s)')
+        info.setStyleSheet(f'color:{ACCENT};font-size:12px;font-weight:600;background:transparent;')
+        info.setAlignment(Qt.AlignCenter)
+        left.addWidget(info)
+        root.addLayout(left, 3)
 
-        # ── Mode automatique ──────────────────────────────────────────────────
-        btn_auto = QPushButton('⚡  Matching automatique (par position verticale)')
-        btn_auto.setObjectName('primary')
-        btn_auto.clicked.connect(self._auto_match)
-        root.addWidget(btn_auto)
+        # ── Right: detection list panel ────────────────────────────────────────
+        right_w = QWidget()
+        right_w.setFixedWidth(320)
+        right_w.setStyleSheet(f'background:{PANEL_BG};border:1px solid {BORDER};border-radius:6px;')
+        right_l = QVBoxLayout(right_w)
+        right_l.setContentsMargins(10, 10, 10, 10); right_l.setSpacing(8)
 
-        self.lbl_auto = QLabel(''); self.lbl_auto.setObjectName('dim')
-        self.lbl_auto.setWordWrap(True)
-        root.addWidget(self.lbl_auto)
+        title = QLabel('DETECTIONS')
+        title.setStyleSheet(f'color:{ACCENT};font-size:12px;font-weight:700;letter-spacing:1px;border:none;background:transparent;')
+        right_l.addWidget(title)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f'color:{TEXT_DIM};')
-        root.addWidget(sep)
+        # All / None
+        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
+        btn_all = QPushButton('Toutes'); btn_all.setFixedHeight(26)
+        btn_all.clicked.connect(self._select_all)
+        btn_none = QPushButton('Aucune'); btn_none.setFixedHeight(26)
+        btn_none.clicked.connect(self._select_none)
+        btn_row.addWidget(btn_all); btn_row.addWidget(btn_none)
+        right_l.addLayout(btn_row)
 
-        manual_lbl = QLabel('— ou sélection manuelle —')
-        manual_lbl.setObjectName('dim'); manual_lbl.setAlignment(Qt.AlignCenter)
-        root.addWidget(manual_lbl)
+        # Scroll area for detections
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f'QScrollArea{{background:transparent;border:none;}}')
+        inner = QWidget(); inner.setStyleSheet('background:transparent;')
+        inner_l = QVBoxLayout(inner); inner_l.setSpacing(6); inner_l.setContentsMargins(0, 0, 0, 0)
 
-        # ── Colonnes côte à côte ──────────────────────────────────────────────
-        cols = QHBoxLayout(); cols.setSpacing(12)
+        for i, box in enumerate(self._boxes):
+            color = _YOLO_BOX_PALETTE[i % len(_YOLO_BOX_PALETTE)]
+            card = self._make_det_card(i, box, color)
+            inner_l.addWidget(card)
 
-        # Colonne Fluoro
-        fl_box = QGroupBox(f'Fluoro ({n_fl})')
-        fl_box.setStyleSheet(f'QGroupBox {{ background:{CARD_BG}; border:1px solid {BORDER2}; '
-                              f'border-radius:6px; padding:10px; }} '
-                              f'QGroupBox::title {{ color:{ACCENT}; }}')
-        fl_lay = QVBoxLayout(fl_box)
-        self._chk_fl = []
-        for i, b in enumerate(boxes_fl):
-            cy = (b['y1'] + b['y2']) // 2
-            chk = QCheckBox(f'V{i+1}  y={cy}  conf={b["conf"]:.0%}')
-            chk.setChecked(True)
-            fl_lay.addWidget(chk)
-            self._chk_fl.append(chk)
-        fl_lay.addStretch()
-        cols.addWidget(fl_box, 1)
+        inner_l.addStretch()
+        scroll.setWidget(inner)
+        right_l.addWidget(scroll, 1)
 
-        # Colonne DRR
-        drr_box = QGroupBox(f'DRR ({n_drr})')
-        drr_box.setStyleSheet(f'QGroupBox {{ background:{CARD_BG}; border:1px solid {BORDER2}; '
-                               f'border-radius:6px; padding:10px; }} '
-                               f'QGroupBox::title {{ color:{ACCENT}; }}')
-        drr_lay = QVBoxLayout(drr_box)
-        self._chk_drr = []
-        for i, b in enumerate(boxes_drr):
-            cy = (b['y1'] + b['y2']) // 2
-            chk = QCheckBox(f'V{i+1}  y={cy}  conf={b["conf"]:.0%}')
-            chk.setChecked(True)
-            drr_lay.addWidget(chk)
-            self._chk_drr.append(chk)
-        drr_lay.addStretch()
-        cols.addWidget(drr_box, 1)
-        root.addLayout(cols, 1)
+        # Summary
+        self._lbl_summary = QLabel(f'{len(self._boxes)} sélectionnée(s)')
+        self._lbl_summary.setStyleSheet(f'color:{TEXT_MID};font-size:11px;border:none;background:transparent;')
+        self._lbl_summary.setAlignment(Qt.AlignCenter)
+        right_l.addWidget(self._lbl_summary)
 
-        # ── Boutons ───────────────────────────────────────────────────────────
-        btns = QHBoxLayout()
-        btn_ok = QPushButton('Appliquer la sélection')
-        btn_ok.setObjectName('success')
-        btn_ok.clicked.connect(self._apply_manual)
-        btns.addWidget(btn_ok, 1)
+        # Buttons
+        btn_row2 = QHBoxLayout(); btn_row2.setSpacing(4)
+        btn_ok = QPushButton('Appliquer'); btn_ok.setObjectName('success')
+        btn_ok.clicked.connect(self.accept)
         btn_cancel = QPushButton('Annuler')
         btn_cancel.clicked.connect(self.reject)
-        btns.addWidget(btn_cancel)
-        root.addLayout(btns)
+        btn_row2.addWidget(btn_ok, 1); btn_row2.addWidget(btn_cancel)
+        right_l.addLayout(btn_row2)
 
-    def _auto_match(self):
-        """
-        Matching automatique par position verticale normalisée.
-        On normalise les centres Y de chaque côté en [0, 1], puis
-        on associe greedily les vertèbres les plus proches.
-        On garde les N = min(n_fl, n_drr) meilleures paires.
-        """
-        boxes_fl = self._det_fl['boxes']
-        boxes_drr = self._det_drr['boxes']
+        root.addWidget(right_w)
 
-        # Centres Y normalisés
-        h_fl = self._det_fl['mask'].shape[0]
-        h_drr = self._det_drr['mask'].shape[0]
-        cy_fl = [((b['y1'] + b['y2']) / 2.0) / h_fl for b in boxes_fl]
-        cy_drr = [((b['y1'] + b['y2']) / 2.0) / h_drr for b in boxes_drr]
+    def _make_det_card(self, idx, box, color):
+        r, g, b = color
+        card = QWidget()
+        card.setStyleSheet(
+            f'background:{CARD_BG};border:1px solid rgb({r},{g},{b});'
+            f'border-radius:6px;')
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(8, 6, 8, 6); cl.setSpacing(3)
 
-        # Greedy matching : pour chaque vertèbre du côté le plus petit,
-        # trouver la plus proche de l'autre côté (non déjà prise)
-        n_min = min(len(cy_fl), len(cy_drr))
-        if len(cy_fl) <= len(cy_drr):
-            used_drr = set()
-            pairs = []
-            for i_fl in range(len(cy_fl)):
-                best_j = None; best_d = float('inf')
-                for j_drr in range(len(cy_drr)):
-                    if j_drr in used_drr:
-                        continue
-                    d = abs(cy_fl[i_fl] - cy_drr[j_drr])
-                    if d < best_d:
-                        best_d = d; best_j = j_drr
-                if best_j is not None:
-                    pairs.append((i_fl, best_j))
-                    used_drr.add(best_j)
-        else:
-            used_fl = set()
-            pairs = []
-            for j_drr in range(len(cy_drr)):
-                best_i = None; best_d = float('inf')
-                for i_fl in range(len(cy_fl)):
-                    if i_fl in used_fl:
-                        continue
-                    d = abs(cy_fl[i_fl] - cy_drr[j_drr])
-                    if d < best_d:
-                        best_d = d; best_i = i_fl
-                if best_i is not None:
-                    pairs.append((best_i, j_drr))
-                    used_fl.add(best_i)
+        # Header row: checkbox + label + confidence badge
+        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        chk = QCheckBox(); chk.setChecked(True)
+        chk.toggled.connect(lambda checked, i=idx: self._on_toggle(i, checked))
+        self._chk_list.append(chk)
+        hdr.addWidget(chk)
 
-        self._sel_fl = [p[0] for p in pairs]
-        self._sel_drr = [p[1] for p in pairs]
+        lbl_name = QLabel(f'V{idx+1}')
+        lbl_name.setStyleSheet(
+            f'color:rgb({r},{g},{b});font-size:13px;font-weight:700;'
+            f'border:none;background:transparent;')
+        hdr.addWidget(lbl_name)
 
-        # Mettre à jour les checkboxes
-        for i, chk in enumerate(self._chk_fl):
-            chk.setChecked(i in self._sel_fl)
-        for i, chk in enumerate(self._chk_drr):
-            chk.setChecked(i in self._sel_drr)
+        conf_pct = int(box['conf'] * 100)
+        conf_color = ACCENT2 if conf_pct >= 70 else (WARN if conf_pct >= 40 else ERR)
+        badge = QLabel(f'{conf_pct}%')
+        badge.setFixedSize(42, 20)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet(
+            f'background:{conf_color};color:#fff;font-size:10px;font-weight:700;'
+            f'border-radius:10px;border:none;')
+        hdr.addWidget(badge)
+        hdr.addStretch()
+        cl.addLayout(hdr)
 
-        desc = ', '.join(f'F-V{p[0]+1} ↔ D-V{p[1]+1}' for p in pairs)
-        self.lbl_auto.setText(
-            f'✓ {len(pairs)} paire(s) associée(s) par position :\n{desc}')
+        # Class name
+        cls_lbl = QLabel(box.get('cls_name', 'vertebra'))
+        cls_lbl.setStyleSheet(f'color:{TEXT_MID};font-size:10px;border:none;background:transparent;')
+        cl.addWidget(cls_lbl)
 
-    def _apply_manual(self):
-        self._sel_fl = [i for i, c in enumerate(self._chk_fl) if c.isChecked()]
-        self._sel_drr = [i for i, c in enumerate(self._chk_drr) if c.isChecked()]
-        self.accept()
+        # Box info
+        bw = box['x2'] - box['x1']
+        bh = box['y2'] - box['y1']
+        cx = (box['x1'] + box['x2']) // 2
+        cy = (box['y1'] + box['y2']) // 2
+        info = QLabel(f'Centre ({cx}, {cy})  |  {bw}×{bh} px')
+        info.setStyleSheet(f'color:{TEXT_DIM};font-size:10px;border:none;background:transparent;')
+        cl.addWidget(info)
+
+        return card
+
+    def _on_toggle(self, idx, checked):
+        if checked and idx not in self._selected:
+            self._selected.append(idx)
+            self._selected.sort()
+        elif not checked and idx in self._selected:
+            self._selected.remove(idx)
+        n = len(self._selected)
+        self._lbl_summary.setText(f'{n} sélectionnée(s) / {len(self._boxes)}')
+        self._render_image()
+
+    def _select_all(self):
+        for chk in self._chk_list: chk.setChecked(True)
+
+    def _select_none(self):
+        for chk in self._chk_list: chk.setChecked(False)
+
+    def _render_image(self):
+        img = self._infer_img.copy()
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.dtype != np.uint8:
+            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+        for i, box in enumerate(self._boxes):
+            color = _YOLO_BOX_PALETTE[i % len(_YOLO_BOX_PALETTE)]
+            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
+            is_sel = i in self._selected
+            thickness = 2 if is_sel else 1
+            alpha_col = color if is_sel else tuple(c // 3 for c in color)
+
+            # Draw box
+            cv2.rectangle(img, (x1, y1), (x2, y2), alpha_col, thickness, lineType=cv2.LINE_AA)
+
+            if is_sel:
+                # Label background
+                label = f'V{i+1} {box["conf"]:.0%}'
+                (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(img, (x1, y1 - th - 8), (x1 + tw + 8, y1), alpha_col, -1)
+                cv2.putText(img, label, (x1 + 4, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+                # Corner accents (YOLO style)
+                corner_len = min(15, (x2 - x1) // 4, (y2 - y1) // 4)
+                ct = 3
+                # Top-left
+                cv2.line(img, (x1, y1), (x1 + corner_len, y1), alpha_col, ct, cv2.LINE_AA)
+                cv2.line(img, (x1, y1), (x1, y1 + corner_len), alpha_col, ct, cv2.LINE_AA)
+                # Top-right
+                cv2.line(img, (x2, y1), (x2 - corner_len, y1), alpha_col, ct, cv2.LINE_AA)
+                cv2.line(img, (x2, y1), (x2, y1 + corner_len), alpha_col, ct, cv2.LINE_AA)
+                # Bottom-left
+                cv2.line(img, (x1, y2), (x1 + corner_len, y2), alpha_col, ct, cv2.LINE_AA)
+                cv2.line(img, (x1, y2), (x1, y2 - corner_len), alpha_col, ct, cv2.LINE_AA)
+                # Bottom-right
+                cv2.line(img, (x2, y2), (x2 - corner_len, y2), alpha_col, ct, cv2.LINE_AA)
+                cv2.line(img, (x2, y2), (x2, y2 - corner_len), alpha_col, ct, cv2.LINE_AA)
+
+        # Fit to label
+        lw = max(64, self._img_label.width())
+        lh = max(64, self._img_label.height())
+        h, w = img.shape[:2]
+        scale = min(lw / w, lh / h)
+        nw, nh = int(w * scale), int(h * scale)
+        img_r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        img_r = np.ascontiguousarray(img_r)
+        qi = QImage(img_r.data, nw, nh, nw * 3, QImage.Format_RGB888)
+        self._img_label.setPixmap(QPixmap.fromImage(qi).copy())
 
     def get_selection(self):
-        return self._sel_fl, self._sel_drr
+        return sorted(self._selected)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e); self._render_image()
 
 
 class SegOverlayWindow(QDialog):
@@ -1292,6 +1352,9 @@ class SegOverlayWindow(QDialog):
             if not self._chks.get(name, QCheckBox()).isChecked():
                 continue
             warped = apply_full_transform(mask.astype(np.float32), self._result)
+            # Resize warped to match fluoro dimensions
+            if warped.shape[:2] != (S, rgb.shape[1]):
+                warped = cv2.resize(warped, (rgb.shape[1], S), interpolation=cv2.INTER_LINEAR)
             r, g, b = self._colors[name]
             struct_alpha = self._alpha_per_struct.get(name, 1.0)
             ov = rgb.copy(); ov[warped > 0.5] = [r, g, b]
@@ -1703,6 +1766,29 @@ class MainWindow(QMainWindow):
         sec_data.addWidget(self.lbl_ct)
         sec_data.addWidget(self.lbl_seg)
         sec_data.addWidget(self.lbl_fluoro_meta)
+
+        # ── Checklist pastilles ────────────────────────────────────────────
+        chk_frame = QWidget()
+        chk_frame.setStyleSheet(f'background:{CARD_BG};border:1px solid {BORDER2};border-radius:6px;')
+        chk_lay = QVBoxLayout(chk_frame)
+        chk_lay.setContentsMargins(10, 8, 10, 8); chk_lay.setSpacing(4)
+        chk_title = QLabel('CHECKLIST')
+        chk_title.setStyleSheet(f'color:{ACCENT};font-size:11px;font-weight:600;letter-spacing:1px;border:none;background:transparent;')
+        chk_lay.addWidget(chk_title)
+        self._chk_indicators = {}
+        for key, label in [('ct', 'CT Volume'), ('seg', 'Segmentation'),
+                           ('fluoro', 'Fluoroscopie'), ('drr', 'DRR'),
+                           ('yolo', 'Modele YOLO'), ('reg', 'Recalage')]:
+            row = QHBoxLayout(); row.setSpacing(6)
+            dot = QLabel('●')
+            dot.setFixedWidth(16)
+            dot.setStyleSheet(f'color:{TEXT_DIM};font-size:14px;border:none;background:transparent;')
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f'color:{TEXT_MID};font-size:11px;border:none;background:transparent;')
+            row.addWidget(dot); row.addWidget(lbl, 1)
+            chk_lay.addLayout(row)
+            self._chk_indicators[key] = dot
+        sec_data.addWidget(chk_frame)
         ll.addWidget(sec_data)
 
         # ── IMAGES ────────────────────────────────────────────────────────────
@@ -1812,15 +1898,12 @@ class MainWindow(QMainWindow):
         self.sp_yolo_imgsz = QSpinBox(); self.sp_yolo_imgsz.setRange(0, 2048); self.sp_yolo_imgsz.setValue(288)
         ygl.addWidget(self.sp_yolo_imgsz, 2, 1)
         ygl.addWidget(_lbl('Gamma'), 3, 0)
-        self.sp_yolo_gamma = QDoubleSpinBox(); self.sp_yolo_gamma.setRange(0.1, 5.0); self.sp_yolo_gamma.setValue(1.4); self.sp_yolo_gamma.setSingleStep(0.1)
+        self.sp_yolo_gamma = QDoubleSpinBox(); self.sp_yolo_gamma.setRange(0.1, 5.0); self.sp_yolo_gamma.setValue(0.65); self.sp_yolo_gamma.setSingleStep(0.1)
         ygl.addWidget(self.sp_yolo_gamma, 3, 1)
-        ygl.addWidget(_lbl('CLAHE clip'), 4, 0)
-        self.sp_yolo_clahe = QDoubleSpinBox(); self.sp_yolo_clahe.setRange(0.1, 20.0); self.sp_yolo_clahe.setValue(2.5); self.sp_yolo_clahe.setSingleStep(0.5)
-        ygl.addWidget(self.sp_yolo_clahe, 4, 1)
-        ygl.addWidget(_lbl('Unsharp'), 5, 0)
-        self.sp_yolo_sharp = QDoubleSpinBox(); self.sp_yolo_sharp.setRange(0.0, 5.0); self.sp_yolo_sharp.setValue(0.5); self.sp_yolo_sharp.setSingleStep(0.1)
-        ygl.addWidget(self.sp_yolo_sharp, 5, 1)
-        self.chk_yolo_invert = QCheckBox('Inverser'); ygl.addWidget(self.chk_yolo_invert, 6, 0, 1, 2)
+        ygl.addWidget(_lbl('Contraste'), 4, 0)
+        self.sp_yolo_contrast = QDoubleSpinBox(); self.sp_yolo_contrast.setRange(0.1, 5.0); self.sp_yolo_contrast.setValue(1.5); self.sp_yolo_contrast.setSingleStep(0.1)
+        ygl.addWidget(self.sp_yolo_contrast, 4, 1)
+        self.chk_yolo_invert = QCheckBox('Inverser niveaux'); self.chk_yolo_invert.setChecked(True); ygl.addWidget(self.chk_yolo_invert, 5, 0, 1, 2)
         sec_yolo.addWidget(yolo_grid)
 
         row_det = QHBoxLayout(); row_det.setSpacing(4)
@@ -2060,6 +2143,7 @@ class MainWindow(QMainWindow):
                     self.seg_masks[f'label_{int(idx)}'] = m
             n = len(self.seg_masks)
             self.lbl_seg.setText(f'Seg : {os.path.basename(path)} ({n})')
+            self._update_checklist()
             self._status(f'Segmentation chargee -- {n} structures')
         except Exception as ex:
             self._err(str(ex))
@@ -2116,6 +2200,7 @@ class MainWindow(QMainWindow):
             self.fluoro_image = img           # résolution native conservée
             self.cv_fl.set_image(img)
             self.tabs.setCurrentIndex(0)
+            self._update_checklist()
             # Auto-remplir les paramètres DRR depuis les métadonnées DICOM
             meta = self._loaded_images[index].get('dicom_meta')
             if meta:
@@ -2174,6 +2259,7 @@ class MainWindow(QMainWindow):
             self.ct_codes = codes
             self.lbl_ct.setText(f'CT: {os.path.basename(p)}\n  {self.ct_vol.shape} | {self.voxel_mm.round(2)} mm | AP={self.ap_axis} {codes}')
             self.btn_drr.setEnabled(True)
+            self._update_checklist()
             self._status(f'CT chargé — axe AP={self.ap_axis} ({codes})')
         except Exception as ex: self._err(str(ex))
 
@@ -2205,6 +2291,7 @@ class MainWindow(QMainWindow):
             n=len(self.seg_masks)
             total=sum(v.sum() for v in self.seg_masks.values())
             self.lbl_seg.setText(f'Seg: {os.path.basename(p)}\n  {n} structures · {total:,} voxels')
+            self._update_checklist()
             self._status(f'Segmentation chargée — {n} structures : {", ".join(list(self.seg_masks)[:6])}{"…" if n>6 else ""}')
         except Exception as ex: self._err(str(ex))
 
@@ -2237,6 +2324,7 @@ class MainWindow(QMainWindow):
         self.drr_image=res['drr']; self.proj_masks=res.get('masks',{})
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
+        self._update_checklist()
         # Auto-injecter les masques de segmentation projetes sur le canvas DRR
         if self.chk_use_seg.isChecked():
             if 'vertebrae' in self.proj_masks and self.proj_masks['vertebrae'] is not None:
@@ -2302,6 +2390,7 @@ class MainWindow(QMainWindow):
     def _reg_done(self,res):
         self.result=res; self.btn_reg.setEnabled(True)
         iou=res['iou']; dice=res['dice']
+        self._update_checklist()
         col=ACCENT2 if iou>0.5 else (WARN if iou>0.25 else ERR)
         self.lbl_iou.setText(f'{iou:.3f}')
         self.lbl_iou.setStyleSheet(f'font-size:22px;font-weight:700;color:{col};')
@@ -2418,6 +2507,25 @@ class MainWindow(QMainWindow):
     def _status(self,msg): self.statusBar().showMessage(msg)
     def _err(self,msg): self.statusBar().showMessage(msg); QMessageBox.warning(self,'Erreur',msg)
 
+    def _update_checklist(self):
+        """Met à jour les pastilles de la checklist."""
+        checks = {
+            'ct':    self.ct_vol is not None,
+            'seg':   bool(self.seg_masks),
+            'fluoro': self.fluoro_image is not None,
+            'drr':   self.drr_image is not None,
+            'yolo':  yolo_ready(),
+            'reg':   self.result is not None,
+        }
+        for key, ok in checks.items():
+            dot = self._chk_indicators.get(key)
+            if dot:
+                dot.setStyleSheet(
+                    f'color:{ACCENT2};font-size:14px;border:none;background:transparent;'
+                    if ok else
+                    f'color:{TEXT_DIM};font-size:14px;border:none;background:transparent;'
+                )
+
     # ══════════════════════════════════════════════════════════════════════════
     # Détection YOLO
     # ══════════════════════════════════════════════════════════════════════════
@@ -2429,6 +2537,7 @@ class MainWindow(QMainWindow):
         try:
             yolo_load(p)
             self.lbl_yolo.setText(os.path.basename(p))
+            self._update_checklist()
             self._status(f'YOLO : {os.path.basename(p)}')
         except Exception as ex:
             self._err(str(ex))
@@ -2439,8 +2548,7 @@ class MainWindow(QMainWindow):
             iou=self.sp_yolo_iou.value() / 100.0,
             imgsz=self.sp_yolo_imgsz.value(),
             pp={'gamma': self.sp_yolo_gamma.value(),
-                'clahe_clip': self.sp_yolo_clahe.value(),
-                'unsharp_strength': self.sp_yolo_sharp.value(),
+                'contrast': self.sp_yolo_contrast.value(),
                 'invert': self.chk_yolo_invert.isChecked()})
 
     def _detect_fluoro(self):
@@ -2480,57 +2588,31 @@ class MainWindow(QMainWindow):
         else:
             self._yolo_det_drr = res
 
+        # Ouvrir le panneau de sélection YOLO
+        dlg = YoloDetectionPanel(res, target, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            sel = dlg.get_selection()
+            if not sel:
+                self._err('Aucune détection sélectionnée.'); return
+            selected_boxes = [res['boxes'][i] for i in sel]
+        else:
+            selected_boxes = res['boxes']
+
         # Construire le masque et l'injecter
         canvas = self.cv_fl if target == 'fluoro' else self.cv_drr
-        s = canvas._size
-        mask = boxes_to_mask(res['boxes'], res['mask'].shape[0], res['mask'].shape[1])
+        h, w = res['mask'].shape
+        mask = boxes_to_mask(selected_boxes, h, w)
         mask_f32 = mask.astype(np.float32) / 255.0
         canvas.set_mask('vertebrae', mask_f32)
 
         tab = 0 if target == 'fluoro' else 1
         self.tabs.setCurrentIndex(tab)
 
+        n_sel = len(selected_boxes)
         self.lbl_yolo_status.setText(
-            f'{target.upper()} : {n} vertèbre(s) détectée(s)\n'
+            f'{target.upper()} : {n_sel}/{n} vertèbre(s) retenue(s)\n'
             f'Masque injecté dans l\'onglet {"Fixe" if target=="fluoro" else "DRR"}')
-        self._status(f'YOLO {target} : {n} vertèbre(s)')
-
-        # Si on a les deux détections, proposer le matching
-        if self._yolo_det_fl is not None and self._yolo_det_drr is not None:
-            n_fl = self._yolo_det_fl['n_detections']
-            n_drr = self._yolo_det_drr['n_detections']
-            if n_fl != n_drr:
-                self.lbl_yolo_status.setText(
-                    f'⚠ Nombre différent : Fluoro={n_fl}, DRR={n_drr}\n'
-                    f'→ Cliquez Matcher pour choisir les vertèbres communes')
-                self._show_match_dialog()
-            else:
-                self.lbl_yolo_status.setText(
-                    f'✓ {n_fl} vertèbre(s) sur chaque image\n'
-                    f'Masques injectés — prêt pour le recalage')
-                self.btn_reg.setEnabled(True)
-
-    def _show_match_dialog(self):
-        dlg = VertebraMatchDialog(
-            self._yolo_det_fl, self._yolo_det_drr, parent=self)
-        if dlg.exec_() == QDialog.Accepted:
-            sel_fl, sel_drr = dlg.get_selection()
-            if not sel_fl or not sel_drr:
-                self._err('Aucune vertèbre sélectionnée.'); return
-            # Reconstruire les masques avec seulement les boîtes sélectionnées
-            det_fl = self._yolo_det_fl
-            det_drr = self._yolo_det_drr
-            h_fl, w_fl = det_fl['mask'].shape
-            h_drr, w_drr = det_drr['mask'].shape
-            mask_fl = boxes_to_mask([det_fl['boxes'][i] for i in sel_fl], h_fl, w_fl)
-            mask_drr = boxes_to_mask([det_drr['boxes'][i] for i in sel_drr], h_drr, w_drr)
-            self.cv_fl.set_mask('vertebrae', mask_fl.astype(np.float32) / 255.0)
-            self.cv_drr.set_mask('vertebrae', mask_drr.astype(np.float32) / 255.0)
-            self.lbl_yolo_status.setText(
-                f'✓ Matching : {len(sel_fl)} vertèbre(s) sélectionnée(s)\n'
-                f'Masques mis à jour — prêt pour le recalage')
-            self.btn_reg.setEnabled(True)
-            self._status(f'Matching : {len(sel_fl)} vertèbre(s) retenues')
+        self._status(f'YOLO {target} : {n_sel} vertèbre(s)')
 
 
 # ══════════════════════════════════════════════════════════════════════════════

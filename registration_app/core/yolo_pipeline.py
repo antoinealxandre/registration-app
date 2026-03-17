@@ -23,7 +23,7 @@ def is_model_loaded() -> bool:
 
 def fluoro_to_xray(img: np.ndarray, gamma: float = 1.4,
                    clahe_clip: float = 2.5, unsharp_strength: float = 0.5,
-                   invert: bool = False) -> np.ndarray:
+                   invert: bool = False, contrast: float = 1.0) -> np.ndarray:
     """Transforme une fluoroscopie en pseudo-Rx."""
     if img.dtype != np.uint8:
         img = np.clip(img * 255, 0, 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
@@ -32,6 +32,10 @@ def fluoro_to_xray(img: np.ndarray, gamma: float = 1.4,
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
     if invert:
         gray = cv2.bitwise_not(gray)
+    # Contrast scaling
+    if abs(contrast - 1.0) > 0.01:
+        mean = gray.mean()
+        gray = np.clip((gray.astype(np.float32) - mean) * contrast + mean, 0, 255).astype(np.uint8)
     gray = cv2.bilateralFilter(gray, 7, 40, 40)
     inv_gamma = 1.0 / max(0.01, gamma)
     lut = (np.arange(256, dtype=np.float32) / 255.0) ** inv_gamma * 255
@@ -65,7 +69,10 @@ def detect_vertebrae(img: np.ndarray, conf: float = 0.25,
     else:
         img_u8 = img.copy()
     if img_u8.ndim == 3:
-        img_u8 = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
+        if img_u8.shape[2] == 1:
+            img_u8 = img_u8[:, :, 0]
+        else:
+            img_u8 = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
 
     if preprocess:
         pp = preprocess_params or {}
@@ -74,7 +81,8 @@ def detect_vertebrae(img: np.ndarray, conf: float = 0.25,
             gamma=pp.get('gamma', 1.4),
             clahe_clip=pp.get('clahe_clip', 2.5),
             unsharp_strength=pp.get('unsharp_strength', 0.5),
-            invert=pp.get('invert', False))
+            invert=pp.get('invert', False),
+            contrast=pp.get('contrast', 1.0))
     else:
         infer_img = img_u8
 

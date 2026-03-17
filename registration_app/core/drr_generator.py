@@ -1,31 +1,45 @@
 """
 core/drr_generator.py
-GéGénération de DRR via DiffDRR (cone-beam, géométrie C-arm réaliste).
-Trois backends disponibles :
-  - "siddon"     : DiffDRR Siddon ray tracing (exact, recommandé)
-  - "trilinear"  : DiffDRR trilinear interpolation (lisse, légèrement plus rapide)
-  - "cpu"        : projection CPU scipy ray-sum (rapide, sans GPU/DiffDRR requis)
+Génération de DRR – cone-beam, géométrie C-arm réaliste.
 
-NOTE ANGLES : DiffDRR attend des radians par défaut.
-On passe toujours degrees=True pour rester en degrés côté API.
-Bug courant : 0.6 radians ≈ 34° ≠ 0.6°.
+Backends (par ordre de préférence) :
+  - "nanodrr"    : nanoDRR (rapide, HU → LAC physique, torch.compile)
+  - "siddon"     : DiffDRR Siddon ray tracing (legacy)
+  - "trilinear"  : DiffDRR trilinear interpolation (legacy)
+  - "cpu"        : projection CPU scipy ray-sum (sans GPU)
+
+Le backend GPU est choisi automatiquement :
+  nanoDRR si disponible, sinon DiffDRR, sinon CPU.
 """
 
 import numpy as np
 import nibabel as nib
 import cv2
-import tempfile, os  # kept for potential external callers
 from scipy.ndimage import rotate as _ndrot
 
+_DEVICE = None
+
+# ── nanoDRR (preferred) ──────────────────────────────────────────────────────
 try:
     import torch
-    from diffdrr.drr import DRR
-    from diffdrr.data import read as diffdrr_read
-    HAS_DIFFDRR = True
+    from nanodrr.data import Subject as _NanoSubject
+    from nanodrr.camera import make_k_inv as _make_k_inv, make_rt_inv as _make_rt_inv
+    from nanodrr.drr import render as _nanodrr_render
+    HAS_NANODRR = True
     _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 except ImportError:
+    HAS_NANODRR = False
+
+# ── DiffDRR (fallback) ───────────────────────────────────────────────────────
+try:
+    import torch
+    from diffdrr.drr import DRR as _DiffDRR
+    from diffdrr.data import read as _diffdrr_read
+    HAS_DIFFDRR = True
+    if _DEVICE is None:
+        _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+except ImportError:
     HAS_DIFFDRR = False
-    _DEVICE = None
 
 
 def load_ct(ct_path: str):
@@ -89,7 +103,7 @@ def generate_drr(
     - sid_mm      : Source-to-Detector distance [mm]
     - sod_mm      : Source-to-Object (isocentre) distance [mm]
     - fov_mm      : champ de vue à l'isocentre [mm]
-    - renderer    : "siddon" | "trilinear" | "cpu"
+    - renderer    : "nanodrr" | "siddon" | "trilinear" | "cpu"
     - progress_cb : callback(pct, msg)
 
     Retourne : image float32 [0, 1]
@@ -98,30 +112,104 @@ def generate_drr(
         return _generate_drr_cpu(
             ct_path, lao_deg, cran_deg, table_angle, output_size, progress_cb)
 
-    if not HAS_DIFFDRR:
-        raise RuntimeError(
-            'DiffDRR non disponible — installez-le : pip install diffdrr')
+    # ── nanoDRR (preferred GPU backend) ───────────────────────────────────
+    if HAS_NANODRR and renderer != "trilinear":
+        return _generate_drr_nanodrr(
+            ct_path, lao_deg, cran_deg, table_angle,
+            output_size, sid_mm, sod_mm, fov_mm, progress_cb)
+
+    # ── DiffDRR fallback ──────────────────────────────────────────────────
+    if HAS_DIFFDRR:
+        return _generate_drr_diffdrr(
+            ct_path, lao_deg, cran_deg, table_angle,
+            output_size, sid_mm, sod_mm, fov_mm,
+            renderer if renderer in ("siddon", "trilinear") else "siddon",
+            progress_cb)
+
+    raise RuntimeError(
+        'Aucun backend GPU disponible — installez nanodrr ou diffdrr')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# nanoDRR backend — projection cone-beam avec conversion HU → LAC physique
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _generate_drr_nanodrr(
+    ct_path, lao_deg, cran_deg, table_angle,
+    output_size, sid_mm, sod_mm, fov_mm, progress_cb,
+):
+    if progress_cb:
+        progress_cb(5, 'Chargement CT (nanoDRR)…')
+
+    # mu_bone augmenté (×2) pour renforcer le contraste osseux
+    from nanodrr.data.preprocess import MU_BONE
+    subject = _NanoSubject.from_filepath(
+        ct_path, mu_bone=MU_BONE * 2.0,
+    ).to(_DEVICE)
+
+    delx = _compute_delx(fov_mm, sid_mm, sod_mm, output_size)
+    k_inv = _make_k_inv(
+        sdd=sid_mm, delx=delx, dely=delx,
+        x0=0.0, y0=0.0,
+        height=output_size, width=output_size,
+        device=_DEVICE,
+    )
+    sdd_t = torch.tensor([sid_mm], device=_DEVICE)
+
+    # Extrinsics — ZXY Euler angles in degrees, same convention as DiffDRR
+    rt_inv = _make_rt_inv(
+        torch.tensor([[cran_deg, lao_deg, table_angle]],
+                      dtype=torch.float32, device=_DEVICE),
+        torch.tensor([[0.0, sod_mm, 0.0]],
+                      dtype=torch.float32, device=_DEVICE),
+        orientation="AP",
+        isocenter=subject.isocenter,
+    )
 
     if progress_cb:
-        progress_cb(5, f'Chargement CT ({renderer})…')
+        progress_cb(30, 'Projection cone-beam (nanoDRR)…')
 
-    subject = diffdrr_read(ct_path, orientation="AP")
+    with torch.no_grad():
+        img_tensor = _nanodrr_render(
+            subject, k_inv, rt_inv, sdd_t,
+            output_size, output_size,
+        )
+
+    # Sum across label channels if present, take first batch
+    img_np = img_tensor.sum(dim=1).squeeze(0).cpu().numpy()
+
+    if progress_cb:
+        progress_cb(70, 'Post-traitement…')
+
+    return _postprocess(img_np)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DiffDRR backend (legacy fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _generate_drr_diffdrr(
+    ct_path, lao_deg, cran_deg, table_angle,
+    output_size, sid_mm, sod_mm, fov_mm, renderer, progress_cb,
+):
+    if progress_cb:
+        progress_cb(5, f'Chargement CT (DiffDRR {renderer})…')
+
+    subject = _diffdrr_read(ct_path, orientation="AP")
     delx = _compute_delx(fov_mm, sid_mm, sod_mm, output_size)
 
-    drr_module = DRR(
+    drr_module = _DiffDRR(
         subject,
         sdd=sid_mm,
         height=output_size,
         width=output_size,
         delx=delx,
-        renderer=renderer,          # "siddon" ou "trilinear"
+        renderer=renderer,
     ).to(_DEVICE)
 
     if progress_cb:
-        progress_cb(30, 'Projection cone-beam…')
+        progress_cb(30, 'Projection cone-beam (DiffDRR)…')
 
-    # Convention DiffDRR ZXY : [cran, lao, table]  — degrees=True (IMPORTANT)
-    # DiffDRR attend des radians par défaut ; degrees=True convertit en interne.
     rot = torch.tensor([[cran_deg, lao_deg, table_angle]],
                        dtype=torch.float32, device=_DEVICE)
     tra = torch.tensor([[0.0, sod_mm, 0.0]],
@@ -131,7 +219,7 @@ def generate_drr(
         img_tensor = drr_module(rot, tra,
                                 parameterization="euler_angles",
                                 convention="ZXY",
-                                degrees=True)   # ← FIX : angles en degrés
+                                degrees=True)
 
     img_np = img_tensor.squeeze().cpu().numpy()
 
@@ -184,6 +272,8 @@ def project_mask_3d(
 
     proj = cv2.resize(proj, (output_size, output_size),
                       interpolation=cv2.INTER_LINEAR)
+    # Flip vertical pour corriger l'orientation (convention NIfTI S-I)
+    proj = np.flipud(proj).copy()
     return (proj > 0.3).astype(np.float32)
 
 
@@ -192,15 +282,48 @@ def project_mask_3d(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _postprocess(img_np: np.ndarray) -> np.ndarray:
-    """Percentile norm + CLAHE → float32 [0, 1]."""
-    p2, p98 = np.percentile(img_np, (2, 98))
-    if p98 > p2:
-        img_np = np.clip((img_np - p2) / (p98 - p2), 0, 1)
+    """
+    Post-traitement réaliste du DRR brut → float32 [0, 1] aspect radio.
+
+    Pipeline :
+      1. Log-transform (loi de Beer-Lambert) — compresse la dynamique,
+         réduit la surbrillance de l'aorte et des zones denses.
+      2. Normalisation robuste (percentiles serrés p0.5/p99.5).
+      3. Inversion — os clairs sur fond sombre (convention radio positive).
+      4. Gamma correction (γ = 0.6) — réhausse le contraste dans les tons moyens.
+      5. CLAHE adapté médical — fait ressortir les vertèbres.
+      6. Unsharp-mask léger — netteté des contours osseux.
+    """
+    # 1. Log-transform : line-integral → "épaisseur d'atténuation" logarithmique
+    #    eps évite log(0) ; log1p = log(1 + x) compresse naturellement les hautes valeurs
+    img = np.log1p(np.clip(img_np, 0, None))
+
+    # 2. Normalisation robuste — écrêtage des outliers (metal, bord CT)
+    p_lo, p_hi = np.percentile(img, (0.5, 99.5))
+    if p_hi > p_lo:
+        img = np.clip((img - p_lo) / (p_hi - p_lo), 0, 1)
     else:
-        img_np = np.zeros_like(img_np)
-    img_u8 = (img_np * 255).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(img_u8).astype(np.float32) / 255.0
+        img = np.zeros_like(img)
+
+    # 3. Inversion — les os (forte atténuation → haute valeur) deviennent clairs
+    #    comme sur un cliché radio classique (convention positive)
+    img = img
+
+    # 4. Gamma correction — γ < 1 éclaircit les tons moyens,
+    #    fait mieux ressortir les vertèbres par rapport au fond
+    gamma = 0.6
+    img = np.power(img, gamma)
+
+    # 5. CLAHE à contraste adaptatif — rehausse les structures locales (vertèbres)
+    img_u8 = (img * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_u8 = clahe.apply(img_u8)
+
+    # 6. Unsharp-mask léger pour la netteté des contours
+    blur = cv2.GaussianBlur(img_u8, (0, 0), sigmaX=1.5)
+    img_u8 = cv2.addWeighted(img_u8, 1.3, blur, -0.3, 0)
+
+    return img_u8.astype(np.float32) / 255.0
 
 
 def _generate_drr_cpu(
