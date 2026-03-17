@@ -1,6 +1,6 @@
 """
 core/drr_generator.py
-Génération de DRR via DiffDRR (cone-beam, géométrie C-arm réaliste).
+GéGénération de DRR via DiffDRR (cone-beam, géométrie C-arm réaliste).
 Trois backends disponibles :
   - "siddon"     : DiffDRR Siddon ray tracing (exact, recommandé)
   - "trilinear"  : DiffDRR trilinear interpolation (lisse, légèrement plus rapide)

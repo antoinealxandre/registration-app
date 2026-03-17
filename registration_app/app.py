@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QStatusBar, QFrame, QMessageBox, QComboBox, QGridLayout, QCheckBox,
     QDialog, QScrollArea, QToolButton, QButtonGroup,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QCursor, QFont
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -30,6 +30,10 @@ from core.drr_generator import load_ct, generate_drr, project_mask_3d
 from core.registration import (register, register_elastic,
                                apply_transform, apply_full_transform,
                                iou_score, dice_score)
+from core.yolo_pipeline import (
+    load_yolo_model as yolo_load, is_model_loaded as yolo_ready,
+    detect_vertebrae, boxes_to_mask, draw_detections,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -409,8 +413,15 @@ class AnnotationCanvas(QLabel):
     # ── API ───────────────────────────────────────────────────────────────────
 
     def set_image(self, img: np.ndarray):
-        s = img.shape[0]; self._size = s
+        h, w = img.shape[:2]
+        s = max(h, w)
         u8 = (np.clip(img,0,1)*255).astype(np.uint8) if img.dtype != np.uint8 else img.copy()
+        # Rendre l'image carrée si nécessaire
+        if h != w:
+            u8_sq = np.zeros((s, s), dtype=np.uint8) if u8.ndim == 2 else np.zeros((s, s, 3), dtype=np.uint8)
+            u8_sq[:h, :w] = u8
+            u8 = u8_sq
+        self._size = s
         self._img_np = u8
         for k in STRUCT:
             self._masks[k] = np.zeros((s,s), np.float32)
@@ -829,9 +840,20 @@ class WorkerThread(QThread):
     progress=pyqtSignal(int,str); result=pyqtSignal(dict); error=pyqtSignal(str)
     def __init__(self,task,kw): super().__init__(); self.task=task; self.kw=kw
     def run(self):
-        try: {'drr':self._drr,'register':self._reg}[self.task]()
+        try: {'drr':self._drr,'register':self._reg,
+               'yolo_detect':self._yolo_detect}[self.task]()
         except Exception as ex:
             import traceback; self.error.emit(f'{ex}\n{traceback.format_exc()}')
+
+    def _yolo_detect(self):
+        kw = self.kw
+        self.progress.emit(10, f'Détection YOLO ({kw["target"]})…')
+        det = detect_vertebrae(
+            kw['img'], conf=kw.get('conf', 0.25), iou=kw.get('iou', 0.45),
+            imgsz=kw.get('imgsz', 288), preprocess=kw.get('preprocess', True),
+            preprocess_params=kw.get('pp', {}))
+        self.progress.emit(100, f'{det["n_detections"]} vertèbre(s) — {kw["target"]}')
+        self.result.emit({'task': 'yolo_detect', 'target': kw['target'], **det})
 
     def _drr(self):
         def pcb(pct, msg):
@@ -900,6 +922,178 @@ _SEG_PALETTE = [
     (240,120,60),(60,240,240),(240,60,180),(120,240,60),(60,120,240),
     (200,200,80),(80,200,200),(200,80,200),(160,240,120),(240,160,120),
 ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dialogue de matching vertèbres
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VertebraMatchDialog(QDialog):
+    """
+    Dialogue pour sélectionner quelles vertèbres garder quand les
+    détections fluoro et DRR n'ont pas le même nombre.
+    Deux modes : automatique (par position) ou manuel (checkboxes).
+    """
+
+    def __init__(self, det_fl: dict, det_drr: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Matching des vertèbres détectées')
+        self.setMinimumSize(700, 500)
+        self.setStyleSheet(STYLE)
+        self._det_fl = det_fl
+        self._det_drr = det_drr
+        self._sel_fl = []
+        self._sel_drr = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        boxes_fl = self._det_fl['boxes']
+        boxes_drr = self._det_drr['boxes']
+        n_fl, n_drr = len(boxes_fl), len(boxes_drr)
+
+        info = QLabel(
+            f'Fluoro : {n_fl} vertèbre(s)   |   DRR : {n_drr} vertèbre(s)\n'
+            f'Choisissez les vertèbres à garder pour le recalage.')
+        info.setObjectName('dim'); info.setWordWrap(True)
+        root.addWidget(info)
+
+        # ── Mode automatique ──────────────────────────────────────────────────
+        btn_auto = QPushButton('⚡  Matching automatique (par position verticale)')
+        btn_auto.setObjectName('primary')
+        btn_auto.clicked.connect(self._auto_match)
+        root.addWidget(btn_auto)
+
+        self.lbl_auto = QLabel(''); self.lbl_auto.setObjectName('dim')
+        self.lbl_auto.setWordWrap(True)
+        root.addWidget(self.lbl_auto)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f'color:{TEXT_DIM};')
+        root.addWidget(sep)
+
+        manual_lbl = QLabel('— ou sélection manuelle —')
+        manual_lbl.setObjectName('dim'); manual_lbl.setAlignment(Qt.AlignCenter)
+        root.addWidget(manual_lbl)
+
+        # ── Colonnes côte à côte ──────────────────────────────────────────────
+        cols = QHBoxLayout(); cols.setSpacing(12)
+
+        # Colonne Fluoro
+        fl_box = QGroupBox(f'Fluoro ({n_fl})')
+        fl_box.setStyleSheet(f'QGroupBox {{ background:{CARD_BG}; border:1px solid {BORDER2}; '
+                              f'border-radius:6px; padding:10px; }} '
+                              f'QGroupBox::title {{ color:{ACCENT}; }}')
+        fl_lay = QVBoxLayout(fl_box)
+        self._chk_fl = []
+        for i, b in enumerate(boxes_fl):
+            cy = (b['y1'] + b['y2']) // 2
+            chk = QCheckBox(f'V{i+1}  y={cy}  conf={b["conf"]:.0%}')
+            chk.setChecked(True)
+            fl_lay.addWidget(chk)
+            self._chk_fl.append(chk)
+        fl_lay.addStretch()
+        cols.addWidget(fl_box, 1)
+
+        # Colonne DRR
+        drr_box = QGroupBox(f'DRR ({n_drr})')
+        drr_box.setStyleSheet(f'QGroupBox {{ background:{CARD_BG}; border:1px solid {BORDER2}; '
+                               f'border-radius:6px; padding:10px; }} '
+                               f'QGroupBox::title {{ color:{ACCENT}; }}')
+        drr_lay = QVBoxLayout(drr_box)
+        self._chk_drr = []
+        for i, b in enumerate(boxes_drr):
+            cy = (b['y1'] + b['y2']) // 2
+            chk = QCheckBox(f'V{i+1}  y={cy}  conf={b["conf"]:.0%}')
+            chk.setChecked(True)
+            drr_lay.addWidget(chk)
+            self._chk_drr.append(chk)
+        drr_lay.addStretch()
+        cols.addWidget(drr_box, 1)
+        root.addLayout(cols, 1)
+
+        # ── Boutons ───────────────────────────────────────────────────────────
+        btns = QHBoxLayout()
+        btn_ok = QPushButton('Appliquer la sélection')
+        btn_ok.setObjectName('success')
+        btn_ok.clicked.connect(self._apply_manual)
+        btns.addWidget(btn_ok, 1)
+        btn_cancel = QPushButton('Annuler')
+        btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(btn_cancel)
+        root.addLayout(btns)
+
+    def _auto_match(self):
+        """
+        Matching automatique par position verticale normalisée.
+        On normalise les centres Y de chaque côté en [0, 1], puis
+        on associe greedily les vertèbres les plus proches.
+        On garde les N = min(n_fl, n_drr) meilleures paires.
+        """
+        boxes_fl = self._det_fl['boxes']
+        boxes_drr = self._det_drr['boxes']
+
+        # Centres Y normalisés
+        h_fl = self._det_fl['mask'].shape[0]
+        h_drr = self._det_drr['mask'].shape[0]
+        cy_fl = [((b['y1'] + b['y2']) / 2.0) / h_fl for b in boxes_fl]
+        cy_drr = [((b['y1'] + b['y2']) / 2.0) / h_drr for b in boxes_drr]
+
+        # Greedy matching : pour chaque vertèbre du côté le plus petit,
+        # trouver la plus proche de l'autre côté (non déjà prise)
+        n_min = min(len(cy_fl), len(cy_drr))
+        if len(cy_fl) <= len(cy_drr):
+            used_drr = set()
+            pairs = []
+            for i_fl in range(len(cy_fl)):
+                best_j = None; best_d = float('inf')
+                for j_drr in range(len(cy_drr)):
+                    if j_drr in used_drr:
+                        continue
+                    d = abs(cy_fl[i_fl] - cy_drr[j_drr])
+                    if d < best_d:
+                        best_d = d; best_j = j_drr
+                if best_j is not None:
+                    pairs.append((i_fl, best_j))
+                    used_drr.add(best_j)
+        else:
+            used_fl = set()
+            pairs = []
+            for j_drr in range(len(cy_drr)):
+                best_i = None; best_d = float('inf')
+                for i_fl in range(len(cy_fl)):
+                    if i_fl in used_fl:
+                        continue
+                    d = abs(cy_fl[i_fl] - cy_drr[j_drr])
+                    if d < best_d:
+                        best_d = d; best_i = i_fl
+                if best_i is not None:
+                    pairs.append((best_i, j_drr))
+                    used_fl.add(best_i)
+
+        self._sel_fl = [p[0] for p in pairs]
+        self._sel_drr = [p[1] for p in pairs]
+
+        # Mettre à jour les checkboxes
+        for i, chk in enumerate(self._chk_fl):
+            chk.setChecked(i in self._sel_fl)
+        for i, chk in enumerate(self._chk_drr):
+            chk.setChecked(i in self._sel_drr)
+
+        desc = ', '.join(f'F-V{p[0]+1} ↔ D-V{p[1]+1}' for p in pairs)
+        self.lbl_auto.setText(
+            f'✓ {len(pairs)} paire(s) associée(s) par position :\n{desc}')
+
+    def _apply_manual(self):
+        self._sel_fl = [i for i, c in enumerate(self._chk_fl) if c.isChecked()]
+        self._sel_drr = [i for i, c in enumerate(self._chk_drr) if c.isChecked()]
+        self.accept()
+
+    def get_selection(self):
+        return self._sel_fl, self._sel_drr
+
 
 class SegOverlayWindow(QDialog):
     """Fenêtre optimisée : fluoroscopie recalée + segmentations, contrôles avancés."""
@@ -1595,6 +1789,59 @@ class MainWindow(QMainWindow):
         sec_ann.addWidget(hint)
         ll.addWidget(sec_ann)
 
+        # ── DETECTION YOLO ────────────────────────────────────────────────────
+        sec_yolo = CollapsibleSection('DETECTION YOLO', starts_open=True)
+
+        row_yolo_load = QHBoxLayout(); row_yolo_load.setSpacing(4)
+        self.btn_load_yolo = QPushButton('Charger modèle (.pt)')
+        self.btn_load_yolo.clicked.connect(self._load_yolo_model)
+        row_yolo_load.addWidget(self.btn_load_yolo, 1)
+        self.lbl_yolo = QLabel(''); self.lbl_yolo.setObjectName('dim')
+        row_yolo_load.addWidget(self.lbl_yolo)
+        sec_yolo.addLayout(row_yolo_load)
+
+        yolo_grid = QWidget(); yolo_grid.setStyleSheet('background:transparent;')
+        ygl = QGridLayout(yolo_grid); ygl.setContentsMargins(0,0,0,0); ygl.setSpacing(4)
+        ygl.addWidget(_lbl('Confiance (%)'), 0, 0)
+        self.sp_yolo_conf = QSpinBox(); self.sp_yolo_conf.setRange(1, 95); self.sp_yolo_conf.setValue(25)
+        ygl.addWidget(self.sp_yolo_conf, 0, 1)
+        ygl.addWidget(_lbl('IoU NMS (%)'), 1, 0)
+        self.sp_yolo_iou = QSpinBox(); self.sp_yolo_iou.setRange(1, 95); self.sp_yolo_iou.setValue(45)
+        ygl.addWidget(self.sp_yolo_iou, 1, 1)
+        ygl.addWidget(_lbl('imgsz (px)'), 2, 0)
+        self.sp_yolo_imgsz = QSpinBox(); self.sp_yolo_imgsz.setRange(0, 2048); self.sp_yolo_imgsz.setValue(288)
+        ygl.addWidget(self.sp_yolo_imgsz, 2, 1)
+        ygl.addWidget(_lbl('Gamma'), 3, 0)
+        self.sp_yolo_gamma = QDoubleSpinBox(); self.sp_yolo_gamma.setRange(0.1, 5.0); self.sp_yolo_gamma.setValue(1.4); self.sp_yolo_gamma.setSingleStep(0.1)
+        ygl.addWidget(self.sp_yolo_gamma, 3, 1)
+        ygl.addWidget(_lbl('CLAHE clip'), 4, 0)
+        self.sp_yolo_clahe = QDoubleSpinBox(); self.sp_yolo_clahe.setRange(0.1, 20.0); self.sp_yolo_clahe.setValue(2.5); self.sp_yolo_clahe.setSingleStep(0.5)
+        ygl.addWidget(self.sp_yolo_clahe, 4, 1)
+        ygl.addWidget(_lbl('Unsharp'), 5, 0)
+        self.sp_yolo_sharp = QDoubleSpinBox(); self.sp_yolo_sharp.setRange(0.0, 5.0); self.sp_yolo_sharp.setValue(0.5); self.sp_yolo_sharp.setSingleStep(0.1)
+        ygl.addWidget(self.sp_yolo_sharp, 5, 1)
+        self.chk_yolo_invert = QCheckBox('Inverser'); ygl.addWidget(self.chk_yolo_invert, 6, 0, 1, 2)
+        sec_yolo.addWidget(yolo_grid)
+
+        row_det = QHBoxLayout(); row_det.setSpacing(4)
+        self.btn_detect_fl = QPushButton('Détecter Fluoro'); self.btn_detect_fl.setObjectName('primary')
+        self.btn_detect_fl.clicked.connect(self._detect_fluoro)
+        row_det.addWidget(self.btn_detect_fl, 1)
+        self.btn_detect_drr = QPushButton('Détecter DRR'); self.btn_detect_drr.setObjectName('primary')
+        self.btn_detect_drr.clicked.connect(self._detect_drr)
+        row_det.addWidget(self.btn_detect_drr, 1)
+        sec_yolo.addLayout(row_det)
+
+        self.lbl_yolo_status = QLabel(''); self.lbl_yolo_status.setObjectName('dim')
+        self.lbl_yolo_status.setWordWrap(True)
+        sec_yolo.addWidget(self.lbl_yolo_status)
+
+        # État détections
+        self._yolo_det_fl = None    # résultat detect_vertebrae fluoro
+        self._yolo_det_drr = None   # résultat detect_vertebrae DRR
+
+        ll.addWidget(sec_yolo)
+
         # ── RECALAGE ──────────────────────────────────────────────────────────
         sec_reg = CollapsibleSection('RECALAGE', starts_open=True)
 
@@ -1712,7 +1959,7 @@ class MainWindow(QMainWindow):
     def _on_mask_upd(self):
         has_fl  = self.cv_fl.get_mask()  is not None and self.cv_fl.get_mask().sum()  > 0
         has_drr = self.cv_drr.get_mask() is not None and self.cv_drr.get_mask().sum() > 0
-        self.btn_reg.setEnabled(has_fl and has_drr)
+        self.btn_reg.setEnabled(bool(has_fl and has_drr))
 
     # ── Drag & Drop / Gestion images ─────────────────────────────────────────
 
@@ -2042,9 +2289,9 @@ class MainWindow(QMainWindow):
         if md is None or md.sum()==0: self._err('Aucun masque vertebres sur le DRR (generez le DRR d\'abord)'); return
         # Normaliser les deux masques à la même taille de travail pour le recalage
         reg_size = self.sp_size.value()
-        if mf.shape[0] != reg_size:
+        if mf.shape[:2] != (reg_size, reg_size):
             mf = cv2.resize(mf, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
-        if md.shape[0] != reg_size:
+        if md.shape[:2] != (reg_size, reg_size):
             md = cv2.resize(md, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
         self.btn_reg.setEnabled(False)
         kw=dict(moving=md, fixed=mf, elastic=self.chk_elastic.isChecked())
@@ -2074,6 +2321,11 @@ class MainWindow(QMainWindow):
         # ── Images source ─────────────────────────────────────────────────────
         fig_fl  = self.fluoro_image if self.fluoro_image is not None else np.zeros((s,s),np.float32)
         fig_drr = self.drr_image    if self.drr_image    is not None else np.zeros((s,s),np.float32)
+        # Resize au format de recalage pour avoir des dimensions homogènes
+        if fig_fl.shape[:2] != (s, s):
+            fig_fl = cv2.resize(fig_fl.astype(np.float32), (s, s), interpolation=cv2.INTER_LINEAR)
+        if fig_drr.shape[:2] != (s, s):
+            fig_drr = cv2.resize(fig_drr.astype(np.float32), (s, s), interpolation=cv2.INTER_LINEAR)
         fig_drr_reg = apply_full_transform(fig_drr.astype(np.float32), res)
 
         # ── Contours à superposer ─────────────────────────────────────────────
@@ -2084,6 +2336,8 @@ class MainWindow(QMainWindow):
         for struct,info in STRUCT.items():
             m=self.cv_fl.get_mask(struct)
             if m is None or m.sum()==0: continue
+            if m.shape[:2] != (s, s):
+                m = cv2.resize(m.astype(np.uint8), (s, s), interpolation=cv2.INTER_NEAREST)
             cnts,_=cv2.findContours((m*255).astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
             for cnt in cnts:
                 pts=cnt.squeeze()
@@ -2093,6 +2347,8 @@ class MainWindow(QMainWindow):
         for struct in STRUCT:
             m=self.cv_drr.get_mask(struct)
             if m is None or m.sum()==0: continue
+            if m.shape[:2] != (s, s):
+                m = cv2.resize(m.astype(np.float32), (s, s), interpolation=cv2.INTER_NEAREST)
             mr=(apply_full_transform(m.astype(np.float32), res) > 0.5).astype(np.uint8)
             cnts,_=cv2.findContours((mr*255).astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
             for cnt in cnts:
@@ -2101,6 +2357,8 @@ class MainWindow(QMainWindow):
 
         # Contours projections CT recalees
         for name,proj in self.proj_masks.items():
+            if proj.shape[:2] != (s, s):
+                proj = cv2.resize(proj.astype(np.float32), (s, s), interpolation=cv2.INTER_NEAREST)
             pr=(apply_full_transform(proj.astype(np.float32), res) > 0.5).astype(np.uint8)
             col=ct_cols.get(name,(200,200,200))
             cnts,_=cv2.findContours((pr*255).astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
@@ -2156,9 +2414,123 @@ class MainWindow(QMainWindow):
         win.exec_()
 
     def _on_prog(self,pct,msg): self.prog_bar.setValue(pct); self.lbl_prog.setText(msg); self._status(msg)
-    def _on_err(self,msg): self.btn_drr.setEnabled(True); self.btn_reg.setEnabled(True); self._err(msg)
+    def _on_err(self,msg): self.btn_drr.setEnabled(True); self.btn_reg.setEnabled(True); self.btn_detect_fl.setEnabled(True); self.btn_detect_drr.setEnabled(True); self._err(msg)
     def _status(self,msg): self.statusBar().showMessage(msg)
     def _err(self,msg): self.statusBar().showMessage(msg); QMessageBox.warning(self,'Erreur',msg)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Détection YOLO
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _load_yolo_model(self):
+        p, _ = QFileDialog.getOpenFileName(self, 'Modèle YOLO', '', 'PyTorch (*.pt)')
+        if not p:
+            return
+        try:
+            yolo_load(p)
+            self.lbl_yolo.setText(os.path.basename(p))
+            self._status(f'YOLO : {os.path.basename(p)}')
+        except Exception as ex:
+            self._err(str(ex))
+
+    def _yolo_kw(self):
+        return dict(
+            conf=self.sp_yolo_conf.value() / 100.0,
+            iou=self.sp_yolo_iou.value() / 100.0,
+            imgsz=self.sp_yolo_imgsz.value(),
+            pp={'gamma': self.sp_yolo_gamma.value(),
+                'clahe_clip': self.sp_yolo_clahe.value(),
+                'unsharp_strength': self.sp_yolo_sharp.value(),
+                'invert': self.chk_yolo_invert.isChecked()})
+
+    def _detect_fluoro(self):
+        if not yolo_ready():
+            self._err('Chargez un modèle YOLO (.pt) d\'abord.'); return
+        if self.fluoro_image is None:
+            self._err('Chargez une fluoroscopie d\'abord.'); return
+        kw = {**self._yolo_kw(), 'img': self.fluoro_image,
+              'target': 'fluoro', 'preprocess': True}
+        self.worker = WorkerThread('yolo_detect', kw)
+        self.worker.progress.connect(self._on_prog)
+        self.worker.result.connect(self._on_yolo_result)
+        self.worker.error.connect(self._on_err)
+        self.worker.start()
+
+    def _detect_drr(self):
+        if not yolo_ready():
+            self._err('Chargez un modèle YOLO (.pt) d\'abord.'); return
+        if self.drr_image is None:
+            self._err('Générez ou chargez un DRR d\'abord.'); return
+        kw = {**self._yolo_kw(), 'img': self.drr_image,
+              'target': 'drr', 'preprocess': False}
+        self.worker = WorkerThread('yolo_detect', kw)
+        self.worker.progress.connect(self._on_prog)
+        self.worker.result.connect(self._on_yolo_result)
+        self.worker.error.connect(self._on_err)
+        self.worker.start()
+
+    def _on_yolo_result(self, res):
+        target = res['target']
+        n = res['n_detections']
+        if n == 0:
+            self._err(f'Aucune vertèbre détectée sur {target}.')
+            return
+        if target == 'fluoro':
+            self._yolo_det_fl = res
+        else:
+            self._yolo_det_drr = res
+
+        # Construire le masque et l'injecter
+        canvas = self.cv_fl if target == 'fluoro' else self.cv_drr
+        s = canvas._size
+        mask = boxes_to_mask(res['boxes'], res['mask'].shape[0], res['mask'].shape[1])
+        mask_f32 = mask.astype(np.float32) / 255.0
+        canvas.set_mask('vertebrae', mask_f32)
+
+        tab = 0 if target == 'fluoro' else 1
+        self.tabs.setCurrentIndex(tab)
+
+        self.lbl_yolo_status.setText(
+            f'{target.upper()} : {n} vertèbre(s) détectée(s)\n'
+            f'Masque injecté dans l\'onglet {"Fixe" if target=="fluoro" else "DRR"}')
+        self._status(f'YOLO {target} : {n} vertèbre(s)')
+
+        # Si on a les deux détections, proposer le matching
+        if self._yolo_det_fl is not None and self._yolo_det_drr is not None:
+            n_fl = self._yolo_det_fl['n_detections']
+            n_drr = self._yolo_det_drr['n_detections']
+            if n_fl != n_drr:
+                self.lbl_yolo_status.setText(
+                    f'⚠ Nombre différent : Fluoro={n_fl}, DRR={n_drr}\n'
+                    f'→ Cliquez Matcher pour choisir les vertèbres communes')
+                self._show_match_dialog()
+            else:
+                self.lbl_yolo_status.setText(
+                    f'✓ {n_fl} vertèbre(s) sur chaque image\n'
+                    f'Masques injectés — prêt pour le recalage')
+                self.btn_reg.setEnabled(True)
+
+    def _show_match_dialog(self):
+        dlg = VertebraMatchDialog(
+            self._yolo_det_fl, self._yolo_det_drr, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            sel_fl, sel_drr = dlg.get_selection()
+            if not sel_fl or not sel_drr:
+                self._err('Aucune vertèbre sélectionnée.'); return
+            # Reconstruire les masques avec seulement les boîtes sélectionnées
+            det_fl = self._yolo_det_fl
+            det_drr = self._yolo_det_drr
+            h_fl, w_fl = det_fl['mask'].shape
+            h_drr, w_drr = det_drr['mask'].shape
+            mask_fl = boxes_to_mask([det_fl['boxes'][i] for i in sel_fl], h_fl, w_fl)
+            mask_drr = boxes_to_mask([det_drr['boxes'][i] for i in sel_drr], h_drr, w_drr)
+            self.cv_fl.set_mask('vertebrae', mask_fl.astype(np.float32) / 255.0)
+            self.cv_drr.set_mask('vertebrae', mask_drr.astype(np.float32) / 255.0)
+            self.lbl_yolo_status.setText(
+                f'✓ Matching : {len(sel_fl)} vertèbre(s) sélectionnée(s)\n'
+                f'Masques mis à jour — prêt pour le recalage')
+            self.btn_reg.setEnabled(True)
+            self._status(f'Matching : {len(sel_fl)} vertèbre(s) retenues')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
