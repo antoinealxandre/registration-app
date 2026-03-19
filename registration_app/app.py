@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QDialog, QScrollArea, QToolButton, QButtonGroup,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QCursor, QFont
+from PyQt5.QtGui import QImage, QPixmap, QCursor, QFont, QIcon, QPainter
 
 sys.path.insert(0, os.path.dirname(__file__))
 from core.drr_generator import load_ct, generate_drr, project_mask_3d
@@ -141,6 +141,28 @@ def catmull_rom_chain(points: list, n_interp: int = 8) -> list:
             result.append((int(round(x)), int(round(y))))
     result.append((int(pts[-1][0]), int(pts[-1][1])))
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Icônes SVG (Material Icons)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_svg_icon(path_d: str, color: str = '#cdd5e8', size: int = 20):
+    """Crée une QIcon depuis un path SVG Material Icons (viewBox 0 0 24 24)."""
+    try:
+        from PyQt5.QtSvg import QSvgRenderer
+        from PyQt5.QtCore import QByteArray
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+               f'<path fill="{color}" d="{path_d}"/></svg>')
+        renderer = QSvgRenderer(QByteArray(svg.encode('utf-8')))
+        img = QImage(size, size, QImage.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        renderer.render(p)
+        p.end()
+        return QIcon(QPixmap.fromImage(img))
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -575,11 +597,6 @@ class AnnotationCanvas(QLabel):
         if self._tool=='eraser' and self._cursor_pos:
             cv2.circle(base,self._cursor_pos,self._brush_r,(200,80,80),2)
             cv2.circle(base,self._cursor_pos,2,(200,80,80),-1)
-
-        # Barre de statut en bas
-        labels={'pencil':'CRAYON','polygon':'POLYGONE','rectangle':'RECT','eraser':'GOMME'}
-        txt=f"{labels.get(self._tool,'')}  |  {STRUCT[self._active]['label']}"
-        cv2.putText(base,txt,(8,self._size-10),cv2.FONT_HERSHEY_SIMPLEX,0.38,(r,g,b),1)
 
         h,w=base.shape[:2]
         qi=QImage(base.data,w,h,3*w,QImage.Format_RGB888)
@@ -1688,7 +1705,7 @@ def read_metadata_csv(path: str):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('2D/3D Registration — EP Lab')
+        self.setWindowTitle('2D/3D Registration')
         self.setMinimumSize(1280, 800)
         self.setStyleSheet(STYLE)
         self.ct_vol = self.voxel_mm = self.ct_aff = None
@@ -1725,7 +1742,7 @@ class MainWindow(QMainWindow):
         left_vbox.setSpacing(0)
 
         # Logo/titre
-        tl = QLabel('EP Lab  |  2D/3D Registration')
+        tl = QLabel('2D/3D Registration')
         tl.setAlignment(Qt.AlignCenter)
         tl.setFixedHeight(44)
         tl.setStyleSheet(
@@ -1760,35 +1777,30 @@ class MainWindow(QMainWindow):
         btn_browse.clicked.connect(self._on_browse)
         sec_data.addWidget(btn_browse)
 
+        self._chk_indicators = {}
+
+        def _dot_row(label_widget, key):
+            row = QHBoxLayout(); row.setSpacing(6); row.setContentsMargins(0, 0, 0, 0)
+            dot = QLabel('●'); dot.setFixedWidth(16)
+            dot.setStyleSheet(f'color:{TEXT_DIM};font-size:14px;border:none;background:transparent;')
+            self._chk_indicators[key] = dot
+            row.addWidget(dot); row.addWidget(label_widget, 1)
+            return row
+
         self.lbl_ct = QLabel('CT : --'); self.lbl_ct.setObjectName('dim'); self.lbl_ct.setWordWrap(True)
         self.lbl_seg = QLabel('Seg : --'); self.lbl_seg.setObjectName('dim'); self.lbl_seg.setWordWrap(True)
         self.lbl_fluoro_meta = QLabel('Fluoro : --'); self.lbl_fluoro_meta.setObjectName('dim'); self.lbl_fluoro_meta.setWordWrap(True)
-        sec_data.addWidget(self.lbl_ct)
-        sec_data.addWidget(self.lbl_seg)
-        sec_data.addWidget(self.lbl_fluoro_meta)
+        sec_data.addLayout(_dot_row(self.lbl_ct, 'ct'))
+        sec_data.addLayout(_dot_row(self.lbl_seg, 'seg'))
+        sec_data.addLayout(_dot_row(self.lbl_fluoro_meta, 'fluoro'))
 
-        # ── Checklist pastilles ────────────────────────────────────────────
-        chk_frame = QWidget()
-        chk_frame.setStyleSheet(f'background:{CARD_BG};border:1px solid {BORDER2};border-radius:6px;')
-        chk_lay = QVBoxLayout(chk_frame)
-        chk_lay.setContentsMargins(10, 8, 10, 8); chk_lay.setSpacing(4)
-        chk_title = QLabel('CHECKLIST')
-        chk_title.setStyleSheet(f'color:{ACCENT};font-size:11px;font-weight:600;letter-spacing:1px;border:none;background:transparent;')
-        chk_lay.addWidget(chk_title)
-        self._chk_indicators = {}
-        for key, label in [('ct', 'CT Volume'), ('seg', 'Segmentation'),
-                           ('fluoro', 'Fluoroscopie'), ('drr', 'DRR'),
-                           ('yolo', 'Modele YOLO'), ('reg', 'Recalage')]:
-            row = QHBoxLayout(); row.setSpacing(6)
-            dot = QLabel('●')
-            dot.setFixedWidth(16)
-            dot.setStyleSheet(f'color:{TEXT_DIM};font-size:14px;border:none;background:transparent;')
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f'color:{TEXT_MID};font-size:11px;border:none;background:transparent;')
-            row.addWidget(dot); row.addWidget(lbl, 1)
-            chk_lay.addLayout(row)
-            self._chk_indicators[key] = dot
-        sec_data.addWidget(chk_frame)
+        # Dots fantômes pour DRR / YOLO / Reg (non affichés, mis à jour par _update_checklist)
+        for _key in ('drr', 'yolo', 'reg'):
+            _d = QLabel('●'); _d.setFixedWidth(16)
+            _d.setStyleSheet(f'color:{TEXT_DIM};font-size:14px;border:none;background:transparent;')
+            _d.hide()
+            self._chk_indicators[_key] = _d
+
         ll.addWidget(sec_data)
 
         # ── IMAGES ────────────────────────────────────────────────────────────
@@ -1835,10 +1847,6 @@ class MainWindow(QMainWindow):
         # ── ANNOTATION ────────────────────────────────────────────────────────
         sec_ann = CollapsibleSection('ANNOTATION', starts_open=True)
 
-        hint_wf = QLabel('➤ DRR : contours vertebres auto-injectes depuis la segmentation CT\n➤ Fluoroscopie : annoter manuellement les vertebres visibles')
-        hint_wf.setObjectName('dim'); hint_wf.setWordWrap(True)
-        sec_ann.addWidget(hint_wf)
-
         self.chk_use_seg = QCheckBox('Utiliser la segmentation CT (contours auto sur DRR)')
         self.chk_use_seg.setChecked(True)
         self.chk_use_seg.setToolTip(
@@ -1846,12 +1854,43 @@ class MainWindow(QMainWindow):
             'Decoche : le DRR est genere vierge, annoter manuellement les vertebres.')
         sec_ann.addWidget(self.chk_use_seg)
 
-        tr = QHBoxLayout(); tr.setSpacing(6); tr.setContentsMargins(0, 0, 0, 0)
-        self.btn_pencil = QPushButton('Crayon'); self.btn_pencil.setObjectName('tool'); self.btn_pencil.setCheckable(True); self.btn_pencil.setChecked(True)
-        self.btn_rect = QPushButton('Rectangle'); self.btn_rect.setObjectName('tool'); self.btn_rect.setCheckable(True)
+        # Boutons outils avec icônes Material Icons
+        tr = QHBoxLayout(); tr.setSpacing(4); tr.setContentsMargins(0, 0, 0, 0)
+        _pencil_d = ('M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z'
+                     'M20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39'
+                     '-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z')
+        _rect_d   = 'M3 3v18h18V3H3zm16 16H5V5h14v14z'
+        _eraser_d = ('M15.14 3c-.51 0-1.02.2-1.41.59L2.59 14.73c-.78.77-.78 2.04'
+                     ' 0 2.83L5.03 20h7.66l8.72-8.73c.79-.78.79-2.05 0-2.83l-4.85'
+                     '-4.85c-.39-.39-.9-.59-1.42-.59zM6.04 19l-2.06-2.07 5.23-5.22'
+                     ' 2.07 2.07L6.04 19z')
+
+        self.btn_pencil = QPushButton(); self.btn_pencil.setObjectName('tool')
+        self.btn_pencil.setCheckable(True); self.btn_pencil.setChecked(True)
+        self.btn_pencil.setFixedSize(34, 34); self.btn_pencil.setToolTip('Crayon (tracé libre)')
+        _ic = _make_svg_icon(_pencil_d)
+        if _ic: self.btn_pencil.setIcon(_ic); self.btn_pencil.setIconSize(QSize(20, 20))
+        else: self.btn_pencil.setText('✏')
+
+        self.btn_rect = QPushButton(); self.btn_rect.setObjectName('tool')
+        self.btn_rect.setCheckable(True)
+        self.btn_rect.setFixedSize(34, 34); self.btn_rect.setToolTip('Rectangle')
+        _ic = _make_svg_icon(_rect_d)
+        if _ic: self.btn_rect.setIcon(_ic); self.btn_rect.setIconSize(QSize(20, 20))
+        else: self.btn_rect.setText('⬜')
+
+        self.btn_eraser = QPushButton(); self.btn_eraser.setObjectName('tool')
+        self.btn_eraser.setCheckable(True)
+        self.btn_eraser.setFixedSize(34, 34); self.btn_eraser.setToolTip('Gomme (effacer)')
+        _ic = _make_svg_icon(_eraser_d)
+        if _ic: self.btn_eraser.setIcon(_ic); self.btn_eraser.setIconSize(QSize(20, 20))
+        else: self.btn_eraser.setText('⌫')
+
         self.btn_pencil.clicked.connect(lambda: self._set_tool('pencil'))
         self.btn_rect.clicked.connect(lambda: self._set_tool('rectangle'))
-        tr.addWidget(self.btn_pencil, 1); tr.addWidget(self.btn_rect, 1)
+        self.btn_eraser.clicked.connect(lambda: self._set_tool('eraser'))
+        tr.addWidget(self.btn_pencil); tr.addWidget(self.btn_rect); tr.addWidget(self.btn_eraser)
+        tr.addStretch()
         sec_ann.addLayout(tr)
 
         rp = QHBoxLayout(); rp.setSpacing(6); rp.setContentsMargins(0, 0, 0, 0)
@@ -1869,10 +1908,6 @@ class MainWindow(QMainWindow):
         b_all.clicked.connect(self._clear_all)
         act.addWidget(b_undo, 1); act.addWidget(b_all, 1)
         sec_ann.addLayout(act)
-
-        hint = QLabel('Crayon : tracer le contour puis relacher\nFermeture auto si retour au depart')
-        hint.setObjectName('dim'); hint.setWordWrap(True)
-        sec_ann.addWidget(hint)
         ll.addWidget(sec_ann)
 
         # ── DETECTION YOLO ────────────────────────────────────────────────────
@@ -2012,20 +2047,23 @@ class MainWindow(QMainWindow):
 
     def _wrap(self, cv, hint):
         w = QWidget(); w.setStyleSheet(f'background:{PANEL_BG};')
-        l = QVBoxLayout(w); l.setContentsMargins(4, 4, 4, 4); l.setSpacing(4)
-        hl = QLabel(hint); hl.setObjectName('dim'); hl.setAlignment(Qt.AlignCenter)
-        l.addWidget(hl); l.addWidget(cv, 1)
+        l = QVBoxLayout(w); l.setContentsMargins(4, 4, 4, 4); l.setSpacing(0)
+        l.addWidget(cv, 1)
         return w
 
     # ── Slots UI ──────────────────────────────────────────────────────────────
 
-    def _set_tool(self,tool):
-        for btn,t in [(self.btn_pencil,'pencil'),(self.btn_rect,'rectangle')]:
-            btn.setChecked(t==tool)
-        for cv in [self.cv_fl,self.cv_drr]: cv.set_tool(tool)
-        hints={'pencil':'Tracer le contour en continu, relacher pour valider',
-               'rectangle':'Cliquer-glisser pour dessiner un rectangle'}
-        self._status(hints.get(tool,''))
+    def _set_tool(self, tool):
+        for btn, t in [(self.btn_pencil, 'pencil'), (self.btn_rect, 'rectangle'), (self.btn_eraser, 'eraser')]:
+            btn.setChecked(t == tool)
+        for cv in [self.cv_fl, self.cv_drr]:
+            cv.set_tool(tool)
+        hints = {
+            'pencil':    'Tracer le contour en continu, relacher pour valider',
+            'rectangle': 'Cliquer-glisser pour dessiner un rectangle',
+            'eraser':    'Cliquer-glisser pour effacer des annotations',
+        }
+        self._status(hints.get(tool, ''))
 
     def _on_pen(self,v): self.lbl_pen.setText(f'{v}px'); [cv.set_pen_radius(v) for cv in [self.cv_fl,self.cv_drr]]
     def _undo(self): self._active_cv().undo()
