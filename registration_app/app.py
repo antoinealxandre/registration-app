@@ -858,7 +858,8 @@ class WorkerThread(QThread):
     def __init__(self,task,kw): super().__init__(); self.task=task; self.kw=kw
     def run(self):
         try: {'drr':self._drr,'register':self._reg,
-               'yolo_detect':self._yolo_detect}[self.task]()
+               'yolo_detect':self._yolo_detect,
+               'auto_pipeline':self._auto_pipeline}[self.task]()
         except Exception as ex:
             import traceback; self.error.emit(f'{ex}\n{traceback.format_exc()}')
 
@@ -928,6 +929,218 @@ class WorkerThread(QThread):
             res = register(mask_moving=self.kw['moving'], mask_fixed=self.kw['fixed'],
                            progress_cb=cb)
         self.progress.emit(100, f"IoU={res['iou']:.3f}"); self.result.emit(res)
+
+    # ── Pipeline automatique complet ──────────────────────────────────────────
+    def _auto_pipeline(self):
+        """
+        Pipeline complet en un clic :
+          1. Génération DRR depuis le CT + géométrie DICOM
+          2. Projection individuelle de chaque vertèbre (T6-T12) → bounding-boxes DRR
+          3. Détection YOLO sur la fluoroscopie
+          4. Appariement : on ne garde que les vertèbres visibles des deux côtés
+          5. Recalage IoU sur les masques appariés
+
+        Le côté DRR utilise les segmentations connues (T6-T12) plutôt que YOLO,
+        ce qui élimine l'incertitude sur l'identité des vertèbres DRR.
+        L'appariement se fait par position relative verticale, en cherchant la
+        sous-séquence de détections fluoro qui correspond le mieux aux positions
+        des vertèbres projetées depuis le CT.
+        """
+        import re as _re
+        kw = self.kw
+        ct_path   = kw['ct_path']
+        ct_aff    = kw['ct_aff']
+        seg_masks = kw['seg_masks']       # dict {name: 3d_mask}
+        fluoro    = kw['fluoro']           # float32 [0,1]
+        reg_size  = kw['output_size']
+        elastic   = kw.get('elastic', False)
+        yolo_kw   = kw.get('yolo_kw', {})
+
+        # ── Filtrer les segmentations vertébrales (T6-T12) ────────────────────
+        vert_pattern = _re.compile(r'(T|L|C|S)\s*(\d+)', _re.IGNORECASE)
+        vert_segs = {}
+        for name, mask3d in seg_masks.items():
+            m = vert_pattern.search(name)
+            if m:
+                region = m.group(1).upper()
+                num = int(m.group(2))
+                order = {'C': 0, 'T': 1, 'L': 2, 'S': 3}.get(region, 9) * 100 + num
+                vert_segs[name] = {'mask': mask3d, 'order': order,
+                                   'label': f'{region}{num}'}
+        if not vert_segs:
+            raise RuntimeError(
+                'Aucune segmentation vertébrale trouvée dans les masques chargés.\n'
+                'Noms trouvés : ' + ', '.join(seg_masks.keys()))
+
+        # Trier par ordre anatomique (C→T→L→S)
+        vert_sorted = sorted(vert_segs.items(), key=lambda x: x[1]['order'])
+        n_seg = len(vert_sorted)
+        labels_seg = [v['label'] for _, v in vert_sorted]
+        self.progress.emit(3, f'{n_seg} vertèbre(s) segmentée(s) : {", ".join(labels_seg)}')
+
+        # ── 1. Génération DRR ─────────────────────────────────────────────────
+        self.progress.emit(5, 'Génération DRR (cone-beam)…')
+        drr_kw = {k: kw[k] for k in ('lao_deg', 'cran_deg', 'table_angle',
+                                       'output_size', 'renderer')
+                  if k in kw}
+        for k in ('sid_mm', 'sod_mm', 'fov_mm'):
+            if k in kw:
+                drr_kw[k] = kw[k]
+        drr_kw['ct_path'] = ct_path
+        drr_kw['progress_cb'] = lambda pct, msg: self.progress.emit(
+            5 + int(pct * 0.15), msg)
+        drr_image = generate_drr(**drr_kw)
+
+        # ── 2. Projection individuelle de chaque vertèbre ────────────────────
+        self.progress.emit(22, 'Projection des segmentations vertébrales…')
+        proj_kw = {k: kw.get(k) for k in ('lao_deg', 'cran_deg', 'table_angle',
+                                            'output_size', 'sid_mm', 'sod_mm',
+                                            'fov_mm', 'renderer')}
+        proj_kw = {k: v for k, v in proj_kw.items() if v is not None}
+        proj_kw['ct_path'] = ct_path
+        proj_kw['ct_affine'] = ct_aff
+
+        drr_vert_boxes = []          # bounding-boxes DRR issues de la segmentation
+        all_proj_masks = {}          # toutes les projections (pour overlay)
+        for i, (name, info) in enumerate(vert_sorted):
+            proj = project_mask_3d(mask_3d=info['mask'], **proj_kw)
+            all_proj_masks[name] = proj
+            # Extraire la bounding-box à partir du masque projeté
+            ys, xs = np.where(proj > 0.5)
+            if len(ys) == 0:
+                continue
+            box = {'x1': int(xs.min()), 'y1': int(ys.min()),
+                   'x2': int(xs.max()), 'y2': int(ys.max()),
+                   'cls_name': info['label'], 'conf': 1.0,
+                   'order': info['order'], 'proj_mask': proj}
+            drr_vert_boxes.append(box)
+            self.progress.emit(22 + int((i + 1) / n_seg * 8),
+                               f'Projection {info["label"]}…')
+
+        if len(drr_vert_boxes) < 2:
+            raise RuntimeError(
+                f'Seulement {len(drr_vert_boxes)} vertèbre(s) visibles sur le DRR '
+                f'après projection. Vérifiez les angles de vue.')
+
+        drr_vert_boxes.sort(key=lambda b: b['y1'])
+        n_drr = len(drr_vert_boxes)
+        drr_labels = [b['cls_name'] for b in drr_vert_boxes]
+        self.progress.emit(30, f'{n_drr} vertèbre(s) projetées sur DRR : {", ".join(drr_labels)}')
+
+        # ── 3. Détection YOLO sur la fluoroscopie ────────────────────────────
+        self.progress.emit(32, 'Détection YOLO sur la fluoroscopie…')
+        fl_resized = cv2.resize(
+            (np.clip(fluoro, 0, 1) * 255).astype(np.uint8),
+            (reg_size, reg_size), interpolation=cv2.INTER_LANCZOS4)
+        det = detect_vertebrae(
+            fl_resized,
+            conf=yolo_kw.get('conf', 0.25),
+            iou=yolo_kw.get('iou', 0.45),
+            imgsz=yolo_kw.get('imgsz', 288),
+            preprocess=True,
+            preprocess_params=yolo_kw.get('pp', {}))
+        boxes_fl = det['boxes']
+        n_fl = len(boxes_fl)
+        if n_fl == 0:
+            raise RuntimeError(
+                'Aucune vertèbre détectée sur la fluoroscopie.\n'
+                'Essayez de baisser le seuil de confiance YOLO.')
+        self.progress.emit(48, f'{n_fl} vertèbre(s) détectée(s) sur la fluoro')
+
+        # ── 4. Appariement ───────────────────────────────────────────────────
+        #
+        # Stratégie : les vertèbres DRR sont connues (T6-T12 par ex.).
+        # On cherche dans les détections fluoro (triées haut→bas) la sous-séquence
+        # contiguë de longueur k qui minimise l'erreur de position relative
+        # par rapport aux vertèbres DRR projetées.
+        #
+        # Cela gère les cas où YOLO détecte plus ou moins de vertèbres que
+        # le nombre de segmentations, en trouvant le meilleur sous-ensemble commun.
+        self.progress.emit(50, 'Appariement des vertèbres…')
+
+        def _rel_centers(boxes, h):
+            return np.array([(b['y1'] + b['y2']) / (2.0 * h) for b in boxes])
+
+        pos_drr = _rel_centers(drr_vert_boxes, reg_size)
+        pos_fl  = _rel_centers(boxes_fl, reg_size)
+
+        best_score = np.inf
+        best_fl_idx = None
+        best_dr_idx = None
+
+        k_max = min(n_drr, n_fl)
+        k_min = max(2, k_max - 2)      # on tolère de perdre 2 vertèbres max
+
+        for k in range(k_max, k_min - 1, -1):
+            for i0 in range(n_fl - k + 1):
+                for j0 in range(n_drr - k + 1):
+                    sub_fl  = pos_fl[i0:i0 + k]
+                    sub_drr = pos_drr[j0:j0 + k]
+                    mse = float(np.mean((sub_fl - sub_drr) ** 2))
+                    penalty = 0.02 * (k_max - k)
+                    score = mse + penalty
+                    if score < best_score:
+                        best_score = score
+                        best_fl_idx = list(range(i0, i0 + k))
+                        best_dr_idx = list(range(j0, j0 + k))
+
+        if best_fl_idx is None or len(best_fl_idx) < 2:
+            raise RuntimeError(
+                f'Impossible d\'apparier les vertèbres.\n'
+                f'DRR : {n_drr} segmentations, Fluoro : {n_fl} détections YOLO.')
+
+        matched_fl  = [boxes_fl[i] for i in best_fl_idx]
+        matched_drr = [drr_vert_boxes[i] for i in best_dr_idx]
+        n_matched = len(matched_fl)
+        matched_labels = [b['cls_name'] for b in matched_drr]
+        self.progress.emit(55,
+            f'{n_matched} vertèbre(s) appariée(s) : {", ".join(matched_labels)}')
+
+        # ── 5. Construction des masques ──────────────────────────────────────
+        # Côté DRR : masques issus de la segmentation projetée (pas des boîtes)
+        mask_drr = np.zeros((reg_size, reg_size), dtype=np.float32)
+        for b in matched_drr:
+            mask_drr = np.clip(mask_drr + b['proj_mask'], 0, 1)
+
+        # Côté fluoro : masques issus des boîtes YOLO
+        mask_fl = np.zeros((reg_size, reg_size), dtype=np.float32)
+        for b in matched_fl:
+            mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
+
+        # ── 6. Recalage ─────────────────────────────────────────────────────
+        self.progress.emit(58, 'Recalage 2D (optimisation IoU)…')
+
+        def reg_cb(frac, iou_val):
+            if elastic:
+                stage = 'Rigide' if frac < 0.5 else 'Elastique'
+                self.progress.emit(58 + int(frac * 35), f'{stage} — IoU={iou_val:.4f}')
+            else:
+                self.progress.emit(58 + int(frac * 35), f'Recalage — IoU={iou_val:.4f}')
+
+        if elastic:
+            res = register_elastic(mask_moving=mask_drr, mask_fixed=mask_fl,
+                                   progress_cb=reg_cb)
+        else:
+            res = register(mask_moving=mask_drr, mask_fixed=mask_fl,
+                           progress_cb=reg_cb)
+
+        self.progress.emit(95,
+            f'Recalage terminé — IoU={res["iou"]:.4f}  Dice={res["dice"]:.4f}')
+
+        # ── Résultat complet ──────────────────────────────────────────────────
+        res['_auto'] = True
+        res['drr_image'] = drr_image
+        res['proj_masks'] = all_proj_masks
+        res['matched_labels'] = matched_labels
+        res['n_matched'] = n_matched
+        res['n_fluoro_det'] = n_fl
+        res['n_drr_seg'] = n_drr
+        res['mask_fl'] = mask_fl
+        res['mask_drr'] = mask_drr
+        self.progress.emit(100,
+            f'Pipeline terminé — IoU={res["iou"]:.4f}  '
+            f'Vertèbres : {", ".join(matched_labels)}')
+        self.result.emit(res)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1848,7 +2061,7 @@ class MainWindow(QMainWindow):
         sec_ann = CollapsibleSection('ANNOTATION', starts_open=True)
 
         self.chk_use_seg = QCheckBox('Utiliser la segmentation CT (contours auto sur DRR)')
-        self.chk_use_seg.setChecked(True)
+        self.chk_use_seg.setChecked(False)
         self.chk_use_seg.setToolTip(
             'Coche : les masques de segmentation 3D sont auto-projetes sur le DRR apres generation.\n'
             'Decoche : le DRR est genere vierge, annoter manuellement les vertebres.')
@@ -2021,6 +2234,33 @@ class MainWindow(QMainWindow):
         btn_exp.clicked.connect(self.export_results)
         sec_act.addWidget(btn_exp)
         ll.addWidget(sec_act)
+
+        # ── PIPELINE AUTO (bouton magique) ────────────────────────────────────
+        sec_auto = CollapsibleSection('PIPELINE AUTO', starts_open=True)
+
+        auto_info = QLabel(
+            'DRR + Détection + Appariement + Recalage\n'
+            'en un seul clic. Nécessite : CT, Segmentation\n'
+            'vertébrale, Fluoroscopie DICOM et modèle YOLO.')
+        auto_info.setObjectName('dim'); auto_info.setWordWrap(True)
+        sec_auto.addWidget(auto_info)
+
+        self.btn_auto = QPushButton('LANCER LE PIPELINE COMPLET')
+        self.btn_auto.setObjectName('success')
+        self.btn_auto.setStyleSheet(
+            f'QPushButton{{background:#0d2a1a;border:2px solid {ACCENT2};color:{ACCENT2};'
+            f'font-weight:700;font-size:13px;min-height:42px;border-radius:6px;letter-spacing:1px;}}'
+            f'QPushButton:hover{{background:#1a3d28;color:#fff;}}'
+            f'QPushButton:disabled{{background:{DARK_BG};border-color:{TEXT_DIM};color:{TEXT_DIM};}}')
+        self.btn_auto.clicked.connect(self._run_auto_pipeline)
+        sec_auto.addWidget(self.btn_auto)
+
+        self.lbl_auto_status = QLabel('')
+        self.lbl_auto_status.setObjectName('dim')
+        self.lbl_auto_status.setWordWrap(True)
+        sec_auto.addWidget(self.lbl_auto_status)
+
+        ll.addWidget(sec_auto)
 
         ll.addStretch()
 
@@ -2539,6 +2779,118 @@ class MainWindow(QMainWindow):
             return
         win = SegOverlayWindow(self.fluoro_image, self.proj_masks, self.result, parent=self)
         win.exec_()
+
+    # ── Pipeline automatique complet ──────────────────────────────────────────
+
+    def _run_auto_pipeline(self):
+        """Lance le pipeline complet : DRR → Détection → Appariement → Recalage."""
+        # Vérifications
+        if self.ct_path is None:
+            self._err('Chargez un CT (NIfTI) d\'abord.'); return
+        if not self.seg_masks:
+            self._err('Chargez une segmentation vertébrale (NIfTI + CSV labels).'); return
+        if self.fluoro_image is None:
+            self._err('Chargez une fluoroscopie d\'abord.'); return
+        if not yolo_ready():
+            self._err('Chargez un modèle YOLO (.pt) d\'abord.'); return
+
+        self.btn_auto.setEnabled(False)
+        self.btn_drr.setEnabled(False)
+        self.btn_reg.setEnabled(False)
+        self.lbl_auto_status.setText('Pipeline en cours…')
+        self.prog_bar.setValue(0)
+
+        kw = dict(
+            ct_path=self.ct_path,
+            ct_aff=self.ct_aff,
+            seg_masks=self.seg_masks,
+            fluoro=self.fluoro_image,
+            output_size=self.sp_size.value(),
+            lao_deg=self.sp_lao.value(),
+            cran_deg=self.sp_cran.value(),
+            table_angle=self.sp_table.value(),
+            sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
+            sod_mm=self.dicom_meta.get('sod_mm', 510.0),
+            fov_mm=self.dicom_meta.get('fov_mm'),
+            renderer='siddon',
+            elastic=self.chk_elastic.isChecked(),
+            yolo_kw=dict(
+                conf=self.sp_yolo_conf.value() / 100.0,
+                iou=self.sp_yolo_iou.value() / 100.0,
+                imgsz=self.sp_yolo_imgsz.value(),
+                pp={'gamma': self.sp_yolo_gamma.value(),
+                    'contrast': self.sp_yolo_contrast.value(),
+                    'invert': self.chk_yolo_invert.isChecked()}),
+        )
+        self.worker = WorkerThread('auto_pipeline', kw)
+        self.worker.progress.connect(self._on_prog)
+        self.worker.result.connect(self._auto_done)
+        self.worker.error.connect(self._on_auto_err)
+        self.worker.start()
+
+    def _auto_done(self, res):
+        """Callback quand le pipeline auto est terminé."""
+        self.btn_auto.setEnabled(True)
+        self.btn_drr.setEnabled(True)
+
+        # Injecter le DRR généré dans l'UI
+        self.drr_image = res['drr_image']
+        self.proj_masks = res.get('proj_masks', {})
+        self.cv_drr.set_image(self.drr_image)
+        self.tabs.setTabText(1, 'DRR')
+
+        # Injecter les masques appariés dans les canvas
+        mask_fl = res.get('mask_fl')
+        mask_drr = res.get('mask_drr')
+        if mask_fl is not None:
+            self.cv_fl.set_mask('vertebrae', mask_fl)
+        if mask_drr is not None:
+            self.cv_drr.set_mask('vertebrae', mask_drr)
+        self.btn_reg.setEnabled(True)
+
+        # Stocker le résultat de recalage
+        self.result = res
+        self._update_checklist()
+
+        # Mettre à jour les métriques
+        iou = res['iou']; dice = res['dice']
+        col = ACCENT2 if iou > 0.5 else (WARN if iou > 0.25 else ERR)
+        self.lbl_iou.setText(f'{iou:.3f}')
+        self.lbl_iou.setStyleSheet(f'font-size:22px;font-weight:700;color:{col};')
+        self.lbl_dice.setText(f'{dice:.3f}')
+        self.lbl_dice.setStyleSheet(f'font-size:22px;font-weight:700;color:{col};')
+        self.lbl_tx.setText(f'tx = {res["tx"]:+.1f} px')
+        self.lbl_ty.setText(f'ty = {res["ty"]:+.1f} px')
+        self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
+        self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
+
+        # Construire le panneau résultat visuel
+        self._build_result(res)
+        self.tabs.setCurrentIndex(2)
+
+        # Activer le bouton segmentations 2D
+        self.btn_seg_overlay.setEnabled(
+            bool(self.proj_masks) and self.fluoro_image is not None)
+
+        # Label résumé
+        labels = ', '.join(res.get('matched_labels', []))
+        n_m = res.get('n_matched', '?')
+        n_fl = res.get('n_fluoro_det', '?')
+        n_seg = res.get('n_drr_seg', '?')
+        self.lbl_auto_status.setText(
+            f'IoU={iou:.4f}  Dice={dice:.4f}\n'
+            f'{n_m} vertèbre(s) appariée(s) : {labels}\n'
+            f'(Fluoro : {n_fl} détections YOLO, CT : {n_seg} segmentations)')
+        self._status(
+            f'Pipeline auto terminé — IoU={iou:.4f}  Dice={dice:.4f}  '
+            f'Vertèbres : [{labels}]')
+
+    def _on_auto_err(self, msg):
+        self.btn_auto.setEnabled(True)
+        self.btn_drr.setEnabled(True)
+        self.btn_reg.setEnabled(True)
+        self.lbl_auto_status.setText(f'Erreur : {msg.splitlines()[0]}')
+        self._err(msg)
 
     def _on_prog(self,pct,msg): self.prog_bar.setValue(pct); self.lbl_prog.setText(msg); self._status(msg)
     def _on_err(self,msg): self.btn_drr.setEnabled(True); self.btn_reg.setEnabled(True); self.btn_detect_fl.setEnabled(True); self.btn_detect_drr.setEnabled(True); self._err(msg)
