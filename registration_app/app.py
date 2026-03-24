@@ -56,7 +56,7 @@ ERR      = '#e05060'
 STRUCT = {
     'vertebrae': {'rgb': (80, 220, 130),  'hex': '#50dc82', 'label': 'Vertebres'},
     'heart':     {'rgb': (240,  80,  90), 'hex': '#f0505a', 'label': 'Coeur'},
-    'aorta':     {'rgb': (80, 190, 240),  'hex': '#50bef0', 'label': 'Aorte'},
+    'autre':     {'rgb': (80, 190, 240),  'hex': '#50bef0', 'label': 'Autre'},
 }
 
 SIDEBAR_W = 310
@@ -2043,14 +2043,17 @@ class MainWindow(QMainWindow):
         self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-90, 90); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
         gdl.addWidget(self.sp_lao, 0, 1)
         gdl.addWidget(_lbl('Cran/Caud (deg)'), 1, 0)
-        self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-45, 45); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
+        self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-180, 180); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
         gdl.addWidget(self.sp_cran, 1, 1)
         gdl.addWidget(_lbl('Table (deg)'), 2, 0)
         self.sp_table = QDoubleSpinBox(); self.sp_table.setRange(-45, 45); self.sp_table.setValue(0); self.sp_table.setSingleStep(0.5)
         gdl.addWidget(self.sp_table, 2, 1)
-        gdl.addWidget(_lbl('Resolution (px)'), 3, 0)
+        gdl.addWidget(_lbl('FOV isoctr (mm)'), 3, 0)
+        self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(300); self.sp_fov.setSingleStep(10)
+        gdl.addWidget(self.sp_fov, 3, 1)
+        gdl.addWidget(_lbl('Resolution (px)'), 4, 0)
         self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
-        gdl.addWidget(self.sp_size, 3, 1)
+        gdl.addWidget(self.sp_size, 4, 1)
         sec_drr.addWidget(drr_grid)
         self.btn_drr = QPushButton('Generer DRR'); self.btn_drr.setObjectName('primary')
         self.btn_drr.clicked.connect(self.generate_drr); self.btn_drr.setEnabled(False)
@@ -2287,7 +2290,37 @@ class MainWindow(QMainWindow):
 
     def _wrap(self, cv, hint):
         w = QWidget(); w.setStyleSheet(f'background:{PANEL_BG};')
-        l = QVBoxLayout(w); l.setContentsMargins(4, 4, 4, 4); l.setSpacing(0)
+        l = QVBoxLayout(w); l.setContentsMargins(4, 4, 4, 4); l.setSpacing(6)
+        
+        # ── Sélection de structure à annoter ──────────────────────────────────
+        struct_ctrl = QHBoxLayout(); struct_ctrl.setSpacing(6)
+        struct_ctrl.addWidget(QLabel('Structure :').setObjectName('dim') or QLabel('Structure :'))
+        
+        struct_btns = QButtonGroup()
+        for i, (name, info) in enumerate(STRUCT.items()):
+            btn = QPushButton(info['label'])
+            btn.setObjectName('tool')
+            btn.setCheckable(True)
+            btn.setChecked(i == 0)  # vertebrae par défaut
+            r, g, b = info['rgb']
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  border: 2px solid {BORDER2}; border-radius: 4px;"
+                f"  min-height: 24px; padding: 2px 8px;"
+                f"  background: rgba({r-40},{g-40},{b-40},255);"
+                f"}}"
+                f"QPushButton:checked {{"
+                f"  border: 2px solid rgb({r},{g},{b});"
+                f"  color: rgb({r},{g},{b}); font-weight: 600;"
+                f"}}")
+            btn.clicked.connect(lambda checked, name=name: self._set_active_struct(cv, name))
+            struct_btns.addButton(btn)
+            struct_ctrl.addWidget(btn)
+        cv._struct_btns = struct_btns
+        
+        struct_ctrl.addStretch()
+        l.addLayout(struct_ctrl)
+        
         l.addWidget(cv, 1)
         return w
 
@@ -2304,6 +2337,14 @@ class MainWindow(QMainWindow):
             'eraser':    'Cliquer-glisser pour effacer des annotations',
         }
         self._status(hints.get(tool, ''))
+
+    def _set_active_struct(self, cv, struct_name):
+        """Change la structure active pour annoter."""
+        cv.set_active(struct_name)
+        info = STRUCT.get(struct_name, {})
+        hint = f'Structure active : {info.get("label", struct_name)}'
+        self._status(hint)
+        cv._refresh()
 
     def _on_pen(self,v): self.lbl_pen.setText(f'{v}px'); [cv.set_pen_radius(v) for cv in [self.cv_fl,self.cv_drr]]
     def _undo(self): self._active_cv().undo()
@@ -2589,10 +2630,10 @@ class MainWindow(QMainWindow):
         if self.ct_path is None: self._err('Charger un CT d\'abord'); return
         self.btn_drr.setEnabled(False)
         kw=dict(ct_path=self.ct_path, ct_aff=self.ct_aff,
-                lao_deg=self.sp_lao.value(), cran_deg=self.sp_cran.value(),
+                lao_deg=self.sp_lao.value(), cran_deg=self.sp_cran.value() + 180,
                 table_angle=self.sp_table.value(),
                 output_size=self.sp_size.value(), masks=self.seg_masks,
-                fov_mm=self.dicom_meta.get('fov_mm'),
+                fov_mm=self.sp_fov.value(),
                 renderer='siddon')
         self.worker=WorkerThread('drr',kw)
         self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
@@ -2649,16 +2690,47 @@ class MainWindow(QMainWindow):
         self._status('X-Ray chargé — dessiner les structures dans l\'onglet X-Ray')
 
     def run_registration(self):
-        mf = self.cv_fl.get_mask('vertebrae')
-        md = self.cv_drr.get_mask('vertebrae')
-        if mf is None or mf.sum()==0: self._err('Annoter les vertebres sur la fluoroscopie avant le recalage'); return
-        if md is None or md.sum()==0: self._err('Aucun masque vertebres sur le DRR (generez le DRR d\'abord)'); return
+        # Récupérer TOUS les masques annotés (vertebrae, heart, aorta)
+        masks_all_fl = {}
+        masks_all_drr = {}
+        for struct in STRUCT.keys():
+            m_fl = self.cv_fl.get_mask(struct)
+            m_drr = self.cv_drr.get_mask(struct)
+            if m_fl is not None and m_fl.sum() > 0:
+                masks_all_fl[struct] = m_fl
+            if m_drr is not None and m_drr.sum() > 0:
+                masks_all_drr[struct] = m_drr
+        
+        if not masks_all_fl:
+            self._err('Annoter au moins une structure (vertèbres, cœur, aorte) sur la fluoroscopie'); return
+        if not masks_all_drr:
+            self._err('Annoter au moins une structure sur le DRR'); return
+        
+        # Fusionner tous les masques annotés en un seul masque
+        def combine_masks(masks_dict):
+            combined = None
+            for m in masks_dict.values():
+                if combined is None:
+                    combined = m.copy()
+                else:
+                    combined = np.clip(combined + m, 0, 1)
+            return combined
+        
+        mf = combine_masks(masks_all_fl)
+        md = combine_masks(masks_all_drr)
+        
         # Normaliser les deux masques à la même taille de travail pour le recalage
         reg_size = self.sp_size.value()
         if mf.shape[:2] != (reg_size, reg_size):
             mf = cv2.resize(mf, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
         if md.shape[:2] != (reg_size, reg_size):
             md = cv2.resize(md, (reg_size, reg_size), interpolation=cv2.INTER_NEAREST)
+        
+        # Afficher les structures utilisées dans le recalage
+        structs_used = list(set(list(masks_all_fl.keys()) + list(masks_all_drr.keys())))
+        struct_labels = [STRUCT[s]['label'] for s in structs_used]
+        self._status(f'Recalage sur : {", ".join(struct_labels)}')
+        
         self.btn_reg.setEnabled(False)
         kw=dict(moving=md, fixed=mf, elastic=self.chk_elastic.isChecked())
         self.worker=WorkerThread('register',kw)

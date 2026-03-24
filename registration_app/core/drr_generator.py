@@ -272,8 +272,6 @@ def project_mask_3d(
 
     proj = cv2.resize(proj, (output_size, output_size),
                       interpolation=cv2.INTER_LINEAR)
-    # Flip vertical pour corriger l'orientation (convention NIfTI S-I)
-    proj = np.flipud(proj).copy()
     return (proj > 0.3).astype(np.float32)
 
 
@@ -305,9 +303,9 @@ def _postprocess(img_np: np.ndarray) -> np.ndarray:
     else:
         img = np.zeros_like(img)
 
-    # 3. Inversion — les os (forte atténuation → haute valeur) deviennent clairs
-    #    comme sur un cliché radio classique (convention positive)
-    img = img
+    # 3. Flip horizontal — C-arm PA : l'image est miroitée gauche-droite
+    #    pour correspondre à la fluoro
+    img = np.fliplr(img)
 
     # 4. Gamma correction — γ < 1 éclaircit les tons moyens,
     #    fait mieux ressortir les vertèbres par rapport au fond

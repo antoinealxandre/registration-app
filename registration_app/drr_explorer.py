@@ -313,7 +313,7 @@ class DRRWorker(QThread):
             drr = generate_drr(
                 ct_path=p['ct_path'],
                 lao_deg=p['lao_deg'],
-                cran_deg=p['cran_deg'],
+                cran_deg=p['cran_deg'] + 180,   # convention : UI 0° = PA (180°)
                 table_angle=p['table_angle'],
                 output_size=p['output_size'],
                 sid_mm=p['sid_mm'],
@@ -325,6 +325,107 @@ class DRRWorker(QThread):
             self.result.emit(drr)
         except Exception as ex:
             self.error.emit(str(ex))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Métriques de similarité image
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalized Cross-Correlation (scalaire dans [-1, 1])."""
+    a = a.astype(np.float64).ravel()
+    b = b.astype(np.float64).ravel()
+    a -= a.mean()
+    b -= b.mean()
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom > 1e-9 else 0.0
+
+
+def _mse_norm(a: np.ndarray, b: np.ndarray) -> float:
+    """MSE normalisé [0, 1] après normalisation min-max de chaque image."""
+    def _n(x):
+        x = x.astype(np.float64)
+        mn, mx = x.min(), x.max()
+        return (x - mn) / (mx - mn + 1e-8)
+    return float(np.mean((_n(a) - _n(b)) ** 2))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sweep worker — itération systématique sur grille d'angles
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SweepWorker(QThread):
+    step_progress = pyqtSignal(int, int, str)           # current, total, msg
+    step_result   = pyqtSignal(int, dict, np.ndarray)   # idx, info_dict, drr
+    sweep_done    = pyqtSignal()
+    error         = pyqtSignal(str)
+
+    def __init__(self, base_params: dict, grid: list, fluoro_img=None):
+        super().__init__()
+        self._base   = base_params   # ct_path, sid_mm, sod_mm, renderer, …
+        self._grid   = grid          # [{'lao_deg': x, 'cran_deg': y, 'fov_mm': z}, …]
+        self._fluoro = fluoro_img    # np.ndarray, image de référence pour les métriques
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            if not HAS_NIBABEL:
+                self.error.emit('nibabel non installé')
+                return
+            from drr_generator import generate_drr
+        except ImportError as ex:
+            self.error.emit(str(ex))
+            return
+
+        total = len(self._grid)
+        for i, sp in enumerate(self._grid):
+            if self._cancel:
+                break
+            lao  = sp['lao_deg']
+            cran = sp['cran_deg']
+            fov  = sp.get('fov_mm', self._base.get('fov_mm', 200.0))
+            self.step_progress.emit(
+                i, total,
+                f"[{i + 1}/{total}]  LAO={lao:+.1f}°  CRAN={cran:+.1f}°  FOV={fov:.0f} mm",
+            )
+            try:
+                drr = generate_drr(
+                    ct_path     = self._base['ct_path'],
+                    lao_deg     = lao,
+                    cran_deg    = cran + 180,       # convention : UI 0° = PA (180°)
+                    table_angle = self._base.get('table_angle', 0.0),
+                    output_size = self._base.get('output_size', 256),
+                    sid_mm      = self._base['sid_mm'],
+                    sod_mm      = self._base['sod_mm'],
+                    fov_mm      = fov,
+                    renderer    = self._base.get('renderer', 'cpu'),
+                )
+            except Exception as ex:
+                self.error.emit(f'Étape {i + 1} : {ex}')
+                continue
+
+            ncc_val, mse_val = 0.0, 1.0
+            if self._fluoro is not None:
+                try:
+                    flu_r = cv2.resize(
+                        self._fluoro.astype(np.float32),
+                        (drr.shape[1], drr.shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    ncc_val = _ncc(drr, flu_r)
+                    mse_val = _mse_norm(drr, flu_r)
+                except Exception:
+                    pass
+
+            self.step_result.emit(i, {
+                'lao_deg': lao, 'cran_deg': cran,
+                'fov_mm': fov, 'ncc': ncc_val, 'mse': mse_val,
+            }, drr)
+
+        self.sweep_done.emit()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -436,6 +537,7 @@ class ImageViewer(QLabel):
         super().__init__(parent)
         self._img = None
         self._overlay = None
+        self._overlay_alpha = 0.5   # 0 = DRR seul, 1 = fluoro seul
         self._placeholder = placeholder
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(300, 300)
@@ -452,6 +554,11 @@ class ImageViewer(QLabel):
         self._render()
 
     def clear_overlay(self):
+        self._overlay = None
+        self._render()
+
+    def clear_image(self):
+        self._img = None
         self._overlay = None
         self._render()
 
@@ -490,15 +597,480 @@ class ImageViewer(QLabel):
         d = cv2.resize(d, sz)
         f = cv2.resize(f, sz)
 
-        # Magenta/Vert overlay
+        # Overlay magenta/vert avec blend alpha
+        a = float(getattr(self, '_overlay_alpha', 0.5))
         out = np.zeros((*sz[::-1], 3), dtype=np.uint8)
-        out[:, :, 1] = d          # DRR → vert
-        out[:, :, 2] = f          # Fluoro → rouge
+        out[:, :, 1] = (d.astype(np.float32) * (1.0 - a)).astype(np.uint8)  # DRR → vert
+        out[:, :, 2] = (f.astype(np.float32) * a).astype(np.uint8)          # Fluoro → rouge
+        out[:, :, 0] = (f.astype(np.float32) * a * 0.7).astype(np.uint8)    # + bleu → teinte magenta
         return out
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._render()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RangeRow — "De X à Y, pas Z"
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RangeRow(QWidget):
+    """Widget compact : De [from] à [to] pas [step] pour paramétrer un sweep."""
+
+    def __init__(self, label: str, lo: float, hi: float,
+                 default_from: float, default_to: float, default_step: float,
+                 unit: str = '', parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        lw = QLabel(label)
+        lw.setObjectName('mid')
+        lw.setFixedWidth(140)
+        lay.addWidget(lw)
+
+        lay.addWidget(_lbl('de', 'dim'))
+        self.sp_from = QDoubleSpinBox()
+        self.sp_from.setRange(lo, hi)
+        self.sp_from.setValue(default_from)
+        self.sp_from.setFixedWidth(70)
+        if unit:
+            self.sp_from.setSuffix(' ' + unit)
+        lay.addWidget(self.sp_from)
+
+        lay.addWidget(_lbl('à', 'dim'))
+        self.sp_to = QDoubleSpinBox()
+        self.sp_to.setRange(lo, hi)
+        self.sp_to.setValue(default_to)
+        self.sp_to.setFixedWidth(70)
+        if unit:
+            self.sp_to.setSuffix(' ' + unit)
+        lay.addWidget(self.sp_to)
+
+        lay.addWidget(_lbl('pas', 'dim'))
+        self.sp_step = QDoubleSpinBox()
+        self.sp_step.setRange(0.1, abs(hi - lo))
+        self.sp_step.setSingleStep(0.5)
+        self.sp_step.setValue(default_step)
+        self.sp_step.setFixedWidth(62)
+        if unit:
+            self.sp_step.setSuffix(' ' + unit)
+        lay.addWidget(self.sp_step)
+        lay.addStretch()
+
+    def values(self) -> list:
+        """Liste de valeurs du sweep de a à b inclus, par pas s."""
+        a, b, s = self.sp_from.value(), self.sp_to.value(), self.sp_step.value()
+        if s <= 0 or a > b:
+            return [round(a, 4)]
+        out, v = [], a
+        while v <= b + 1e-9:
+            out.append(round(v, 4))
+            v += s
+        return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Station de Calibration — sweep systématique LAO × CRAN vs fluoro
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CalibrationStation(QWidget):
+    """Panneau de calibration par grille d'angles avec comparaison fluoroscopie."""
+    params_validated = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._worker   = None
+        self._fluoro   = None
+        self._ct_path  = None
+        self._base_prm = {}
+        self._results  = []    # [(info_dict, drr_array), …]
+        self._sel_row  = -1
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(8, 8, 8, 8)
+        lo.setSpacing(6)
+
+        # ── Haut : config (gauche) + table résultats (droite) ─────────────────
+        top = QSplitter(Qt.Horizontal)
+
+        # Panneau de configuration
+        cfg = QWidget()
+        cfg.setFixedWidth(370)
+        clo = QVBoxLayout(cfg)
+        clo.setContentsMargins(6, 6, 6, 6)
+        clo.setSpacing(6)
+
+        clo.addWidget(_head('CONFIGURATION SWEEP'))
+
+        for icon, attr in [('CT  :', 'lbl_ct'), ('FLU :', 'lbl_flu')]:
+            rh = QHBoxLayout()
+            rh.addWidget(_lbl(icon, 'mid'))
+            lw = _lbl('— (chargez depuis le panneau principal)', 'dim')
+            setattr(self, attr, lw)
+            rh.addWidget(lw)
+            clo.addLayout(rh)
+
+        clo.addWidget(_sep())
+        clo.addWidget(_head('PARAMÈTRES FIXES C-ARM'))
+
+        self.p_sid = ParamRow('SID (source→détecteur)', 500, 1500, 1.0, 996.0, 1, 'mm')
+        self.p_sod = ParamRow('SOD (source→isocentre)', 300, 1200, 1.0, 720.0, 1, 'mm')
+        clo.addWidget(self.p_sid)
+        clo.addWidget(self.p_sod)
+
+        rend_h = QHBoxLayout()
+        rend_h.addWidget(_lbl('Backend :', 'mid'))
+        self.combo_renderer = QComboBox()
+        self.combo_renderer.addItems(['cpu', 'siddon', 'trilinear', 'nanodrr'])
+        rend_h.addWidget(self.combo_renderer)
+        rend_h.addStretch()
+        rend_h.addWidget(_lbl('Taille :', 'mid'))
+        self.sp_size = QSpinBox()
+        self.sp_size.setRange(64, 512)
+        self.sp_size.setValue(256)
+        self.sp_size.setSingleStep(64)
+        self.sp_size.setFixedWidth(70)
+        rend_h.addWidget(self.sp_size)
+        clo.addLayout(rend_h)
+
+        clo.addWidget(_sep())
+        clo.addWidget(_head('GRILLE D\'ANGLES'))
+
+        self.rr_lao  = RangeRow('LAO (+) / RAO (−)',   -90,  90, -5.0,  5.0, 1.0, '°')
+        self.rr_cran = RangeRow('CRAN (+) / CAUD (−)', -45,  45, -5.0,  5.0, 1.0, '°')
+        clo.addWidget(self.rr_lao)
+        clo.addWidget(self.rr_cran)
+
+        clo.addWidget(_sep())
+        clo.addWidget(_head('FOV FIXE'))
+
+        fov_h = QHBoxLayout()
+        fov_h.addWidget(_lbl('FOV :', 'mid'))
+        self.sp_fov = QDoubleSpinBox()
+        self.sp_fov.setRange(50, 500)
+        self.sp_fov.setValue(200.0)
+        self.sp_fov.setSuffix(' mm')
+        self.sp_fov.setFixedWidth(100)
+        fov_h.addWidget(self.sp_fov)
+        fov_h.addStretch()
+        clo.addLayout(fov_h)
+
+        clo.addWidget(_sep())
+
+        self.lbl_count = _lbl('—', 'dim')
+        for rr in [self.rr_lao, self.rr_cran]:
+            for sp in [rr.sp_from, rr.sp_to, rr.sp_step]:
+                sp.valueChanged.connect(self._update_count)
+        self._update_count()
+        clo.addWidget(self.lbl_count)
+
+        btn_row = QHBoxLayout()
+        self.btn_run = QPushButton('⚡  Lancer le sweep')
+        self.btn_run.setObjectName('primary')
+        self.btn_run.clicked.connect(self._run)
+        btn_row.addWidget(self.btn_run)
+
+        self.btn_cancel_sw = QPushButton('✕  Annuler')
+        self.btn_cancel_sw.setEnabled(False)
+        self.btn_cancel_sw.clicked.connect(self._cancel)
+        btn_row.addWidget(self.btn_cancel_sw)
+        clo.addLayout(btn_row)
+
+        self.prog = QProgressBar()
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+        clo.addWidget(self.prog)
+
+        self.lbl_status = _lbl('—', 'dim')
+        clo.addWidget(self.lbl_status)
+        clo.addStretch()
+
+        # Table des résultats
+        tbl_w = QWidget()
+        tlo = QVBoxLayout(tbl_w)
+        tlo.setContentsMargins(4, 4, 4, 4)
+        tlo.setSpacing(4)
+
+        tlo.addWidget(_head('RÉSULTATS'))
+
+        sort_h = QHBoxLayout()
+        sort_h.addWidget(_lbl('Trier :', 'mid'))
+        self.combo_sort = QComboBox()
+        self.combo_sort.addItems(['NCC ↓ (mieux)', 'MSE ↑ (mieux)', 'LAO', 'CRAN'])
+        self.combo_sort.currentIndexChanged.connect(self._sort)
+        sort_h.addWidget(self.combo_sort)
+        sort_h.addStretch()
+        self.btn_clear = QPushButton('🗑  Effacer')
+        self.btn_clear.clicked.connect(self._clear)
+        sort_h.addWidget(self.btn_clear)
+        tlo.addLayout(sort_h)
+
+        self.tbl = QTableWidget(0, 6)
+        self.tbl.setHorizontalHeaderLabels(['#', 'LAO°', 'CRAN°', 'FOV', 'NCC', 'MSE'])
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for c in range(1, 6):
+            self.tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl.selectionModel().selectionChanged.connect(self._on_sel)
+        tlo.addWidget(self.tbl, stretch=1)
+
+        top.addWidget(cfg)
+        top.addWidget(tbl_w)
+        top.setStretchFactor(0, 0)
+        top.setStretchFactor(1, 1)
+        lo.addWidget(top, stretch=2)
+
+        # ── Bas : viewers d'aperçu ─────────────────────────────────────────────
+        lo.addWidget(_sep())
+
+        prev_hdr = QHBoxLayout()
+        self.lbl_prev_title = _head('DRR SÉLECTIONNÉ')
+        prev_hdr.addWidget(self.lbl_prev_title)
+        prev_hdr.addStretch()
+        lo.addLayout(prev_hdr)
+
+        prev_row = QHBoxLayout()
+        prev_row.setSpacing(8)
+
+        drr_col = QVBoxLayout()
+        drr_col.addWidget(_head('DRR'))
+        self.viewer_drr = ImageViewer('Sélectionnez une ligne ↑')
+        self.viewer_drr.setMinimumHeight(240)
+        drr_col.addWidget(self.viewer_drr)
+        prev_row.addLayout(drr_col)
+
+        flu_col2 = QVBoxLayout()
+        flu_col2.addWidget(_head('FLUOROSCOPIE RÉFÉRENCE'))
+        self.viewer_flu2 = ImageViewer('Chargez un DICOM →')
+        self.viewer_flu2.setMinimumHeight(240)
+        flu_col2.addWidget(self.viewer_flu2)
+        prev_row.addLayout(flu_col2)
+
+        lo.addLayout(prev_row, stretch=3)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(_lbl('Blend overlay :', 'mid'))
+        self.sld_blend = QSlider(Qt.Horizontal)
+        self.sld_blend.setRange(0, 100)
+        self.sld_blend.setValue(50)
+        self.sld_blend.setFixedWidth(140)
+        self.sld_blend.valueChanged.connect(self._blend_changed)
+        ctrl_row.addWidget(self.sld_blend)
+
+        self.btn_overlay_cs = QPushButton('⊕  Overlay ON/OFF')
+        self.btn_overlay_cs.setCheckable(True)
+        self.btn_overlay_cs.toggled.connect(self._toggle_overlay)
+        ctrl_row.addWidget(self.btn_overlay_cs)
+
+        ctrl_row.addStretch()
+
+        self.btn_validate = QPushButton('✓  Valider ces paramètres')
+        self.btn_validate.setObjectName('primary')
+        self.btn_validate.setEnabled(False)
+        self.btn_validate.clicked.connect(self._validate)
+        ctrl_row.addWidget(self.btn_validate)
+
+        lo.addLayout(ctrl_row)
+
+    # ── API publique ───────────────────────────────────────────────────────────
+
+    def set_ct(self, path: str):
+        self._ct_path = path
+        self.lbl_ct.setText(os.path.basename(path))
+
+    def set_fluoro(self, img: np.ndarray):
+        self._fluoro = img
+        self.viewer_flu2.set_image(img)
+        h, w = img.shape[:2]
+        self.lbl_flu.setText(f'chargée — {w}×{h} px')
+
+    def set_base_params(self, params: dict):
+        """Synchronise les paramètres fixes depuis le panneau Paramètres principal."""
+        self._base_prm = params.copy()
+        if params.get('sid_mm'):   self.p_sid.setValue(params['sid_mm'])
+        if params.get('sod_mm'):   self.p_sod.setValue(params['sod_mm'])
+        if params.get('renderer'): self.combo_renderer.setCurrentText(params['renderer'])
+        if params.get('fov_mm'):   self.sp_fov.setValue(params['fov_mm'])
+
+    # ── Slots privés ──────────────────────────────────────────────────────────
+
+    def _update_count(self):
+        n_l = len(self.rr_lao.values())
+        n_c = len(self.rr_cran.values())
+        total = n_l * n_c
+        self.lbl_count.setText(
+            f'<span style="color:{CYAN}">{total}</span> itération(s) '
+            f'({n_l} LAO × {n_c} CRAN)')
+        self.lbl_count.setTextFormat(Qt.RichText)
+
+    def _build_grid(self) -> list:
+        return [
+            {'lao_deg': lao, 'cran_deg': cran, 'fov_mm': self.sp_fov.value()}
+            for lao  in self.rr_lao.values()
+            for cran in self.rr_cran.values()
+        ]
+
+    def _run(self):
+        if not self._ct_path:
+            QMessageBox.warning(
+                self, 'CT manquant',
+                'Générez d\'abord un DRR depuis le panneau Paramètres,\n'
+                'puis revenez ici pour lancer le sweep.')
+            return
+        if self._worker and self._worker.isRunning():
+            return
+        grid = self._build_grid()
+        if not grid:
+            return
+        base = {
+            'ct_path':     self._ct_path,
+            'sid_mm':      self.p_sid.value(),
+            'sod_mm':      self.p_sod.value(),
+            'fov_mm':      self.sp_fov.value(),
+            'renderer':    self.combo_renderer.currentText(),
+            'output_size': self.sp_size.value(),
+            'table_angle': self._base_prm.get('table_angle', 0.0),
+        }
+        self._worker = SweepWorker(base, grid, self._fluoro)
+        self._worker.step_progress.connect(self._on_progress)
+        self._worker.step_result.connect(self._on_result)
+        self._worker.sweep_done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self.btn_run.setEnabled(False)
+        self.btn_cancel_sw.setEnabled(True)
+        self.prog.setValue(0)
+        self._worker.start()
+
+    def _cancel(self):
+        if self._worker:
+            self._worker.cancel()
+
+    def _on_progress(self, cur: int, total: int, msg: str):
+        pct = int(cur / total * 100) if total > 0 else 0
+        self.prog.setValue(pct)
+        self.lbl_status.setText(msg)
+
+    def _on_result(self, idx: int, info: dict, drr: np.ndarray):
+        self._results.append((info.copy(), drr))
+        has_flu = self._fluoro is not None
+        best_so_far = (has_flu and len(self._results) > 1 and
+                       all(info['ncc'] >= r[0]['ncc'] for r in self._results[:-1]))
+        row = self.tbl.rowCount()
+        self.tbl.insertRow(row)
+        vals = [
+            str(len(self._results)),
+            f"{info['lao_deg']:+.1f}",
+            f"{info['cran_deg']:+.1f}",
+            f"{info['fov_mm']:.0f}",
+            f"{info['ncc']:.4f}" if has_flu else '—',
+            f"{info['mse']:.4f}" if has_flu else '—',
+        ]
+        for c, v in enumerate(vals):
+            item = QTableWidgetItem(v)
+            item.setTextAlignment(Qt.AlignCenter)
+            if best_so_far and c in (4, 5):
+                item.setForeground(QColor(CYAN))
+            self.tbl.setItem(row, c, item)
+            self.tbl.setRowHeight(row, 22)
+        self.tbl.scrollToBottom()
+
+    def _on_done(self):
+        self.btn_run.setEnabled(True)
+        self.btn_cancel_sw.setEnabled(False)
+        self.prog.setValue(100)
+        self.lbl_status.setText(f'Sweep terminé — {len(self._results)} itération(s).')
+        self._sort(self.combo_sort.currentIndex())
+
+    def _on_error(self, msg: str):
+        self.lbl_status.setText(f'Erreur : {msg}')
+
+    def _sort(self, idx: int = 0):
+        key_map = {
+            0: lambda x: -x[0]['ncc'],
+            1: lambda x:  x[0]['mse'],
+            2: lambda x:  x[0]['lao_deg'],
+            3: lambda x:  x[0]['cran_deg'],
+        }
+        self._results.sort(key=key_map.get(idx, key_map[0]))
+        self._rebuild_table()
+
+    def _rebuild_table(self):
+        self.tbl.setRowCount(0)
+        has_flu = self._fluoro is not None
+        for i, (info, _) in enumerate(self._results):
+            row = self.tbl.rowCount()
+            self.tbl.insertRow(row)
+            vals = [
+                str(i + 1),
+                f"{info['lao_deg']:+.1f}",
+                f"{info['cran_deg']:+.1f}",
+                f"{info['fov_mm']:.0f}",
+                f"{info['ncc']:.4f}" if has_flu else '—',
+                f"{info['mse']:.4f}" if has_flu else '—',
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignCenter)
+                if i == 0 and c in (4, 5) and has_flu:
+                    item.setForeground(QColor(CYAN))
+                self.tbl.setItem(row, c, item)
+                self.tbl.setRowHeight(row, 22)
+
+    def _clear(self):
+        self._results.clear()
+        self.tbl.setRowCount(0)
+        self.viewer_drr.clear_image()
+        self._sel_row = -1
+        self.btn_validate.setEnabled(False)
+        self.lbl_prev_title.setText('DRR SÉLECTIONNÉ')
+
+    def _on_sel(self):
+        idxs = self.tbl.selectionModel().selectedRows()
+        if not idxs:
+            return
+        row = idxs[0].row()
+        if 0 <= row < len(self._results):
+            self._sel_row = row
+            info, drr = self._results[row]
+            self.viewer_drr.set_image(drr)
+            self.lbl_prev_title.setText(
+                f'DRR #{row + 1} — LAO={info["lao_deg"]:+.1f}°  '
+                f'CRAN={info["cran_deg"]:+.1f}°  '
+                f'NCC={info["ncc"]:.4f}  MSE={info["mse"]:.4f}')
+            self.btn_validate.setEnabled(True)
+            if self.btn_overlay_cs.isChecked() and self._fluoro is not None:
+                self.viewer_drr.set_overlay(self._fluoro)
+
+    def _toggle_overlay(self, checked: bool):
+        if checked and self._sel_row >= 0 and self._fluoro is not None:
+            _, drr = self._results[self._sel_row]
+            self.viewer_drr.set_overlay(self._fluoro)
+            self.viewer_flu2.set_overlay(drr)
+        else:
+            self.viewer_drr.clear_overlay()
+            self.viewer_flu2.clear_overlay()
+
+    def _blend_changed(self, val: int):
+        alpha = val / 100.0
+        for v in [self.viewer_drr, self.viewer_flu2]:
+            v._overlay_alpha = alpha
+            v._render()
+
+    def _validate(self):
+        if not (0 <= self._sel_row < len(self._results)):
+            return
+        info, _ = self._results[self._sel_row]
+        self.params_validated.emit({
+            'lao_deg':  info['lao_deg'],
+            'cran_deg': info['cran_deg'],
+            'fov_mm':   info['fov_mm'],
+            'sid_mm':   self.p_sid.value(),
+            'sod_mm':   self.p_sod.value(),
+        })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -893,11 +1465,20 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left)
 
-        # ── Colonne droite : viewers ──────────────────────────────────────────
+        # ── Colonne droite : tabs Explorateur / Station de calibration ─────────
         right = QWidget()
         rlo = QVBoxLayout(right)
-        rlo.setContentsMargins(8, 8, 8, 8)
-        rlo.setSpacing(8)
+        rlo.setContentsMargins(0, 0, 0, 0)
+        rlo.setSpacing(0)
+
+        self.right_tabs = QTabWidget()
+        rlo.addWidget(self.right_tabs)
+
+        # ── Tab 0 : Explorateur ───────────────────────────────────────────────
+        explorer_w = QWidget()
+        elo = QVBoxLayout(explorer_w)
+        elo.setContentsMargins(8, 8, 8, 8)
+        elo.setSpacing(8)
 
         # Toolbar viewers
         tbar = QHBoxLayout()
@@ -927,7 +1508,7 @@ class MainWindow(QMainWindow):
         self.lbl_time = _lbl('', 'dim')
         tbar.addWidget(self.lbl_time)
 
-        rlo.addLayout(tbar)
+        elo.addLayout(tbar)
 
         # Viewers côte à côte
         viewers_row = QHBoxLayout()
@@ -955,13 +1536,20 @@ class MainWindow(QMainWindow):
         drr_col.addWidget(self.viewer_drr)
         viewers_row.addLayout(drr_col)
 
-        rlo.addLayout(viewers_row, stretch=1)
+        elo.addLayout(viewers_row, stretch=1)
 
         # Barre de progression et infos
         self.prog_global = QProgressBar()
         self.prog_global.setRange(0, 100)
         self.prog_global.setValue(0)
-        rlo.addWidget(self.prog_global)
+        elo.addWidget(self.prog_global)
+
+        self.right_tabs.addTab(explorer_w, '🔍  Explorateur')
+
+        # ── Tab 1 : Station de Calibration ────────────────────────────────────
+        self.calib_station = CalibrationStation()
+        self.calib_station.params_validated.connect(self._on_calib_validated)
+        self.right_tabs.addTab(self.calib_station, '📊  Station de calibration')
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -996,6 +1584,7 @@ class MainWindow(QMainWindow):
                 self.viewer_flu.set_image(self._fluoro_img)
                 sz = self._fluoro_img.shape
                 self.lbl_fluoro_info.setText(f'{sz[1]}×{sz[0]} px')
+                self.calib_station.set_fluoro(self._fluoro_img)
 
             sid = meta.get('sid_mm', '—')
             sod = meta.get('sod_mm', '—')
@@ -1022,6 +1611,9 @@ class MainWindow(QMainWindow):
         self._worker.result.connect(self._on_drr_result)
         self._worker.error.connect(self._on_drr_error)
         self._worker.start()
+        # Sync calibration station with current CT + geometry
+        self.calib_station.set_ct(params['ct_path'])
+        self.calib_station.set_base_params(params)
 
     def _on_progress(self, pct: int, msg: str):
         self.params_panel.prog.setValue(pct)
@@ -1089,6 +1681,17 @@ class MainWindow(QMainWindow):
         with open(p, 'w') as f:
             json.dump(export, f, indent=2)
         self._status(f'Paramètres exportés → {p}')
+
+    def _on_calib_validated(self, params: dict):
+        """Applique dans le panneau Paramètres les angles validés depuis la station."""
+        self.params_panel.apply_dicom_meta(params)
+        self.right_tabs.setCurrentIndex(0)
+        self.left_tabs.setCurrentIndex(0)
+        self._status(
+            f"✓ Validé depuis la station — "
+            f"LAO={params['lao_deg']:+.1f}°  "
+            f"CRAN={params['cran_deg']:+.1f}°  "
+            f"FOV={params['fov_mm']:.0f} mm")
 
     def _status(self, msg: str):
         self.statusBar().showMessage(msg)
