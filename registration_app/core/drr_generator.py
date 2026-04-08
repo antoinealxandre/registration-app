@@ -276,6 +276,95 @@ def project_mask_3d(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Générateur rapide (CT pré-chargé) — pour boucle d'optimisation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_fast_generator(ct_path: str, output_size: int = 256,
+                          sid_mm: float = 1020.0, sod_mm: float = 510.0,
+                          fov_mm: float = None, table_angle: float = 0.0):
+    """
+    Retourne un callable ``gen(lao_deg, cran_deg) -> float32 [0,1]``
+    qui génère un DRR *sans* recharger le CT à chaque appel.
+
+    Les angles attendus sont les valeurs UI brutes (PAS +180 pour cran).
+    Le +180 est ajouté automatiquement en interne.
+
+    Backends (par priorité) : nanoDRR → DiffDRR → CPU (lent).
+    """
+    delx = _compute_delx(fov_mm, sid_mm, sod_mm, output_size)
+
+    # ── nanoDRR ───────────────────────────────────────────────────────────
+    if HAS_NANODRR:
+        from nanodrr.data.preprocess import MU_BONE
+        subject = _NanoSubject.from_filepath(
+            ct_path, mu_bone=MU_BONE * 2.0,
+        ).to(_DEVICE)
+        k_inv = _make_k_inv(
+            sdd=sid_mm, delx=delx, dely=delx,
+            x0=0.0, y0=0.0,
+            height=output_size, width=output_size,
+            device=_DEVICE,
+        )
+        sdd_t = torch.tensor([sid_mm], device=_DEVICE)
+
+        def _gen_nano(lao_deg, cran_deg):
+            rt_inv = _make_rt_inv(
+                torch.tensor([[cran_deg + 180, lao_deg, table_angle]],
+                              dtype=torch.float32, device=_DEVICE),
+                torch.tensor([[0.0, sod_mm, 0.0]],
+                              dtype=torch.float32, device=_DEVICE),
+                orientation="AP",
+                isocenter=subject.isocenter,
+            )
+            with torch.no_grad():
+                img_t = _nanodrr_render(
+                    subject, k_inv, rt_inv, sdd_t,
+                    output_size, output_size)
+            return _postprocess(img_t.sum(dim=1).squeeze(0).cpu().numpy())
+
+        return _gen_nano
+
+    # ── DiffDRR ───────────────────────────────────────────────────────────
+    if HAS_DIFFDRR:
+        from diffdrr.pose import convert as _pose_convert
+        subject = _diffdrr_read(ct_path, orientation="AP")
+        drr_module = _DiffDRR(
+            subject, sdd=sid_mm,
+            height=output_size, width=output_size,
+            delx=delx, renderer="siddon",
+        ).to(_DEVICE)
+
+        def _gen_diffdrr(lao_deg, cran_deg):
+            rot = torch.tensor([[cran_deg + 180, lao_deg, table_angle]],
+                               dtype=torch.float32, device=_DEVICE)
+            tra = torch.tensor([[0.0, sod_mm, 0.0]],
+                               dtype=torch.float32, device=_DEVICE)
+            with torch.no_grad():
+                img_t = drr_module(rot, tra,
+                                   parameterization="euler_angles",
+                                   convention="ZXY", degrees=True)
+            return _postprocess(img_t.squeeze().cpu().numpy())
+
+        return _gen_diffdrr
+
+    # ── CPU fallback (lent) ───────────────────────────────────────────────
+    def _gen_cpu(lao_deg, cran_deg):
+        return generate_drr(
+            ct_path=ct_path,
+            lao_deg=lao_deg,
+            cran_deg=cran_deg + 180,
+            table_angle=table_angle,
+            output_size=output_size,
+            sid_mm=sid_mm,
+            sod_mm=sod_mm,
+            fov_mm=fov_mm,
+            renderer="cpu",
+        )
+
+    return _gen_cpu
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Helpers internes
 # ══════════════════════════════════════════════════════════════════════════════
 
