@@ -61,6 +61,7 @@ STRUCT = {
 
 SIDEBAR_W = 310
 DEFAULT_FOV_MM = 220.0
+AUTO_PIPELINE_FOV_MM = 220.0
 
 STYLE = f"""
 QMainWindow,QWidget{{background:{DARK_BG};color:{TEXT};font-family:'Segoe UI',sans-serif;font-size:12px;}}
@@ -1393,7 +1394,7 @@ class WorkerThread(QThread):
             raise RuntimeError('Chargez un modèle YOLO (.pt) d\'abord.')
 
         # ── 1. Génération DRR ────────────────────────────────────────────────
-        self.progress.emit(5, 'Génération DRR…')
+        self.progress.emit(5, f'Génération DRR (FOV={geom_kw.get("fov_mm", AUTO_PIPELINE_FOV_MM):.0f} mm)…')
         drr_image = generate_drr(
             ct_path=ct_path, renderer='siddon',
             progress_cb=lambda p, m: self.progress.emit(5 + int(p * 0.18), m),
@@ -1472,10 +1473,22 @@ class WorkerThread(QThread):
         for b in matched_fl:
             mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
 
-        # ── 6. Recalage IoU ──────────────────────────────────────────────────
-        def _cb(frac, iou_val):
-            self.progress.emit(50 + int(frac * 44), f'Recalage IoU={iou_val:.3f}')
-        res = register(mask_moving=mask_drr, mask_fixed=mask_fl, progress_cb=_cb)
+        # ── 6. Recalage (élastique par défaut) ──────────────────────────────
+        use_elastic = kw.get('elastic', True)
+        if use_elastic:
+            self.progress.emit(50, 'Recalage élastique (rigide + FFD)…')
+
+            def _cb(frac, iou_val):
+                stage = 'Rigide' if frac < 0.5 else 'Elastique'
+                self.progress.emit(50 + int(frac * 44), f'{stage} — IoU={iou_val:.3f}')
+
+            res = register_elastic(mask_moving=mask_drr, mask_fixed=mask_fl,
+                                   progress_cb=_cb)
+        else:
+            def _cb(frac, iou_val):
+                self.progress.emit(50 + int(frac * 44), f'Recalage IoU={iou_val:.3f}')
+
+            res = register(mask_moving=mask_drr, mask_fixed=mask_fl, progress_cb=_cb)
 
         res.update(_auto=True, _phase='done', drr_image=drr_image,
                    proj_masks=all_proj_masks, mask_fl=mask_fl, mask_drr=mask_drr,
@@ -2890,7 +2903,7 @@ class MainWindow(QMainWindow):
         sec_auto = CollapsibleSection('PIPELINE AUTO', starts_open=True)
 
         auto_info = QLabel(
-            'DRR + Détection YOLO + Appariement auto + Recalage\n'
+            'DRR + Détection YOLO + Appariement auto + Recalage élastique\n'
             'Nécessite : CT, Fluoroscopie DICOM et modèle YOLO.\n'
             'Fallback : sélection manuelle si YOLO échoue.')
         auto_info.setObjectName('dim'); auto_info.setWordWrap(True)
@@ -2972,10 +2985,6 @@ class MainWindow(QMainWindow):
 
         self.overlay_panel = FinalOverlayPanel()
         self.tabs.addTab(self.overlay_panel, 'Overlay')
-
-        # Onglet intermédiaire : DRR généré + segmentations projetées
-        self.drr_proj_panel = FinalOverlayPanel()
-        self._tab_idx_drr_proj = self.tabs.addTab(self.drr_proj_panel, 'DRR + Seg')
 
         for cv in [self.cv_fl, self.cv_drr]:
             cv.set_tool('pencil'); cv.set_active('vertebrae')
@@ -3231,7 +3240,6 @@ class MainWindow(QMainWindow):
             self.drr_image = img
             self.proj_masks = {}
             self.cv_drr.set_image(img)
-            self._update_drr_projection(switch_to_tab=False)
             self.tabs.setTabText(1, 'Mobile')
             self.tabs.setCurrentIndex(1)
             self._status(f'Image mobile : {name}')
@@ -3331,6 +3339,8 @@ class MainWindow(QMainWindow):
                 table_angle=self.sp_table.value(),
                 output_size=self.sp_size.value(), masks=self.seg_masks,
                 fov_mm=self.sp_fov.value(),
+            sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
+            sod_mm=self.dicom_meta.get('sod_mm', 510.0),
                 renderer='siddon')
         self.worker=WorkerThread('drr',kw)
         self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
@@ -3341,7 +3351,6 @@ class MainWindow(QMainWindow):
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
         self._update_checklist()
-        self._update_drr_projection(switch_to_tab=True)
         # Auto-injecter les masques de segmentation projetes sur le canvas DRR
         if self.chk_use_seg.isChecked():
             if 'vertebrae' in self.proj_masks and self.proj_masks['vertebrae'] is not None:
@@ -3384,7 +3393,6 @@ class MainWindow(QMainWindow):
         self.proj_masks={}
         self.cv_drr.set_image(self.drr_image)
         self.lbl_xray.setText(f'X-Ray: {os.path.basename(p)}\n  {img.shape}')
-        self._update_drr_projection(switch_to_tab=True)
         self.tabs.setTabText(1,'X-Ray')
         self.tabs.setCurrentIndex(1)
         self._status('X-Ray chargé — dessiner les structures dans l\'onglet X-Ray')
@@ -3570,27 +3578,6 @@ class MainWindow(QMainWindow):
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(3)
 
-    def _update_drr_projection(self, switch_to_tab=False):
-        """Alimente l'onglet DRR + Seg avec DRR natif et projections non recalées."""
-        if self.drr_image is None:
-            return
-        s = int(self.drr_image.shape[0])
-        identity = {
-            'tx': 0.0,
-            'ty': 0.0,
-            'angle': 0.0,
-            'scale': 1.0,
-            'center': (s * 0.5, s * 0.5),
-        }
-        self.drr_proj_panel.set_data(
-            fluoro=self.drr_image,
-            proj_masks=self.proj_masks or {},
-            result=identity,
-            reg_size=s,
-        )
-        if switch_to_tab:
-            self.tabs.setCurrentIndex(self._tab_idx_drr_proj)
-
     # ── Pipeline automatique complet ──────────────────────────────────────────
 
     def _run_auto_pipeline(self):
@@ -3618,9 +3605,9 @@ class MainWindow(QMainWindow):
             table_angle=self.sp_table.value(),
             sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
             sod_mm=self.dicom_meta.get('sod_mm', 510.0),
-            fov_mm=self.sp_fov.value(),   # spinbox — ajustable par l'utilisateur
+            fov_mm=AUTO_PIPELINE_FOV_MM,   # pipeline complet verrouillé à 220 mm
             renderer='siddon',
-            elastic=self.chk_elastic.isChecked(),
+            elastic=True,
             yolo_kw=dict(
                 conf=self.sp_yolo_conf.value() / 100.0,
                 iou=self.sp_yolo_iou.value() / 100.0,
@@ -3648,7 +3635,6 @@ class MainWindow(QMainWindow):
             self.proj_masks = res.get('all_proj_masks', {})
             self.cv_drr.set_image(self.drr_image)
             self.tabs.setTabText(1, 'DRR')
-            self._update_drr_projection(switch_to_tab=True)
 
             # Ouvrir le panneau dual de sélection
             dlg = DualYoloSelectionDialog(
@@ -3697,7 +3683,6 @@ class MainWindow(QMainWindow):
         self.proj_masks = res.get('proj_masks', {})
         self.cv_drr.set_image(self.drr_image)
         self.tabs.setTabText(1, 'DRR')
-        self._update_drr_projection(switch_to_tab=True)
 
         # Injecter les masques appariés dans les canvas
         mask_fl = res.get('mask_fl')
@@ -3861,7 +3846,6 @@ class MainWindow(QMainWindow):
         self.sp_size.setValue(it['size'])
         self.drr_image = it['drr_image']
         self.proj_masks = it['proj_masks']
-        self._update_drr_projection(switch_to_tab=False)
         if self.drr_image is not None:
             self.cv_drr.set_image(self.drr_image)
             if self.chk_use_seg.isChecked() and self.proj_masks:
