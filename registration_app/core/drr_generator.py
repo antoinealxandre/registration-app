@@ -73,11 +73,11 @@ def _compute_delx(fov_mm: float, sid_mm: float, sod_mm: float,
     Au détecteur, le FOV est magnifié : fov_det = fov_mm * (sid/sod)
     delx = fov_det / output_size
     """
-    if fov_mm and fov_mm > 0 and sid_mm and sod_mm and sod_mm > 0:
-        fov_det = fov_mm * (sid_mm / sod_mm)
-        return fov_det / output_size
-    # Défaut raisonnable : FOV détecteur ~400mm pour 512px
-    return 400.0 / output_size
+    fov_iso = float(fov_mm) if (fov_mm is not None and fov_mm > 0) else 220.0
+    sid = float(sid_mm) if (sid_mm is not None and sid_mm > 0) else 1020.0
+    sod = float(sod_mm) if (sod_mm is not None and sod_mm > 0) else 510.0
+    fov_det = fov_iso * (sid / sod)
+    return fov_det / float(output_size)
 
 
 def generate_drr(
@@ -272,6 +272,36 @@ def project_mask_3d(
 
     proj = cv2.resize(proj, (output_size, output_size),
                       interpolation=cv2.INTER_LINEAR)
+
+    # Correction d'échelle physique : la projection rapide ci-dessus mappe
+    # implicitement toute la largeur CT sur l'image de sortie. Le DRR, lui,
+    # est paramétré par un FOV physique (à l'isocentre). On ajuste donc la
+    # taille apparente pour que masque et DRR partagent la même échelle.
+    if fov_mm is not None and fov_mm > 0 and ct_affine is not None:
+        try:
+            vx = float(abs(ct_affine[0, 0]))
+            vz = float(abs(ct_affine[2, 2]))
+            nx = int(mask_3d.shape[0])
+            nz = int(mask_3d.shape[2])
+            ct_span_mm = max(nx * vx, nz * vz, 1e-6)
+            scale = float(ct_span_mm / float(fov_mm))
+            scale = float(np.clip(scale, 0.25, 4.0))
+
+            if abs(scale - 1.0) > 0.02:
+                c = output_size * 0.5
+                M = cv2.getRotationMatrix2D((c, c), 0.0, scale)
+                proj = cv2.warpAffine(
+                    proj,
+                    M,
+                    (output_size, output_size),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+        except Exception:
+            # Fallback silencieux : on conserve la projection rapide sans correction.
+            pass
+
     return (proj > 0.3).astype(np.float32)
 
 

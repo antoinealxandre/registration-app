@@ -60,6 +60,7 @@ STRUCT = {
 }
 
 SIDEBAR_W = 310
+DEFAULT_FOV_MM = 220.0
 
 STYLE = f"""
 QMainWindow,QWidget{{background:{DARK_BG};color:{TEXT};font-family:'Segoe UI',sans-serif;font-size:12px;}}
@@ -2379,8 +2380,8 @@ def read_dicom_fluoro(path: str):
     cran = _get('PositionerSecondaryAngle', 0.0)
 
     # ── Distances et grossissement ───────────────────────────────────────────
-    sid  = _get('DistanceSourceToDetector', 1000.0)
-    sod  = _get('DistanceSourceToPatient',  750.0)
+    sid  = _get('DistanceSourceToDetector', 1020.0)
+    sod  = _get('DistanceSourceToPatient',  510.0)
     mag  = _get('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
 
     # ── Pixel spacing ────────────────────────────────────────────────────────
@@ -2391,14 +2392,19 @@ def read_dicom_fluoro(path: str):
     rows = int(getattr(ds, 'Rows', img_uint8.shape[0]))
     cols = int(getattr(ds, 'Columns', img_uint8.shape[1]))
     fov_dim = _get_multi('FieldOfViewDimensions')           # au détecteur
-    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    if fov_dim:
+        fov_dim_mm = tuple(fov_dim)
+        fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    else:
+        fov_mm = DEFAULT_FOV_MM
+        fov_det = fov_mm * (sid / sod) if sid > 0 and sod > 0 else (DEFAULT_FOV_MM * 2.0)
+        fov_dim_mm = (fov_det, fov_det)
     intensifier_mm = _get('IntensifierSize', 0.0)
     fov_shape = _get_str('FieldOfViewShape', '')
     fov_origin_raw = _get_multi('FieldOfViewOrigin')
     fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
-
-    # Champ de vue à l'isocentre (corrigé du grossissement)
-    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    if not np.isfinite(fov_mm) or fov_mm <= 0:
+        fov_mm = DEFAULT_FOV_MM
 
     # ── Table ────────────────────────────────────────────────────────────────
     table_angle = _get('TableAngle', 0.0)
@@ -2499,8 +2505,8 @@ def read_metadata_csv(path: str):
 
     lao  = _f('PositionerPrimaryAngle', 0.0)
     cran = _f('PositionerSecondaryAngle', 0.0)
-    sid  = _f('DistanceSourceToDetector', 1000.0)
-    sod  = _f('DistanceSourceToPatient', 750.0)
+    sid  = _f('DistanceSourceToDetector', 1020.0)
+    sod  = _f('DistanceSourceToPatient', 510.0)
     mag  = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
 
     ips = _flist('ImagerPixelSpacing')
@@ -2509,10 +2515,16 @@ def read_metadata_csv(path: str):
     rows = int(_f('Rows', 1000))
     cols = int(_f('Columns', 1000))
     fov_dim = _flist('FieldOfViewDimensions')
-    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    if fov_dim:
+        fov_dim_mm = tuple(fov_dim)
+        fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    else:
+        fov_mm = DEFAULT_FOV_MM
+        fov_det = fov_mm * (sid / sod) if sid > 0 and sod > 0 else (DEFAULT_FOV_MM * 2.0)
+        fov_dim_mm = (fov_det, fov_det)
     intensifier_mm = _f('IntensifierSize', 0.0)
-
-    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    if not np.isfinite(fov_mm) or fov_mm <= 0:
+        fov_mm = DEFAULT_FOV_MM
 
     table_angle = _f('TableAngle', 0.0)
     arm_l = _f('AngleValueLArm', None) if 'AngleValueLArm' in lookup else None
@@ -2705,7 +2717,7 @@ class MainWindow(QMainWindow):
         self.sp_table = QDoubleSpinBox(); self.sp_table.setRange(-45, 45); self.sp_table.setValue(0); self.sp_table.setSingleStep(0.5)
         gdl.addWidget(self.sp_table, 2, 1)
         gdl.addWidget(_lbl('FOV isoctr (mm)'), 3, 0)
-        self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(300); self.sp_fov.setSingleStep(10)
+        self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(DEFAULT_FOV_MM); self.sp_fov.setSingleStep(10)
         gdl.addWidget(self.sp_fov, 3, 1)
         gdl.addWidget(_lbl('Resolution (px)'), 4, 0)
         self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
@@ -2848,12 +2860,6 @@ class MainWindow(QMainWindow):
         # ── ACTIONS ──────────────────────────────────────────────────────────
         sec_act = CollapsibleSection('ACTIONS', starts_open=False)
 
-        self.btn_seg_overlay = QPushButton('Segmentations 2D')
-        self.btn_seg_overlay.setObjectName('primary')
-        self.btn_seg_overlay.setEnabled(False)
-        self.btn_seg_overlay.clicked.connect(self.open_seg_overlay)
-        sec_act.addWidget(self.btn_seg_overlay)
-
         btn_exp = QPushButton('Exporter resultats')
         btn_exp.clicked.connect(self.export_results)
         sec_act.addWidget(btn_exp)
@@ -2966,6 +2972,10 @@ class MainWindow(QMainWindow):
 
         self.overlay_panel = FinalOverlayPanel()
         self.tabs.addTab(self.overlay_panel, 'Overlay')
+
+        # Onglet intermédiaire : DRR généré + segmentations projetées
+        self.drr_proj_panel = FinalOverlayPanel()
+        self._tab_idx_drr_proj = self.tabs.addTab(self.drr_proj_panel, 'DRR + Seg')
 
         for cv in [self.cv_fl, self.cv_drr]:
             cv.set_tool('pencil'); cv.set_active('vertebrae')
@@ -3221,6 +3231,7 @@ class MainWindow(QMainWindow):
             self.drr_image = img
             self.proj_masks = {}
             self.cv_drr.set_image(img)
+            self._update_drr_projection(switch_to_tab=False)
             self.tabs.setTabText(1, 'Mobile')
             self.tabs.setCurrentIndex(1)
             self._status(f'Image mobile : {name}')
@@ -3230,6 +3241,7 @@ class MainWindow(QMainWindow):
         self.sp_lao.setValue(meta['lao'])
         self.sp_cran.setValue(meta['cran'])
         self.sp_table.setValue(meta.get('table_angle', 0.0))
+        self.sp_fov.setValue(float(meta.get('fov_mm', DEFAULT_FOV_MM) or DEFAULT_FOV_MM))
 
         fov = meta['fov_mm']
         # Label résumé dans DONNEES
@@ -3329,6 +3341,7 @@ class MainWindow(QMainWindow):
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
         self._update_checklist()
+        self._update_drr_projection(switch_to_tab=True)
         # Auto-injecter les masques de segmentation projetes sur le canvas DRR
         if self.chk_use_seg.isChecked():
             if 'vertebrae' in self.proj_masks and self.proj_masks['vertebrae'] is not None:
@@ -3371,6 +3384,7 @@ class MainWindow(QMainWindow):
         self.proj_masks={}
         self.cv_drr.set_image(self.drr_image)
         self.lbl_xray.setText(f'X-Ray: {os.path.basename(p)}\n  {img.shape}')
+        self._update_drr_projection(switch_to_tab=True)
         self.tabs.setTabText(1,'X-Ray')
         self.tabs.setCurrentIndex(1)
         self._status('X-Ray chargé — dessiner les structures dans l\'onglet X-Ray')
@@ -3440,7 +3454,6 @@ class MainWindow(QMainWindow):
         if 0 <= self._current_iter_idx < len(self._iterations):
             self._iterations[self._current_iter_idx]['result'] = res
             self._refresh_iter_list()
-        self.btn_seg_overlay.setEnabled(bool(self.proj_masks) and self.fluoro_image is not None)
         self._update_overlay()
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
 
@@ -3557,6 +3570,27 @@ class MainWindow(QMainWindow):
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(3)
 
+    def _update_drr_projection(self, switch_to_tab=False):
+        """Alimente l'onglet DRR + Seg avec DRR natif et projections non recalées."""
+        if self.drr_image is None:
+            return
+        s = int(self.drr_image.shape[0])
+        identity = {
+            'tx': 0.0,
+            'ty': 0.0,
+            'angle': 0.0,
+            'scale': 1.0,
+            'center': (s * 0.5, s * 0.5),
+        }
+        self.drr_proj_panel.set_data(
+            fluoro=self.drr_image,
+            proj_masks=self.proj_masks or {},
+            result=identity,
+            reg_size=s,
+        )
+        if switch_to_tab:
+            self.tabs.setCurrentIndex(self._tab_idx_drr_proj)
+
     # ── Pipeline automatique complet ──────────────────────────────────────────
 
     def _run_auto_pipeline(self):
@@ -3614,6 +3648,7 @@ class MainWindow(QMainWindow):
             self.proj_masks = res.get('all_proj_masks', {})
             self.cv_drr.set_image(self.drr_image)
             self.tabs.setTabText(1, 'DRR')
+            self._update_drr_projection(switch_to_tab=True)
 
             # Ouvrir le panneau dual de sélection
             dlg = DualYoloSelectionDialog(
@@ -3662,6 +3697,7 @@ class MainWindow(QMainWindow):
         self.proj_masks = res.get('proj_masks', {})
         self.cv_drr.set_image(self.drr_image)
         self.tabs.setTabText(1, 'DRR')
+        self._update_drr_projection(switch_to_tab=True)
 
         # Injecter les masques appariés dans les canvas
         mask_fl = res.get('mask_fl')
@@ -3694,10 +3730,6 @@ class MainWindow(QMainWindow):
         # Construire le panneau résultat visuel
         self._build_result(res)
         self.tabs.setCurrentIndex(2)
-
-        # Activer le bouton segmentations 2D
-        self.btn_seg_overlay.setEnabled(
-            bool(self.proj_masks) and self.fluoro_image is not None)
 
         # Mettre à jour l'onglet overlay final
         self._update_overlay()
@@ -3829,6 +3861,7 @@ class MainWindow(QMainWindow):
         self.sp_size.setValue(it['size'])
         self.drr_image = it['drr_image']
         self.proj_masks = it['proj_masks']
+        self._update_drr_projection(switch_to_tab=False)
         if self.drr_image is not None:
             self.cv_drr.set_image(self.drr_image)
             if self.chk_use_seg.isChecked() and self.proj_masks:
