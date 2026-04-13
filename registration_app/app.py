@@ -60,6 +60,8 @@ STRUCT = {
 }
 
 SIDEBAR_W = 310
+DEFAULT_FOV_MM = 220.0
+AUTO_PIPELINE_FOV_MM = 220.0
 
 STYLE = f"""
 QMainWindow,QWidget{{background:{DARK_BG};color:{TEXT};font-family:'Segoe UI',sans-serif;font-size:12px;}}
@@ -850,16 +852,449 @@ class ResultPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Panneau final : Fluoroscopie + Segmentations 3D projetées et recalées
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Palette médicale par nom de structure
+_MEDICAL_COLORS = {
+    'myocardium':               (206, 110,  84),
+    'left atrium':              (203, 108,  81),
+    'left ventricle':           (152,  55,  13),
+    'left ventricle of heart':  (152,  55,  13),
+    'right atrium':             (210, 115,  89),
+    'right ventricle':          (181,  85,  57),
+    'right ventricle of heart': (181,  85,  57),
+    'aorta':                    (224,  97,  76),
+    'pulmonary artery':         (  0, 122, 171),
+    'pulmonary venous system':  (186,  77,  64),
+    'atrial_appendage_left':    (142, 192,  72),
+    'left atrial appendage':    (142, 192,  72),
+    'superior_vena_cava':       (115, 176, 130),
+    'superior vena cava':       (115, 176, 130),
+    'inferior vena cava':       (  0, 151, 206),
+    'heart':                    (206, 110,  84),
+    'spleen':                   (157, 108, 162),
+    'liver':                    (221, 130, 101),
+    'stomach':                  (216, 132, 105),
+    'esophagus':                (211, 171, 143),
+    'trachea':                  (182, 228, 255),
+    'portal/splenic vein':      (  0, 151, 206),
+}
+
+_VERTEBRA_COLOR = (226, 202, 134)   # Jaune os pour les vertèbres
+
+
+def _color_for_structure(name: str, index: int) -> tuple:
+    """Retourne (R,G,B) pour une structure anatomique."""
+    key = name.lower().strip()
+    if key in _MEDICAL_COLORS:
+        return _MEDICAL_COLORS[key]
+    # Vertèbres : T6, T7, L1 … pattern
+    if 'vertebra' in key or 'vertebr' in key:
+        return _VERTEBRA_COLOR
+    # Poumons
+    if 'lung' in key:
+        return (172, 138, 115)
+    return _SEG_PALETTE[index % len(_SEG_PALETTE)]
+
+
+class FinalOverlayPanel(QWidget):
+    """
+    Onglet intégré : vue fluoroscopie 2D avec segmentations 3D
+    projetées et recalées superposées (contours + remplissage).
+    """
+
+    RENDER_MODES = ['Contours + Remplissage', 'Contours seuls', 'Remplissage seul']
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fluoro = None
+        self._proj_masks = {}
+        self._result = None
+        self._reg_size = 512
+        self._mode = 0
+        self._alpha = 0.35
+        self._lw = 2
+        self._show_labels = True
+        self._vis = {}
+        self._colors = {}
+        self._chks = {}
+        self._full_image = None
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0
+        self._pan_active = False
+        self._pan_start = None
+        self._build_ui()
+
+    # ── Construction UI ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(5)
+
+        # ── Barre de contrôle supérieure ──────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
+
+        self._cmb = QComboBox()
+        for m in self.RENDER_MODES:
+            self._cmb.addItem(m)
+        self._cmb.setFixedWidth(200)
+        self._cmb.currentIndexChanged.connect(self._on_mode)
+        ctrl.addWidget(self._cmb)
+
+        sep1 = QFrame(); sep1.setFrameShape(QFrame.VLine); sep1.setObjectName('sep')
+        ctrl.addWidget(sep1)
+
+        lbl_a = QLabel('Opacité :'); lbl_a.setObjectName('dim')
+        ctrl.addWidget(lbl_a)
+        self._sl_alpha = QSlider(Qt.Horizontal)
+        self._sl_alpha.setRange(5, 80); self._sl_alpha.setValue(35)
+        self._sl_alpha.setFixedWidth(110)
+        self._sl_alpha.valueChanged.connect(self._on_alpha)
+        ctrl.addWidget(self._sl_alpha)
+        self._lbl_alpha = QLabel('35 %'); self._lbl_alpha.setObjectName('dim'); self._lbl_alpha.setFixedWidth(35)
+        ctrl.addWidget(self._lbl_alpha)
+
+        lbl_c = QLabel('Contour :'); lbl_c.setObjectName('dim')
+        ctrl.addWidget(lbl_c)
+        self._sl_lw = QSlider(Qt.Horizontal)
+        self._sl_lw.setRange(1, 6); self._sl_lw.setValue(2)
+        self._sl_lw.setFixedWidth(70)
+        self._sl_lw.valueChanged.connect(self._on_lw)
+        ctrl.addWidget(self._sl_lw)
+
+        self._chk_labels = QCheckBox('Labels')
+        self._chk_labels.setChecked(True)
+        self._chk_labels.toggled.connect(lambda _: self._render())
+        ctrl.addWidget(self._chk_labels)
+
+        ctrl.addStretch()
+
+        btn_export = QPushButton('Exporter PNG')
+        btn_export.clicked.connect(self._export)
+        ctrl.addWidget(btn_export)
+
+        root.addLayout(ctrl)
+
+        # ── Zone principale : image + panneau structures ──────────────────────
+        body = QHBoxLayout()
+        body.setSpacing(8)
+
+        # Image
+        self._lbl_img = QLabel()
+        self._lbl_img.setAlignment(Qt.AlignCenter)
+        self._lbl_img.setMinimumSize(400, 400)
+        self._lbl_img.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._lbl_img.setStyleSheet(f'background:{DARK_BG};border-radius:4px;')
+        self._lbl_img.wheelEvent = self._on_wheel
+        self._lbl_img.mousePressEvent = self._on_press
+        self._lbl_img.mouseMoveEvent = self._on_move
+        self._lbl_img.mouseReleaseEvent = self._on_release
+        body.addWidget(self._lbl_img, 3)
+
+        # Panneau structures
+        sp = QWidget()
+        sp.setFixedWidth(230)
+        sp.setStyleSheet(f'background:{PANEL_BG};border:1px solid {BORDER};border-radius:6px;')
+        spl = QVBoxLayout(sp)
+        spl.setContentsMargins(8, 8, 8, 8); spl.setSpacing(6)
+
+        title = QLabel('STRUCTURES')
+        title.setStyleSheet(f'color:{ACCENT};font-size:11px;font-weight:700;'
+                            f'letter-spacing:1px;border:none;background:transparent;')
+        spl.addWidget(title)
+
+        hr = QHBoxLayout(); hr.setSpacing(4)
+        ba = QPushButton('Toutes'); ba.setFixedHeight(24); ba.clicked.connect(self._show_all)
+        bn = QPushButton('Aucune'); bn.setFixedHeight(24); bn.clicked.connect(self._hide_all)
+        hr.addWidget(ba); hr.addWidget(bn)
+        spl.addLayout(hr)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet(f'QScrollArea{{background:transparent;border:none;}}')
+        self._inner = QWidget(); self._inner.setStyleSheet('background:transparent;')
+        self._inner_l = QVBoxLayout(self._inner)
+        self._inner_l.setContentsMargins(0, 0, 0, 0); self._inner_l.setSpacing(3)
+        self._inner_l.addStretch()
+        self._scroll.setWidget(self._inner)
+        spl.addWidget(self._scroll, 1)
+
+        # Zoom
+        zr = QHBoxLayout(); zr.setSpacing(4)
+        zr.addWidget(QLabel('Zoom :'))
+        self._sl_zoom = QSlider(Qt.Horizontal)
+        self._sl_zoom.setRange(50, 400); self._sl_zoom.setValue(100)
+        self._sl_zoom.valueChanged.connect(self._on_zoom_sl)
+        zr.addWidget(self._sl_zoom)
+        self._lbl_zoom = QLabel('100 %'); self._lbl_zoom.setFixedWidth(40); self._lbl_zoom.setObjectName('dim')
+        zr.addWidget(self._lbl_zoom)
+        spl.addLayout(zr)
+
+        btn_rst = QPushButton('Réinitialiser vue')
+        btn_rst.setFixedHeight(26)
+        btn_rst.clicked.connect(self._reset_view)
+        spl.addWidget(btn_rst)
+
+        self._lbl_info = QLabel('En attente de données…')
+        self._lbl_info.setObjectName('dim'); self._lbl_info.setWordWrap(True)
+        spl.addWidget(self._lbl_info)
+
+        body.addWidget(sp)
+        root.addLayout(body, 1)
+
+    # ── API publique ──────────────────────────────────────────────────────────
+    def set_data(self, fluoro: np.ndarray, proj_masks: dict,
+                 result: dict, reg_size: int):
+        """
+        fluoro     : float32 [0,1] image fluoroscopie (résolution native)
+        proj_masks : {nom_structure: masque 2D float32 à reg_size}
+        result     : dict résultat du recalage (tx, ty, angle, scale, center…)
+        reg_size   : résolution de travail du recalage [px]
+        """
+        self._fluoro = np.clip(fluoro, 0, 1).astype(np.float32)
+        self._proj_masks = proj_masks or {}
+        self._result = result
+        self._reg_size = reg_size
+        self._colors = {}
+        self._vis = {}
+        for i, name in enumerate(self._proj_masks):
+            self._colors[name] = _color_for_structure(name, i)
+            self._vis[name] = True
+        self._rebuild_list()
+        self._zoom = 1.0; self._pan_x = self._pan_y = 0
+        self._sl_zoom.blockSignals(True); self._sl_zoom.setValue(100); self._sl_zoom.blockSignals(False)
+        self._render()
+
+    def has_data(self):
+        return self._fluoro is not None and self._result is not None and bool(self._proj_masks)
+
+    # ── Reconstruction de la liste de structures ──────────────────────────────
+    def _rebuild_list(self):
+        while self._inner_l.count():
+            w = self._inner_l.takeAt(0).widget()
+            if w: w.deleteLater()
+        self._chks = {}
+        for name in self._proj_masks:
+            r, g, b = self._colors.get(name, (200, 200, 200))
+            row = QWidget(); row.setStyleSheet('background:transparent;')
+            rl = QHBoxLayout(row); rl.setContentsMargins(2, 1, 2, 1); rl.setSpacing(4)
+            chk = QCheckBox(); chk.setChecked(True)
+            chk.toggled.connect(lambda _, n=name: self._toggle(n))
+            self._chks[name] = chk
+            rl.addWidget(chk)
+            sw = QLabel(); sw.setFixedSize(12, 12)
+            sw.setStyleSheet(f'background:rgb({r},{g},{b});border-radius:2px;border:none;')
+            rl.addWidget(sw)
+            display = name if len(name) <= 22 else name[:19] + '…'
+            lbl = QLabel(display); lbl.setToolTip(name)
+            lbl.setStyleSheet(f'color:{TEXT};font-size:10px;border:none;background:transparent;')
+            rl.addWidget(lbl, 1)
+            self._inner_l.addWidget(row)
+        self._inner_l.addStretch()
+        n = len(self._proj_masks)
+        self._lbl_info.setText(f'{n} structure(s) projetée(s)')
+
+    # ── Slots ─────────────────────────────────────────────────────────────────
+    def _toggle(self, name):
+        self._vis[name] = self._chks[name].isChecked()
+        self._render()
+
+    def _show_all(self):
+        for c in self._chks.values(): c.setChecked(True)
+
+    def _hide_all(self):
+        for c in self._chks.values(): c.setChecked(False)
+
+    def _on_mode(self, idx):   self._mode = idx; self._render()
+    def _on_alpha(self, v):    self._alpha = v / 100.0; self._lbl_alpha.setText(f'{v} %'); self._render()
+    def _on_lw(self, v):       self._lw = v; self._render()
+
+    def _on_zoom_sl(self, v):
+        self._zoom = v / 100.0
+        self._lbl_zoom.setText(f'{v} %')
+        self._render()
+
+    def _on_wheel(self, e):
+        if e.angleDelta().y() > 0:
+            self._zoom = min(self._zoom * 1.12, 4.0)
+        else:
+            self._zoom = max(self._zoom / 1.12, 0.5)
+        self._sl_zoom.blockSignals(True)
+        self._sl_zoom.setValue(int(self._zoom * 100))
+        self._sl_zoom.blockSignals(False)
+        self._lbl_zoom.setText(f'{int(self._zoom*100)} %')
+        self._render()
+
+    def _on_press(self, e):
+        self._pan_active = True; self._pan_start = (e.x(), e.y())
+    def _on_move(self, e):
+        if not self._pan_active or not self._pan_start: return
+        self._pan_x += (e.x() - self._pan_start[0]) * 0.5
+        self._pan_y += (e.y() - self._pan_start[1]) * 0.5
+        self._pan_start = (e.x(), e.y())
+        self._render()
+    def _on_release(self, e):
+        self._pan_active = False
+
+    def _reset_view(self):
+        self._zoom = 1.0; self._pan_x = self._pan_y = 0
+        self._sl_zoom.blockSignals(True); self._sl_zoom.setValue(100); self._sl_zoom.blockSignals(False)
+        self._lbl_zoom.setText('100 %')
+        self._render()
+
+    # ── Rendu principal ───────────────────────────────────────────────────────
+    def _render(self):
+        if self._fluoro is None or self._result is None:
+            self._lbl_img.clear(); return
+
+        fl = self._fluoro
+        S = fl.shape[0]
+        reg_s = self._reg_size
+
+        fl_u8 = (fl * 255).astype(np.uint8)
+        rgb = cv2.cvtColor(fl_u8, cv2.COLOR_GRAY2RGB).astype(np.float32)
+
+        self._show_labels = self._chk_labels.isChecked()
+
+        for name, mask in self._proj_masks.items():
+            if not self._vis.get(name, True):
+                continue
+
+            m = mask.astype(np.float32)
+            if m.shape[:2] != (reg_s, reg_s):
+                m = cv2.resize(m, (reg_s, reg_s), interpolation=cv2.INTER_LINEAR)
+
+            warped = apply_full_transform(m, self._result)
+            if warped.shape[:2] != (S, S):
+                warped = cv2.resize(warped, (S, S), interpolation=cv2.INTER_LINEAR)
+
+            binary = (warped > 0.3).astype(np.uint8)
+            if binary.sum() == 0:
+                continue
+
+            r, g, b = self._colors.get(name, (200, 200, 200))
+            alpha = self._alpha
+
+            # Remplissage
+            if self._mode in (0, 2):
+                ov = rgb.copy(); ov[binary > 0] = [r, g, b]
+                rgb = cv2.addWeighted(rgb, 1 - alpha, ov, alpha, 0)
+
+            # Contours
+            if self._mode in (0, 1):
+                cnts, _ = cv2.findContours(
+                    binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+                cv2.drawContours(rgb_u8, cnts, -1, (r, g, b),
+                                 self._lw, lineType=cv2.LINE_AA)
+                rgb = rgb_u8.astype(np.float32)
+
+            # Labels
+            if self._show_labels and binary.sum() > 100:
+                ys, xs = np.where(binary > 0)
+                cx, cy = int(xs.mean()), int(ys.min()) - 10
+                cy = max(16, cy)
+                rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+                txt = name if len(name) <= 24 else name[:21] + '…'
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+                lx = max(0, min(cx - tw // 2, S - tw - 4))
+                ly = max(th + 4, cy)
+                cv2.rectangle(rgb_u8,
+                              (lx - 3, ly - th - 3), (lx + tw + 3, ly + 3),
+                              (int(r * 0.3), int(g * 0.3), int(b * 0.3)), -1)
+                cv2.rectangle(rgb_u8,
+                              (lx - 3, ly - th - 3), (lx + tw + 3, ly + 3),
+                              (r, g, b), 1)
+                cv2.putText(rgb_u8, txt, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (r, g, b), 1, cv2.LINE_AA)
+                rgb = rgb_u8.astype(np.float32)
+
+        self._full_image = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        # Zoom et pan
+        h, w = self._full_image.shape[:2]
+        if abs(self._zoom - 1.0) > 0.01 or abs(self._pan_x) > 0.5 or abs(self._pan_y) > 0.5:
+            M = cv2.getRotationMatrix2D((w * 0.5, h * 0.5), 0, self._zoom)
+            M[0, 2] += self._pan_x; M[1, 2] += self._pan_y
+            display = cv2.warpAffine(self._full_image, M, (w, h),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=(12, 14, 20))
+        else:
+            display = self._full_image
+
+        lw = max(48, self._lbl_img.width()); lh = max(48, self._lbl_img.height())
+        side = min(lw, lh)
+        if side > 16:
+            display = cv2.resize(display, (side, side), interpolation=cv2.INTER_LINEAR)
+        display = np.ascontiguousarray(display)
+        h2, w2 = display.shape[:2]
+        qi = QImage(display.data, w2, h2, w2 * 3, QImage.Format_RGB888)
+        self._lbl_img.setPixmap(QPixmap.fromImage(qi).copy())
+
+    def _export(self):
+        if self._full_image is None: return
+        p, _ = QFileDialog.getSaveFileName(
+            self, 'Exporter overlay', 'overlay_final.png',
+            'PNG (*.png);;JPEG (*.jpg);;TIFF (*.tiff)')
+        if not p: return
+        bgr = cv2.cvtColor(self._full_image, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(p, bgr)
+        QMessageBox.information(self, 'Export', f'Sauvegardé :\n{p}')
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e); self._render()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Worker thread
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ───────────────────────────────────────────────────────────────────────────────
+def _match_centroids(boxes_drr: list, boxes_fl: list, img_size: int):
+    """
+    Apparie chaque boîte DRR à la boîte fluoro dont le centroïde est le plus proche.
+    Seuil : 30 % de la taille image. Retourne (matched_drr, matched_fl).
+    Si aucun appariement, retourne toutes les boîtes des deux côtés.
+    """
+    thr = img_size * 0.30
+
+    def _cx(b):
+        return ((b['x1'] + b['x2']) / 2.0, (b['y1'] + b['y2']) / 2.0)
+
+    used = set()
+    matched_drr, matched_fl = [], []
+    for bd in boxes_drr:
+        cd = _cx(bd)
+        best_d, best_j = float('inf'), -1
+        for j, bf in enumerate(boxes_fl):
+            if j in used:
+                continue
+            cf = _cx(bf)
+            d = ((cd[0] - cf[0]) ** 2 + (cd[1] - cf[1]) ** 2) ** 0.5
+            if d < best_d:
+                best_d, best_j = d, j
+        if best_j >= 0 and best_d <= thr:
+            matched_drr.append(bd)
+            matched_fl.append(boxes_fl[best_j])
+            used.add(best_j)
+
+    if not matched_drr:          # aucun appariement → tout garder
+        return boxes_drr[:], boxes_fl[:]
+    return matched_drr, matched_fl
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 class WorkerThread(QThread):
     progress=pyqtSignal(int,str); result=pyqtSignal(dict); error=pyqtSignal(str)
     def __init__(self,task,kw): super().__init__(); self.task=task; self.kw=kw
     def run(self):
         try: {'drr':self._drr,'register':self._reg,
                'yolo_detect':self._yolo_detect,
-               'auto_pipeline':self._auto_pipeline}[self.task]()
+               'auto_pipeline':self._auto_pipeline,
+               'auto_phase2':self._auto_phase2}[self.task]()
         except Exception as ex:
             import traceback; self.error.emit(f'{ex}\n{traceback.format_exc()}')
 
@@ -931,215 +1366,193 @@ class WorkerThread(QThread):
         self.progress.emit(100, f"IoU={res['iou']:.3f}"); self.result.emit(res)
 
     # ── Pipeline automatique complet ──────────────────────────────────────────
+    # ── Pipeline entièrement automatique (1 bouton) ───────────────────────────
     def _auto_pipeline(self):
         """
-        Pipeline complet en un clic :
-          1. Génération DRR depuis le CT + géométrie DICOM
-          2. Projection individuelle de chaque vertèbre (T6-T12) → bounding-boxes DRR
-          3. Détection YOLO sur la fluoroscopie
-          4. Appariement : on ne garde que les vertèbres visibles des deux côtés
-          5. Recalage IoU sur les masques appariés
-
-        Le côté DRR utilise les segmentations connues (T6-T12) plutôt que YOLO,
-        ce qui élimine l'incertitude sur l'identité des vertèbres DRR.
-        L'appariement se fait par position relative verticale, en cherchant la
-        sous-séquence de détections fluoro qui correspond le mieux aux positions
-        des vertèbres projetées depuis le CT.
+        1. Génère DRR aux angles DICOM
+        2. Détecte vertèbres YOLO sur DRR + fluoro
+        3. Apparie par centroïde le plus proche
+        4. Recalage IoU direct
+        Fallback : sélection manuelle si YOLO échoue.
         """
-        import re as _re
         kw = self.kw
-        ct_path   = kw['ct_path']
-        ct_aff    = kw['ct_aff']
-        seg_masks = kw['seg_masks']       # dict {name: 3d_mask}
-        fluoro    = kw['fluoro']           # float32 [0,1]
-        reg_size  = kw['output_size']
-        elastic   = kw.get('elastic', False)
-        yolo_kw   = kw.get('yolo_kw', {})
+        ct_path     = kw['ct_path']
+        fluoro      = kw['fluoro']
+        reg_size    = kw['output_size']
+        lao_deg     = kw['lao_deg']
+        cran_deg    = kw['cran_deg']     # déjà UI + 180
+        table_angle = kw.get('table_angle', 0.0)
+        yolo_kw     = kw.get('yolo_kw', {})
 
-        # ── Filtrer les segmentations vertébrales (T6-T12) ────────────────────
-        vert_pattern = _re.compile(r'(T|L|C|S)\s*(\d+)', _re.IGNORECASE)
-        vert_segs = {}
-        for name, mask3d in seg_masks.items():
-            m = vert_pattern.search(name)
-            if m:
-                region = m.group(1).upper()
-                num = int(m.group(2))
-                order = {'C': 0, 'T': 1, 'L': 2, 'S': 3}.get(region, 9) * 100 + num
-                vert_segs[name] = {'mask': mask3d, 'order': order,
-                                   'label': f'{region}{num}'}
-        if not vert_segs:
-            raise RuntimeError(
-                'Aucune segmentation vertébrale trouvée dans les masques chargés.\n'
-                'Noms trouvés : ' + ', '.join(seg_masks.keys()))
-
-        # Trier par ordre anatomique (C→T→L→S)
-        vert_sorted = sorted(vert_segs.items(), key=lambda x: x[1]['order'])
-        n_seg = len(vert_sorted)
-        labels_seg = [v['label'] for _, v in vert_sorted]
-        self.progress.emit(3, f'{n_seg} vertèbre(s) segmentée(s) : {", ".join(labels_seg)}')
-
-        # ── 1. Génération DRR ─────────────────────────────────────────────────
-        self.progress.emit(5, 'Génération DRR (cone-beam)…')
-        drr_kw = {k: kw[k] for k in ('lao_deg', 'cran_deg', 'table_angle',
-                                       'output_size', 'renderer')
-                  if k in kw}
+        geom_kw = dict(lao_deg=lao_deg, cran_deg=cran_deg,
+                       table_angle=table_angle, output_size=reg_size)
         for k in ('sid_mm', 'sod_mm', 'fov_mm'):
-            if k in kw:
-                drr_kw[k] = kw[k]
-        drr_kw['ct_path'] = ct_path
-        drr_kw['progress_cb'] = lambda pct, msg: self.progress.emit(
-            5 + int(pct * 0.15), msg)
-        drr_image = generate_drr(**drr_kw)
+            if k in kw and kw[k] is not None:
+                geom_kw[k] = kw[k]
 
-        # ── 2. Projection individuelle de chaque vertèbre ────────────────────
-        self.progress.emit(22, 'Projection des segmentations vertébrales…')
-        proj_kw = {k: kw.get(k) for k in ('lao_deg', 'cran_deg', 'table_angle',
-                                            'output_size', 'sid_mm', 'sod_mm',
-                                            'fov_mm', 'renderer')}
-        proj_kw = {k: v for k, v in proj_kw.items() if v is not None}
-        proj_kw['ct_path'] = ct_path
-        proj_kw['ct_affine'] = ct_aff
+        if not yolo_ready():
+            raise RuntimeError('Chargez un modèle YOLO (.pt) d\'abord.')
 
-        drr_vert_boxes = []          # bounding-boxes DRR issues de la segmentation
-        all_proj_masks = {}          # toutes les projections (pour overlay)
-        for i, (name, info) in enumerate(vert_sorted):
-            proj = project_mask_3d(mask_3d=info['mask'], **proj_kw)
-            all_proj_masks[name] = proj
-            # Extraire la bounding-box à partir du masque projeté
-            ys, xs = np.where(proj > 0.5)
-            if len(ys) == 0:
-                continue
-            box = {'x1': int(xs.min()), 'y1': int(ys.min()),
-                   'x2': int(xs.max()), 'y2': int(ys.max()),
-                   'cls_name': info['label'], 'conf': 1.0,
-                   'order': info['order'], 'proj_mask': proj}
-            drr_vert_boxes.append(box)
-            self.progress.emit(22 + int((i + 1) / n_seg * 8),
-                               f'Projection {info["label"]}…')
+        # ── 1. Génération DRR ────────────────────────────────────────────────
+        self.progress.emit(5, f'Génération DRR (FOV={geom_kw.get("fov_mm", AUTO_PIPELINE_FOV_MM):.0f} mm)…')
+        drr_image = generate_drr(
+            ct_path=ct_path, renderer='siddon',
+            progress_cb=lambda p, m: self.progress.emit(5 + int(p * 0.18), m),
+            **geom_kw)
 
-        if len(drr_vert_boxes) < 2:
-            raise RuntimeError(
-                f'Seulement {len(drr_vert_boxes)} vertèbre(s) visibles sur le DRR '
-                f'après projection. Vérifiez les angles de vue.')
+        # ── 1b. Projection des segmentations 3D ──────────────────────────────
+        all_proj_masks = {}
+        seg_masks = kw.get('seg_masks', {})
+        if seg_masks:
+            self.progress.emit(23, f'Projection de {len(seg_masks)} segmentation(s)…')
+            for seg_name, seg_vol in seg_masks.items():
+                if seg_vol is None or seg_vol.sum() == 0:
+                    continue
+                all_proj_masks[seg_name] = project_mask_3d(
+                    mask_3d=seg_vol,
+                    ct_affine=kw.get('ct_aff'),
+                    ct_path=ct_path,
+                    lao_deg=lao_deg,
+                    cran_deg=cran_deg,
+                    table_angle=table_angle,
+                    output_size=reg_size,
+                    sid_mm=geom_kw.get('sid_mm', 1020.0),
+                    sod_mm=geom_kw.get('sod_mm', 510.0),
+                    fov_mm=geom_kw.get('fov_mm'),
+                )
 
-        drr_vert_boxes.sort(key=lambda b: b['y1'])
-        n_drr = len(drr_vert_boxes)
-        drr_labels = [b['cls_name'] for b in drr_vert_boxes]
-        self.progress.emit(30, f'{n_drr} vertèbre(s) projetées sur DRR : {", ".join(drr_labels)}')
-
-        # ── 3. Détection YOLO sur la fluoroscopie ────────────────────────────
-        self.progress.emit(32, 'Détection YOLO sur la fluoroscopie…')
-        fl_resized = cv2.resize(
-            (np.clip(fluoro, 0, 1) * 255).astype(np.uint8),
-            (reg_size, reg_size), interpolation=cv2.INTER_LANCZOS4)
-        det = detect_vertebrae(
-            fl_resized,
-            conf=yolo_kw.get('conf', 0.25),
+        # ── 2. YOLO sur DRR ─────────────────────────────────────────────────
+        self.progress.emit(25, 'YOLO sur le DRR…')
+        drr_u8 = (np.clip(drr_image, 0, 1) * 255).astype(np.uint8)
+        drr_rs = cv2.resize(drr_u8, (reg_size, reg_size),
+                            interpolation=cv2.INTER_LANCZOS4)
+        det_drr = detect_vertebrae(
+            drr_rs, conf=yolo_kw.get('conf', 0.25),
             iou=yolo_kw.get('iou', 0.45),
-            imgsz=yolo_kw.get('imgsz', 288),
-            preprocess=True,
+            imgsz=yolo_kw.get('imgsz', 288), preprocess=False)
+        boxes_drr = det_drr['boxes']
+
+        # ── 3. YOLO sur fluoro ───────────────────────────────────────────────
+        self.progress.emit(38, 'YOLO sur la fluoroscopie…')
+        yolo_size = 1024
+        fl_u8 = (np.clip(fluoro, 0, 1) * 255).astype(np.uint8)
+        fl_rs = cv2.resize(fl_u8, (yolo_size, yolo_size),
+                           interpolation=cv2.INTER_LANCZOS4)
+        det_fl = detect_vertebrae(
+            fl_rs, conf=yolo_kw.get('conf', 0.25),
+            iou=yolo_kw.get('iou', 0.45),
+            imgsz=yolo_kw.get('imgsz', 288), preprocess=True,
             preprocess_params=yolo_kw.get('pp', {}))
-        boxes_fl = det['boxes']
-        n_fl = len(boxes_fl)
-        if n_fl == 0:
-            raise RuntimeError(
-                'Aucune vertèbre détectée sur la fluoroscopie.\n'
-                'Essayez de baisser le seuil de confiance YOLO.')
-        self.progress.emit(48, f'{n_fl} vertèbre(s) détectée(s) sur la fluoro')
+        scale_f = reg_size / yolo_size
+        boxes_fl = [
+            {'x1': int(b['x1'] * scale_f), 'y1': int(b['y1'] * scale_f),
+             'x2': int(b['x2'] * scale_f), 'y2': int(b['y2'] * scale_f),
+             'conf': b['conf'], 'cls_name': b.get('cls_name', '')}
+            for b in det_fl['boxes']
+        ]
 
-        # ── 4. Appariement ───────────────────────────────────────────────────
-        #
-        # Stratégie : les vertèbres DRR sont connues (T6-T12 par ex.).
-        # On cherche dans les détections fluoro (triées haut→bas) la sous-séquence
-        # contiguë de longueur k qui minimise l'erreur de position relative
-        # par rapport aux vertèbres DRR projetées.
-        #
-        # Cela gère les cas où YOLO détecte plus ou moins de vertèbres que
-        # le nombre de segmentations, en trouvant le meilleur sous-ensemble commun.
-        self.progress.emit(50, 'Appariement des vertèbres…')
+        # ── 4. Appariement automatique ou fallback manuel ────────────────────
+        if not boxes_drr or not boxes_fl:
+            self.progress.emit(50, 'Détection insuffisante — sélection manuelle…')
+            self.result.emit({
+                '_phase': 'select_vertebrae',
+                'drr_image': drr_image, 'all_proj_masks': all_proj_masks,
+                'drr_boxes': boxes_drr, 'det_fl': det_fl, 'det_drr': det_drr,
+                'boxes_fl': boxes_fl, 'reg_size': reg_size,
+            })
+            return
 
-        def _rel_centers(boxes, h):
-            return np.array([(b['y1'] + b['y2']) / (2.0 * h) for b in boxes])
+        matched_drr, matched_fl = _match_centroids(boxes_drr, boxes_fl, reg_size)
+        self.progress.emit(48, f'{len(matched_drr)} paire(s) — recalage…')
 
-        pos_drr = _rel_centers(drr_vert_boxes, reg_size)
-        pos_fl  = _rel_centers(boxes_fl, reg_size)
-
-        best_score = np.inf
-        best_fl_idx = None
-        best_dr_idx = None
-
-        k_max = min(n_drr, n_fl)
-        k_min = max(2, k_max - 2)      # on tolère de perdre 2 vertèbres max
-
-        for k in range(k_max, k_min - 1, -1):
-            for i0 in range(n_fl - k + 1):
-                for j0 in range(n_drr - k + 1):
-                    sub_fl  = pos_fl[i0:i0 + k]
-                    sub_drr = pos_drr[j0:j0 + k]
-                    mse = float(np.mean((sub_fl - sub_drr) ** 2))
-                    penalty = 0.02 * (k_max - k)
-                    score = mse + penalty
-                    if score < best_score:
-                        best_score = score
-                        best_fl_idx = list(range(i0, i0 + k))
-                        best_dr_idx = list(range(j0, j0 + k))
-
-        if best_fl_idx is None or len(best_fl_idx) < 2:
-            raise RuntimeError(
-                f'Impossible d\'apparier les vertèbres.\n'
-                f'DRR : {n_drr} segmentations, Fluoro : {n_fl} détections YOLO.')
-
-        matched_fl  = [boxes_fl[i] for i in best_fl_idx]
-        matched_drr = [drr_vert_boxes[i] for i in best_dr_idx]
-        n_matched = len(matched_fl)
-        matched_labels = [b['cls_name'] for b in matched_drr]
-        self.progress.emit(55,
-            f'{n_matched} vertèbre(s) appariée(s) : {", ".join(matched_labels)}')
-
-        # ── 5. Construction des masques ──────────────────────────────────────
-        # Côté DRR : masques issus de la segmentation projetée (pas des boîtes)
+        # ── 5. Construction masques ──────────────────────────────────────────
         mask_drr = np.zeros((reg_size, reg_size), dtype=np.float32)
         for b in matched_drr:
-            mask_drr = np.clip(mask_drr + b['proj_mask'], 0, 1)
-
-        # Côté fluoro : masques issus des boîtes YOLO
+            mask_drr[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
         mask_fl = np.zeros((reg_size, reg_size), dtype=np.float32)
         for b in matched_fl:
             mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
 
-        # ── 6. Recalage ─────────────────────────────────────────────────────
-        self.progress.emit(58, 'Recalage 2D (optimisation IoU)…')
+        # ── 6. Recalage (élastique par défaut) ──────────────────────────────
+        use_elastic = kw.get('elastic', True)
+        if use_elastic:
+            self.progress.emit(50, 'Recalage élastique (rigide + FFD)…')
+
+            def _cb(frac, iou_val):
+                stage = 'Rigide' if frac < 0.5 else 'Elastique'
+                self.progress.emit(50 + int(frac * 44), f'{stage} — IoU={iou_val:.3f}')
+
+            res = register_elastic(mask_moving=mask_drr, mask_fixed=mask_fl,
+                                   progress_cb=_cb)
+        else:
+            def _cb(frac, iou_val):
+                self.progress.emit(50 + int(frac * 44), f'Recalage IoU={iou_val:.3f}')
+
+            res = register(mask_moving=mask_drr, mask_fixed=mask_fl, progress_cb=_cb)
+
+        res.update(_auto=True, _phase='done', drr_image=drr_image,
+                   proj_masks=all_proj_masks, mask_fl=mask_fl, mask_drr=mask_drr,
+                   n_fluoro_sel=len(matched_fl), n_drr_sel=len(matched_drr))
+        self.progress.emit(100, f'Terminé — IoU={res["iou"]:.3f}')
+        self.result.emit(res)
+
+    # ── Phase 2 (fallback manuel) : sélection vertèbres → recalage ───────────
+    def _auto_phase2(self):
+        """
+        Phase 2 : reçoit les boîtes sélectionnées par l'utilisateur
+        (fluoro + DRR) et effectue le recalage élastique.
+        """
+        kw = self.kw
+        boxes_fl        = kw['boxes_fl']
+        boxes_drr       = kw['boxes_drr']
+        reg_size        = kw['reg_size']
+        drr_image       = kw['drr_image']
+        all_proj_masks  = kw['all_proj_masks']
+
+        n_fl  = len(boxes_fl)
+        n_drr = len(boxes_drr)
+
+        if n_fl == 0:
+            raise RuntimeError('Aucune vertèbre fluoro sélectionnée.')
+        if n_drr == 0:
+            raise RuntimeError('Aucune vertèbre DRR sélectionnée.')
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Construction des masques (boîtes sélectionnées) + recalage élastique
+        # ══════════════════════════════════════════════════════════════════════
+        self.progress.emit(55, 'Construction des masques…')
+
+        mask_drr = np.zeros((reg_size, reg_size), dtype=np.float32)
+        for b in boxes_drr:
+            mask_drr[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
+
+        mask_fl = np.zeros((reg_size, reg_size), dtype=np.float32)
+        for b in boxes_fl:
+            mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
+
+        self.progress.emit(58, 'Recalage élastique (rigide + FFD)…')
 
         def reg_cb(frac, iou_val):
-            if elastic:
-                stage = 'Rigide' if frac < 0.5 else 'Elastique'
-                self.progress.emit(58 + int(frac * 35), f'{stage} — IoU={iou_val:.4f}')
-            else:
-                self.progress.emit(58 + int(frac * 35), f'Recalage — IoU={iou_val:.4f}')
+            stage = 'Rigide' if frac < 0.5 else 'Elastique'
+            self.progress.emit(58 + int(frac * 35), f'{stage} — IoU={iou_val:.4f}')
 
-        if elastic:
-            res = register_elastic(mask_moving=mask_drr, mask_fixed=mask_fl,
-                                   progress_cb=reg_cb)
-        else:
-            res = register(mask_moving=mask_drr, mask_fixed=mask_fl,
-                           progress_cb=reg_cb)
+        res = register_elastic(mask_moving=mask_drr, mask_fixed=mask_fl,
+                               progress_cb=reg_cb)
 
         self.progress.emit(95,
             f'Recalage terminé — IoU={res["iou"]:.4f}  Dice={res["dice"]:.4f}')
 
         # ── Résultat complet ──────────────────────────────────────────────────
         res['_auto'] = True
+        res['_phase'] = 'done'
         res['drr_image'] = drr_image
         res['proj_masks'] = all_proj_masks
-        res['matched_labels'] = matched_labels
-        res['n_matched'] = n_matched
-        res['n_fluoro_det'] = n_fl
-        res['n_drr_seg'] = n_drr
+        res['n_fluoro_sel'] = n_fl
+        res['n_drr_sel'] = n_drr
         res['mask_fl'] = mask_fl
         res['mask_drr'] = mask_drr
         self.progress.emit(100,
-            f'Pipeline terminé — IoU={res["iou"]:.4f}  '
-            f'Vertèbres : {", ".join(matched_labels)}')
+            f'Pipeline terminé — IoU={res["iou"]:.4f}  Dice={res["dice"]:.4f}')
         self.result.emit(res)
 
 
@@ -1385,6 +1798,254 @@ class YoloDetectionPanel(QDialog):
         super().resizeEvent(e); self._render_image()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Panneau dual : sélection vertèbres Fluoro (gauche) + DRR (droite)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DualYoloSelectionDialog(QDialog):
+    """
+    Fenêtre split : fluoroscopie à gauche, DRR à droite.
+    Chaque côté affiche les détections YOLO avec checkboxes.
+    L'utilisateur coche les vertèbres à utiliser pour le recalage.
+    Retourne (fluoro_indices, drr_indices) via get_selections().
+    """
+
+    def __init__(self, det_fl: dict, det_drr: dict,
+                 boxes_fl: list, named_drr_boxes: list,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Sélection des vertèbres — Fluoro / DRR')
+        self.resize(1500, 800)
+        self.setStyleSheet(STYLE)
+
+        self._det_fl = det_fl
+        self._det_drr = det_drr
+        self._boxes_fl = boxes_fl
+        self._named_drr_boxes = named_drr_boxes
+
+        # Sélections (indices)
+        self._sel_fl = list(range(len(det_fl['boxes'])))
+        self._sel_drr = list(range(len(named_drr_boxes)))
+
+        self._chks_fl: list = []
+        self._chks_drr: list = []
+
+        self._build_ui()
+        self._render_fl()
+        self._render_drr()
+
+    # ── Construction UI ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+
+        # ── Titre ──────────────────────────────────────────────────────────────
+        title = QLabel('Sélectionnez les vertèbres : Fluoro (gauche) / DRR (droite)')
+        title.setStyleSheet(
+            f'color:{ACCENT};font-size:13px;font-weight:700;'
+            f'background:transparent;padding:4px;')
+        outer.addWidget(title)
+
+        # ── Ligne principale : fluoro | sep | DRR ─────────────────────────────
+        row = QHBoxLayout()
+        row.setSpacing(0)
+
+        # --- Gauche : Fluoro ---
+        row.addWidget(self._build_side(
+            'FLUORO', self._det_fl['boxes'], self._chks_fl,
+            self._sel_fl, 'fl'), 1)
+
+        # --- Séparateur central ---
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet(f'color:{BORDER};margin:0px;width:2px;')
+        row.addWidget(sep)
+
+        # --- Droite : DRR ---
+        row.addWidget(self._build_side(
+            'DRR', self._named_drr_boxes, self._chks_drr,
+            self._sel_drr, 'drr'), 1)
+
+        outer.addLayout(row, 1)
+
+        # ── Boutons bas ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+        btn_ok = QPushButton('✓ Lancer le recalage')
+        btn_ok.setObjectName('success')
+        btn_ok.setFixedHeight(38)
+        btn_ok.setMinimumWidth(160)
+        btn_ok.setFont(QFont('monospace', 10, QFont.Bold))
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton('✕ Annuler')
+        btn_cancel.setFixedHeight(38)
+        btn_cancel.setMinimumWidth(120)
+        btn_cancel.setFont(QFont('monospace', 10))
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        outer.addLayout(btn_row)
+
+    def _build_side(self, title_text, boxes, chk_list, sel_list, side_key):
+        """Panneau dédié à un côté : image (grande) + liste très compacte."""
+        container = QWidget()
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(4)
+
+        # Titre du côté
+        title = QLabel(title_text)
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f'color:{ACCENT};font-size:11px;font-weight:700;'
+            f'background:transparent;letter-spacing:2px;padding:4px;')
+        vl.addWidget(title)
+
+        # ── Image (grande) ───────────────────────────────────────────────────
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setMinimumSize(300, 300)
+        img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        img_label.setStyleSheet(
+            f'background:{DARK_BG};border:1px solid {BORDER};border-radius:4px;')
+        vl.addWidget(img_label, 1)
+        setattr(self, f'_img_{side_key}', img_label)
+
+        # ── Liste compacte (boutons toggles, pas cards) ──────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(80)
+        scroll.setStyleSheet(
+            f'QScrollArea{{background:transparent;border:none;}}'
+            f'QScrollBar:vertical{{width:6px;background:{PANEL_BG};}}'
+            f'QScrollBar::handle:vertical{{background:{BORDER};border-radius:3px;}}'
+        )
+        inner_w = QWidget()
+        inner_w.setStyleSheet('background:transparent;')
+        inner_l = QHBoxLayout(inner_w)
+        inner_l.setSpacing(4)
+        inner_l.setContentsMargins(2, 2, 2, 2)
+
+        for i, box in enumerate(boxes):
+            color = _YOLO_BOX_PALETTE[i % len(_YOLO_BOX_PALETTE)]
+            tb = self._make_toggle_btn(i, box, color, chk_list, sel_list, side_key)
+            inner_l.addWidget(tb)
+
+        inner_l.addStretch()
+        scroll.setWidget(inner_w)
+        vl.addWidget(scroll)
+
+        return container
+
+    def _make_toggle_btn(self, idx, box, color, chk_list, sel_list, side_key):
+        """Bouton toggle compact pour une détection."""
+        r, g, b = color
+        btn = QPushButton()
+        btn.setFixedHeight(28)
+        btn.setMinimumWidth(40)
+        btn.setCheckable(True)
+        btn.setChecked(True)
+        
+        name = box.get('cls_name', f'V{idx+1}')
+        conf_pct = int(box.get('conf', 0) * 100)
+        btn.setText(f'{name}\n{conf_pct}%')
+        btn.setFont(QFont('monospace', 9))
+        
+        # Style : fond coloré si sélectionné, sinon grisé
+        def update_style():
+            is_checked = btn.isChecked()
+            if is_checked:
+                style = (f'background-color:rgb({r},{g},{b});'
+                        f'color:white;border:2px solid rgb({r},{g},{b});'
+                        f'border-radius:4px;font-weight:700;')
+            else:
+                style = (f'background-color:{CARD_BG};'
+                        f'color:{TEXT_MID};border:1px solid {BORDER};'
+                        f'border-radius:4px;')
+            btn.setStyleSheet(style)
+
+        def on_toggled(checked):
+            if checked and idx not in sel_list:
+                sel_list.append(idx)
+                sel_list.sort()
+            elif not checked and idx in sel_list:
+                sel_list.remove(idx)
+            update_style()
+            if side_key == 'fl':
+                self._render_fl()
+            else:
+                self._render_drr()
+
+        btn.toggled.connect(on_toggled)
+        chk_list.append(btn)  # stocke les boutons au lieu des checkboxes
+        update_style()
+        return btn
+
+    def _set_all(self, chk_list, state):
+        """chk_list contient maintenant des boutons, pas des checkboxes."""
+        for btn in chk_list:
+            btn.setChecked(state)
+
+    # ── Rendu images ──────────────────────────────────────────────────────────
+    def _render_fl(self):
+        self._render_side(
+            self._det_fl['infer_img'], self._det_fl['boxes'],
+            self._sel_fl, self._img_fl)
+
+    def _render_drr(self):
+        self._render_side(
+            self._det_drr['infer_img'], self._named_drr_boxes,
+            self._sel_drr, self._img_drr)
+
+    def _render_side(self, base_img, boxes, sel_list, label_widget):
+        img = base_img.copy()
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.dtype != np.uint8:
+            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+        for i, box in enumerate(boxes):
+            color = _YOLO_BOX_PALETTE[i % len(_YOLO_BOX_PALETTE)]
+            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
+            is_sel = i in sel_list
+            thickness = 2 if is_sel else 1
+            col = color if is_sel else tuple(c // 3 for c in color)
+
+            cv2.rectangle(img, (x1, y1), (x2, y2), col, thickness, cv2.LINE_AA)
+            if is_sel:
+                name = box.get('cls_name', f'V{i+1}')
+                label = f'{name} {box.get("conf", 0):.0%}'
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(img, (x1, y1 - th - 6),
+                              (x1 + tw + 6, y1), col, -1)
+                cv2.putText(img, label, (x1 + 3, y1 - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 0, 0), 1, cv2.LINE_AA)
+
+        lw = max(64, label_widget.width())
+        lh = max(64, label_widget.height())
+        h, w = img.shape[:2]
+        scale = min(lw / w, lh / h)
+        nw, nh = int(w * scale), int(h * scale)
+        img_r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        img_r = np.ascontiguousarray(img_r)
+        qi = QImage(img_r.data, nw, nh, nw * 3, QImage.Format_RGB888)
+        label_widget.setPixmap(QPixmap.fromImage(qi).copy())
+
+    def get_selections(self):
+        """Retourne (fluoro_indices, drr_indices)."""
+        return sorted(self._sel_fl), sorted(self._sel_drr)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render_fl()
+        self._render_drr()
+
+
 class SegOverlayWindow(QDialog):
     """Fenêtre optimisée : fluoroscopie recalée + segmentations, contrôles avancés."""
 
@@ -1525,8 +2186,9 @@ class SegOverlayWindow(QDialog):
         # Boutons d'action
         btn_row = QHBoxLayout()
         btn_export = QPushButton('Exporter'); btn_export.clicked.connect(self._export_image)
+        btn_3d = QPushButton('Vue 3D'); btn_3d.clicked.connect(self._open_3d_view)
         btn_close = QPushButton('Fermer'); btn_close.clicked.connect(self.accept)
-        btn_row.addWidget(btn_export); btn_row.addWidget(btn_close)
+        btn_row.addWidget(btn_export); btn_row.addWidget(btn_3d); btn_row.addWidget(btn_close)
         right.addLayout(btn_row)
 
         # Layout principal
@@ -1635,6 +2297,11 @@ class SegOverlayWindow(QDialog):
         except Exception as ex:
             QMessageBox.warning(self, 'Erreur', f'Export échoué : {ex}')
 
+    def _open_3d_view(self):
+        QMessageBox.information(self, 'Vue 3D',
+                                'La vue 3D interactive n\'est pas disponible.\n'
+                                'Utilisez 3D Slicer pour visualiser les segmentations en 3D.')
+
     def resizeEvent(self, e):
         super().resizeEvent(e); self._render()
 
@@ -1726,8 +2393,8 @@ def read_dicom_fluoro(path: str):
     cran = _get('PositionerSecondaryAngle', 0.0)
 
     # ── Distances et grossissement ───────────────────────────────────────────
-    sid  = _get('DistanceSourceToDetector', 1000.0)
-    sod  = _get('DistanceSourceToPatient',  750.0)
+    sid  = _get('DistanceSourceToDetector', 1020.0)
+    sod  = _get('DistanceSourceToPatient',  510.0)
     mag  = _get('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
 
     # ── Pixel spacing ────────────────────────────────────────────────────────
@@ -1738,14 +2405,19 @@ def read_dicom_fluoro(path: str):
     rows = int(getattr(ds, 'Rows', img_uint8.shape[0]))
     cols = int(getattr(ds, 'Columns', img_uint8.shape[1]))
     fov_dim = _get_multi('FieldOfViewDimensions')           # au détecteur
-    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    if fov_dim:
+        fov_dim_mm = tuple(fov_dim)
+        fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    else:
+        fov_mm = DEFAULT_FOV_MM
+        fov_det = fov_mm * (sid / sod) if sid > 0 and sod > 0 else (DEFAULT_FOV_MM * 2.0)
+        fov_dim_mm = (fov_det, fov_det)
     intensifier_mm = _get('IntensifierSize', 0.0)
     fov_shape = _get_str('FieldOfViewShape', '')
     fov_origin_raw = _get_multi('FieldOfViewOrigin')
     fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
-
-    # Champ de vue à l'isocentre (corrigé du grossissement)
-    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    if not np.isfinite(fov_mm) or fov_mm <= 0:
+        fov_mm = DEFAULT_FOV_MM
 
     # ── Table ────────────────────────────────────────────────────────────────
     table_angle = _get('TableAngle', 0.0)
@@ -1846,8 +2518,8 @@ def read_metadata_csv(path: str):
 
     lao  = _f('PositionerPrimaryAngle', 0.0)
     cran = _f('PositionerSecondaryAngle', 0.0)
-    sid  = _f('DistanceSourceToDetector', 1000.0)
-    sod  = _f('DistanceSourceToPatient', 750.0)
+    sid  = _f('DistanceSourceToDetector', 1020.0)
+    sod  = _f('DistanceSourceToPatient', 510.0)
     mag  = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
 
     ips = _flist('ImagerPixelSpacing')
@@ -1856,10 +2528,16 @@ def read_metadata_csv(path: str):
     rows = int(_f('Rows', 1000))
     cols = int(_f('Columns', 1000))
     fov_dim = _flist('FieldOfViewDimensions')
-    fov_dim_mm = tuple(fov_dim) if fov_dim else (pixel_mm * cols, pixel_mm * rows)
+    if fov_dim:
+        fov_dim_mm = tuple(fov_dim)
+        fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    else:
+        fov_mm = DEFAULT_FOV_MM
+        fov_det = fov_mm * (sid / sod) if sid > 0 and sod > 0 else (DEFAULT_FOV_MM * 2.0)
+        fov_dim_mm = (fov_det, fov_det)
     intensifier_mm = _f('IntensifierSize', 0.0)
-
-    fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
+    if not np.isfinite(fov_mm) or fov_mm <= 0:
+        fov_mm = DEFAULT_FOV_MM
 
     table_angle = _f('TableAngle', 0.0)
     arm_l = _f('AngleValueLArm', None) if 'AngleValueLArm' in lookup else None
@@ -1928,7 +2606,10 @@ class MainWindow(QMainWindow):
         self.dicom_meta = {}
         self.fluoro_image = None; self.result = None
         self._loaded_images = []; self._pending_csv = None
+        self._iterations = []
+        self._current_iter_idx = -1
         self._build_ui()
+        self._load_yolo_default()  # Charger modèle auto au démarrage
         self._status('Deposez vos fichiers pour commencer')
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2017,7 +2698,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_data)
 
         # ── IMAGES ────────────────────────────────────────────────────────────
-        self._sec_images = CollapsibleSection('IMAGES', starts_open=True)
+        self._sec_images = CollapsibleSection('IMAGES', starts_open=False)
         self.lbl_no_images = QLabel('Aucune image chargee')
         self.lbl_no_images.setObjectName('dim')
         self._sec_images.addWidget(self.lbl_no_images)
@@ -2039,17 +2720,17 @@ class MainWindow(QMainWindow):
         def _lbl(t):
             l = QLabel(t); l.setObjectName('mid'); return l
 
-        gdl.addWidget(_lbl('LAO/RAO (deg)'), 0, 0)
-        self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-90, 90); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
+        gdl.addWidget(_lbl('Cran/Caud (deg)'), 0, 0)
+        self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-180, 180); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
         gdl.addWidget(self.sp_lao, 0, 1)
-        gdl.addWidget(_lbl('Cran/Caud (deg)'), 1, 0)
+        gdl.addWidget(_lbl('LAO/RAO (deg)'), 1, 0)
         self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-180, 180); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
         gdl.addWidget(self.sp_cran, 1, 1)
         gdl.addWidget(_lbl('Table (deg)'), 2, 0)
         self.sp_table = QDoubleSpinBox(); self.sp_table.setRange(-45, 45); self.sp_table.setValue(0); self.sp_table.setSingleStep(0.5)
         gdl.addWidget(self.sp_table, 2, 1)
         gdl.addWidget(_lbl('FOV isoctr (mm)'), 3, 0)
-        self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(300); self.sp_fov.setSingleStep(10)
+        self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(DEFAULT_FOV_MM); self.sp_fov.setSingleStep(10)
         gdl.addWidget(self.sp_fov, 3, 1)
         gdl.addWidget(_lbl('Resolution (px)'), 4, 0)
         self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
@@ -2061,7 +2742,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_drr)
 
         # ── ANNOTATION ────────────────────────────────────────────────────────
-        sec_ann = CollapsibleSection('ANNOTATION', starts_open=True)
+        sec_ann = CollapsibleSection('ANNOTATION', starts_open=False)
 
         self.chk_use_seg = QCheckBox('Utiliser la segmentation CT (contours auto sur DRR)')
         self.chk_use_seg.setChecked(False)
@@ -2130,7 +2811,7 @@ class MainWindow(QMainWindow):
         sec_yolo = CollapsibleSection('DETECTION YOLO', starts_open=True)
 
         row_yolo_load = QHBoxLayout(); row_yolo_load.setSpacing(4)
-        self.btn_load_yolo = QPushButton('Charger modèle (.pt)')
+        self.btn_load_yolo = QPushButton('Charger un autre modèle')
         self.btn_load_yolo.clicked.connect(self._load_yolo_model)
         row_yolo_load.addWidget(self.btn_load_yolo, 1)
         self.lbl_yolo = QLabel(''); self.lbl_yolo.setObjectName('dim')
@@ -2177,7 +2858,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_yolo)
 
         # ── RECALAGE ──────────────────────────────────────────────────────────
-        sec_reg = CollapsibleSection('RECALAGE', starts_open=True)
+        sec_reg = CollapsibleSection('RECALAGE', starts_open=False)
 
         self.btn_reg = QPushButton('Lancer le recalage'); self.btn_reg.setObjectName('success')
         self.btn_reg.setEnabled(False); self.btn_reg.clicked.connect(self.run_registration)
@@ -2189,8 +2870,69 @@ class MainWindow(QMainWindow):
         sec_reg.addWidget(self.chk_elastic)
         ll.addWidget(sec_reg)
 
+        # ── ACTIONS ──────────────────────────────────────────────────────────
+        sec_act = CollapsibleSection('ACTIONS', starts_open=False)
+
+        btn_exp = QPushButton('Exporter resultats')
+        btn_exp.clicked.connect(self.export_results)
+        sec_act.addWidget(btn_exp)
+        ll.addWidget(sec_act)
+
+        # ── ITERATIONS ────────────────────────────────────────────────────────
+        sec_iter = CollapsibleSection('ITERATIONS', starts_open=False)
+
+        self._iter_container = QWidget()
+        self._iter_container.setStyleSheet('background:transparent;')
+        self._iter_vbox = QVBoxLayout(self._iter_container)
+        self._iter_vbox.setContentsMargins(0, 0, 0, 0)
+        self._iter_vbox.setSpacing(4)
+        self._lbl_no_iter = QLabel('Aucune iteration')
+        self._lbl_no_iter.setObjectName('dim')
+        self._iter_vbox.addWidget(self._lbl_no_iter)
+        sec_iter.addWidget(self._iter_container)
+
+        self.btn_compare = QPushButton('Comparer les iterations')
+        self.btn_compare.setObjectName('primary')
+        self.btn_compare.setEnabled(False)
+        self.btn_compare.clicked.connect(self._open_comparison)
+        sec_iter.addWidget(self.btn_compare)
+
+        ll.addWidget(sec_iter)
+
+        # ── PIPELINE AUTO (bouton magique) ────────────────────────────────────
+        sec_auto = CollapsibleSection('PIPELINE AUTO', starts_open=True)
+
+        auto_info = QLabel(
+            'DRR + Détection YOLO + Appariement auto + Recalage élastique\n'
+            'Nécessite : CT, Fluoroscopie DICOM et modèle YOLO.\n'
+            'Fallback : sélection manuelle si YOLO échoue.')
+        auto_info.setObjectName('dim'); auto_info.setWordWrap(True)
+        sec_auto.addWidget(auto_info)
+
+        self.btn_auto = QPushButton('LANCER LE PIPELINE COMPLET')
+        self.btn_auto.setObjectName('success')
+        self.btn_auto.setStyleSheet(
+            f'QPushButton{{background:#0d2a1a;border:2px solid {ACCENT2};color:{ACCENT2};'
+            f'font-weight:700;font-size:13px;min-height:42px;border-radius:6px;letter-spacing:1px;}}'
+            f'QPushButton:hover{{background:#1a3d28;color:#fff;}}'
+            f'QPushButton:disabled{{background:{DARK_BG};border-color:{TEXT_DIM};color:{TEXT_DIM};}}')
+        self.btn_auto.clicked.connect(self._run_auto_pipeline)
+        sec_auto.addWidget(self.btn_auto)
+
+        self.lbl_auto_status = QLabel('')
+        self.lbl_auto_status.setObjectName('dim')
+        self.lbl_auto_status.setWordWrap(True)
+        sec_auto.addWidget(self.lbl_auto_status)
+
+        ll.addWidget(sec_auto)
+
+        ll.addStretch()
+
+        root.addWidget(left_outer)
+
+
         # ── RESULTATS ─────────────────────────────────────────────────────────
-        sec_res = CollapsibleSection('RESULTATS', starts_open=True)
+        sec_res = CollapsibleSection('RESULTATS', starts_open=False)
 
         metrics_row = QHBoxLayout(); metrics_row.setSpacing(10)
         m_iou = QWidget(); m_iou.setStyleSheet(f'background:{CARD_BG};border-radius:6px;border:1px solid {BORDER2};')
@@ -2216,6 +2958,9 @@ class MainWindow(QMainWindow):
             sec_res.addWidget(l)
         ll.addWidget(sec_res)
 
+
+
+        
         # ── PROGRESSION ──────────────────────────────────────────────────────
         self.prog_bar = QProgressBar(); self.prog_bar.setRange(0, 100); self.prog_bar.setValue(0)
         ll.addWidget(self.prog_bar)
@@ -2224,50 +2969,6 @@ class MainWindow(QMainWindow):
         self.lbl_prog.setWordWrap(True)
         ll.addWidget(self.lbl_prog)
 
-        # ── ACTIONS ──────────────────────────────────────────────────────────
-        sec_act = CollapsibleSection('ACTIONS', starts_open=True)
-
-        self.btn_seg_overlay = QPushButton('Segmentations 2D')
-        self.btn_seg_overlay.setObjectName('primary')
-        self.btn_seg_overlay.setEnabled(False)
-        self.btn_seg_overlay.clicked.connect(self.open_seg_overlay)
-        sec_act.addWidget(self.btn_seg_overlay)
-
-        btn_exp = QPushButton('Exporter resultats')
-        btn_exp.clicked.connect(self.export_results)
-        sec_act.addWidget(btn_exp)
-        ll.addWidget(sec_act)
-
-        # ── PIPELINE AUTO (bouton magique) ────────────────────────────────────
-        sec_auto = CollapsibleSection('PIPELINE AUTO', starts_open=True)
-
-        auto_info = QLabel(
-            'DRR + Détection + Appariement + Recalage\n'
-            'en un seul clic. Nécessite : CT, Segmentation\n'
-            'vertébrale, Fluoroscopie DICOM et modèle YOLO.')
-        auto_info.setObjectName('dim'); auto_info.setWordWrap(True)
-        sec_auto.addWidget(auto_info)
-
-        self.btn_auto = QPushButton('LANCER LE PIPELINE COMPLET')
-        self.btn_auto.setObjectName('success')
-        self.btn_auto.setStyleSheet(
-            f'QPushButton{{background:#0d2a1a;border:2px solid {ACCENT2};color:{ACCENT2};'
-            f'font-weight:700;font-size:13px;min-height:42px;border-radius:6px;letter-spacing:1px;}}'
-            f'QPushButton:hover{{background:#1a3d28;color:#fff;}}'
-            f'QPushButton:disabled{{background:{DARK_BG};border-color:{TEXT_DIM};color:{TEXT_DIM};}}')
-        self.btn_auto.clicked.connect(self._run_auto_pipeline)
-        sec_auto.addWidget(self.btn_auto)
-
-        self.lbl_auto_status = QLabel('')
-        self.lbl_auto_status.setObjectName('dim')
-        self.lbl_auto_status.setWordWrap(True)
-        sec_auto.addWidget(self.lbl_auto_status)
-
-        ll.addWidget(sec_auto)
-
-        ll.addStretch()
-
-        root.addWidget(left_outer)
 
         # ── Onglets ───────────────────────────────────────────────────────────
         self.tabs = QTabWidget(); self.tabs.setDocumentMode(True)
@@ -2281,6 +2982,9 @@ class MainWindow(QMainWindow):
         ]:
             self.tabs.addTab(self._wrap(cv, hint), label)
         self.tabs.addTab(self.result_panel, 'Resultat')
+
+        self.overlay_panel = FinalOverlayPanel()
+        self.tabs.addTab(self.overlay_panel, 'Overlay')
 
         for cv in [self.cv_fl, self.cv_drr]:
             cv.set_tool('pencil'); cv.set_active('vertebrae')
@@ -2545,6 +3249,7 @@ class MainWindow(QMainWindow):
         self.sp_lao.setValue(meta['lao'])
         self.sp_cran.setValue(meta['cran'])
         self.sp_table.setValue(meta.get('table_angle', 0.0))
+        self.sp_fov.setValue(float(meta.get('fov_mm', DEFAULT_FOV_MM) or DEFAULT_FOV_MM))
 
         fov = meta['fov_mm']
         # Label résumé dans DONNEES
@@ -2634,6 +3339,8 @@ class MainWindow(QMainWindow):
                 table_angle=self.sp_table.value(),
                 output_size=self.sp_size.value(), masks=self.seg_masks,
                 fov_mm=self.sp_fov.value(),
+            sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
+            sod_mm=self.dicom_meta.get('sod_mm', 510.0),
                 renderer='siddon')
         self.worker=WorkerThread('drr',kw)
         self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
@@ -2656,6 +3363,7 @@ class MainWindow(QMainWindow):
                     fused = m.copy() if fused is None else np.clip(fused + m, 0, 1)
                 if fused is not None:
                     self.cv_drr.set_mask('vertebrae', fused)
+        self._save_iteration()
         self.tabs.setCurrentIndex(1); self._status('DRR genere — contours vertebres injectes auto, annoter la fluoroscopie')
 
     def load_xray(self):
@@ -2751,7 +3459,10 @@ class MainWindow(QMainWindow):
         self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
         self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
         self._build_result(res); self.tabs.setCurrentIndex(2)
-        self.btn_seg_overlay.setEnabled(bool(self.proj_masks) and self.fluoro_image is not None)
+        if 0 <= self._current_iter_idx < len(self._iterations):
+            self._iterations[self._current_iter_idx]['result'] = res
+            self._refresh_iter_list()
+        self._update_overlay()
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
 
     def _build_result(self,res):
@@ -2852,15 +3563,26 @@ class MainWindow(QMainWindow):
         win = SegOverlayWindow(self.fluoro_image, self.proj_masks, self.result, parent=self)
         win.exec_()
 
+    def _update_overlay(self):
+        """Alimente l'onglet Overlay avec les données courantes."""
+        if self.fluoro_image is None or self.result is None:
+            return
+        if not self.proj_masks:
+            return
+        self.overlay_panel.set_data(
+            fluoro=self.fluoro_image,
+            proj_masks=self.proj_masks,
+            result=self.result,
+            reg_size=self.sp_size.value(),
+        )
+        # Basculer automatiquement sur l'onglet Overlay
+        self.tabs.setCurrentIndex(3)
+
     # ── Pipeline automatique complet ──────────────────────────────────────────
 
     def _run_auto_pipeline(self):
-        """Lance le pipeline complet : DRR → Détection → Appariement → Recalage."""
-        # Vérifications
         if self.ct_path is None:
             self._err('Chargez un CT (NIfTI) d\'abord.'); return
-        if not self.seg_masks:
-            self._err('Chargez une segmentation vertébrale (NIfTI + CSV labels).'); return
         if self.fluoro_image is None:
             self._err('Chargez une fluoroscopie d\'abord.'); return
         if not yolo_ready():
@@ -2875,17 +3597,17 @@ class MainWindow(QMainWindow):
         kw = dict(
             ct_path=self.ct_path,
             ct_aff=self.ct_aff,
-            seg_masks=self.seg_masks,
             fluoro=self.fluoro_image,
+            seg_masks=self.seg_masks,
             output_size=self.sp_size.value(),
             lao_deg=self.sp_lao.value(),
-            cran_deg=self.sp_cran.value(),
+            cran_deg=self.sp_cran.value() + 180,  # convention UI 0° = PA (180°)
             table_angle=self.sp_table.value(),
             sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
             sod_mm=self.dicom_meta.get('sod_mm', 510.0),
-            fov_mm=self.dicom_meta.get('fov_mm'),
+            fov_mm=AUTO_PIPELINE_FOV_MM,   # pipeline complet verrouillé à 220 mm
             renderer='siddon',
-            elastic=self.chk_elastic.isChecked(),
+            elastic=True,
             yolo_kw=dict(
                 conf=self.sp_yolo_conf.value() / 100.0,
                 iou=self.sp_yolo_iou.value() / 100.0,
@@ -2901,7 +3623,58 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _auto_done(self, res):
-        """Callback quand le pipeline auto est terminé."""
+        """Callback quand le pipeline auto émet un résultat (phase 1 ou final)."""
+
+        # ── Phase 1 : sélection des vertèbres fluoro + DRR ───────────────────
+        if res.get('_phase') == 'select_vertebrae':
+            self._auto_intermediate = res
+            self.lbl_auto_status.setText('Sélectionnez les vertèbres (fluoro + DRR)…')
+
+            # Injecter le DRR dans l'UI dès maintenant
+            self.drr_image = res['drr_image']
+            self.proj_masks = res.get('all_proj_masks', {})
+            self.cv_drr.set_image(self.drr_image)
+            self.tabs.setTabText(1, 'DRR')
+
+            # Ouvrir le panneau dual de sélection
+            dlg = DualYoloSelectionDialog(
+                det_fl=res['det_fl'],
+                det_drr=res['det_drr'],
+                boxes_fl=res['boxes_fl'],
+                named_drr_boxes=res['drr_boxes'],
+                parent=self)
+            if dlg.exec_() != QDialog.Accepted:
+                self.btn_auto.setEnabled(True)
+                self.btn_drr.setEnabled(True)
+                self.lbl_auto_status.setText('Annulé par l\'utilisateur.')
+                return
+
+            sel_fl, sel_drr = dlg.get_selections()
+            if not sel_fl or not sel_drr:
+                self._on_auto_err('Sélectionnez au moins une vertèbre de chaque côté.')
+                return
+
+            selected_fl = [res['boxes_fl'][i] for i in sel_fl
+                           if i < len(res['boxes_fl'])]
+            selected_drr = [res['drr_boxes'][i] for i in sel_drr
+                            if i < len(res['drr_boxes'])]
+
+            # Lancer la phase 2 (recalage élastique) en worker
+            kw2 = dict(
+                boxes_fl=selected_fl,
+                boxes_drr=selected_drr,
+                reg_size=res['reg_size'],
+                drr_image=res['drr_image'],
+                all_proj_masks=res['all_proj_masks'],
+            )
+            self.worker = WorkerThread('auto_phase2', kw2)
+            self.worker.progress.connect(self._on_prog)
+            self.worker.result.connect(self._auto_done)
+            self.worker.error.connect(self._on_auto_err)
+            self.worker.start()
+            return
+
+        # ── Phase finale : résultat complet ───────────────────────────────────
         self.btn_auto.setEnabled(True)
         self.btn_drr.setEnabled(True)
 
@@ -2922,6 +3695,9 @@ class MainWindow(QMainWindow):
 
         # Stocker le résultat de recalage
         self.result = res
+        self._save_iteration()
+        self._iterations[self._current_iter_idx]['result'] = res
+        self._refresh_iter_list()
         self._update_checklist()
 
         # Mettre à jour les métriques
@@ -2940,22 +3716,17 @@ class MainWindow(QMainWindow):
         self._build_result(res)
         self.tabs.setCurrentIndex(2)
 
-        # Activer le bouton segmentations 2D
-        self.btn_seg_overlay.setEnabled(
-            bool(self.proj_masks) and self.fluoro_image is not None)
+        # Mettre à jour l'onglet overlay final
+        self._update_overlay()
 
         # Label résumé
-        labels = ', '.join(res.get('matched_labels', []))
-        n_m = res.get('n_matched', '?')
-        n_fl = res.get('n_fluoro_det', '?')
-        n_seg = res.get('n_drr_seg', '?')
+        n_fl = res.get('n_fluoro_sel', '?')
+        n_drr = res.get('n_drr_sel', '?')
         self.lbl_auto_status.setText(
             f'IoU={iou:.4f}  Dice={dice:.4f}\n'
-            f'{n_m} vertèbre(s) appariée(s) : {labels}\n'
-            f'(Fluoro : {n_fl} détections YOLO, CT : {n_seg} segmentations)')
+            f'Fluoro : {n_fl} vertèbre(s) | DRR : {n_drr} vertèbre(s)')
         self._status(
-            f'Pipeline auto terminé — IoU={iou:.4f}  Dice={dice:.4f}  '
-            f'Vertèbres : [{labels}]')
+            f'Pipeline auto terminé — IoU={iou:.4f}  Dice={dice:.4f}')
 
     def _on_auto_err(self, msg):
         self.btn_auto.setEnabled(True)
@@ -2989,8 +3760,145 @@ class MainWindow(QMainWindow):
                 )
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Gestion des itérations
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _save_iteration(self):
+        """Crée une nouvelle itération à partir de l'état courant."""
+        it = {
+            'lao': self.sp_lao.value(),
+            'cran': self.sp_cran.value(),
+            'table': self.sp_table.value(),
+            'fov': self.sp_fov.value(),
+            'size': self.sp_size.value(),
+            'drr_image': self.drr_image.copy() if self.drr_image is not None else None,
+            'proj_masks': {k: v.copy() for k, v in self.proj_masks.items()},
+            'result': None,
+        }
+        self._iterations.append(it)
+        self._current_iter_idx = len(self._iterations) - 1
+        self._refresh_iter_list()
+
+    def _refresh_iter_list(self):
+        """Met à jour la liste d'itérations dans la sidebar."""
+        while self._iter_vbox.count():
+            item = self._iter_vbox.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        if not self._iterations:
+            lbl = QLabel('Aucune iteration'); lbl.setObjectName('dim')
+            self._iter_vbox.addWidget(lbl)
+            self.btn_compare.setEnabled(False)
+            return
+        for i, it in enumerate(self._iterations):
+            card = QWidget()
+            is_current = (i == self._current_iter_idx)
+            border_col = ACCENT if is_current else BORDER2
+            card.setStyleSheet(
+                f'background:{CARD_BG};border:1px solid {border_col};border-radius:5px;')
+            cl = QHBoxLayout(card)
+            cl.setContentsMargins(6, 4, 6, 4); cl.setSpacing(6)
+            thumb = QLabel(); thumb.setFixedSize(40, 40)
+            drr = it.get('drr_image')
+            if drr is not None:
+                u8 = (np.clip(drr, 0, 1) * 255).astype(np.uint8)
+                t = cv2.resize(u8, (40, 40), interpolation=cv2.INTER_AREA)
+                rgb = cv2.cvtColor(t, cv2.COLOR_GRAY2RGB)
+                qi = QImage(rgb.data, 40, 40, 40 * 3, QImage.Format_RGB888)
+                thumb.setPixmap(QPixmap.fromImage(qi).copy())
+            thumb.setStyleSheet(f'border:1px solid {BORDER2};border-radius:3px;background:{DARK_BG};')
+            cl.addWidget(thumb)
+            info_w = QWidget(); info_w.setStyleSheet('background:transparent;border:none;')
+            info_l = QVBoxLayout(info_w); info_l.setSpacing(1); info_l.setContentsMargins(0, 0, 0, 0)
+            lbl_hdr = QLabel(f'#{i+1}  LAO={it["lao"]:+.1f}  CRAN={it["cran"]:+.1f}')
+            lbl_hdr.setStyleSheet(f'color:{TEXT};font-size:10px;border:none;background:transparent;')
+            info_l.addWidget(lbl_hdr)
+            res = it.get('result')
+            if res:
+                iou_v = res['iou']
+                col = ACCENT2 if iou_v > 0.5 else (WARN if iou_v > 0.25 else ERR)
+                m_lbl = QLabel(f'IoU={iou_v:.3f}  Dice={res["dice"]:.3f}')
+                m_lbl.setStyleSheet(f'color:{col};font-size:10px;font-weight:600;border:none;background:transparent;')
+                info_l.addWidget(m_lbl)
+            else:
+                nr = QLabel('Non recale')
+                nr.setStyleSheet(f'color:{TEXT_DIM};font-size:10px;border:none;background:transparent;')
+                info_l.addWidget(nr)
+            cl.addWidget(info_w, 1)
+            btn = QPushButton('\u25b6'); btn.setFixedSize(28, 28)
+            btn.setToolTip('Charger cette iteration')
+            btn.clicked.connect(lambda checked, idx=i: self._load_iteration(idx))
+            cl.addWidget(btn)
+            self._iter_vbox.addWidget(card)
+        self.btn_compare.setEnabled(len(self._iterations) >= 2)
+
+    def _load_iteration(self, idx):
+        """Recharge une itération dans l'UI."""
+        if idx < 0 or idx >= len(self._iterations):
+            return
+        it = self._iterations[idx]
+        self._current_iter_idx = idx
+        self.sp_lao.setValue(it['lao'])
+        self.sp_cran.setValue(it['cran'])
+        self.sp_table.setValue(it['table'])
+        self.sp_fov.setValue(it['fov'])
+        self.sp_size.setValue(it['size'])
+        self.drr_image = it['drr_image']
+        self.proj_masks = it['proj_masks']
+        if self.drr_image is not None:
+            self.cv_drr.set_image(self.drr_image)
+            if self.chk_use_seg.isChecked() and self.proj_masks:
+                fused = None
+                for m in self.proj_masks.values():
+                    if m is None or m.sum() == 0:
+                        continue
+                    fused = m.copy() if fused is None else np.clip(fused + m, 0, 1)
+                if fused is not None:
+                    self.cv_drr.set_mask('vertebrae', fused)
+        res = it.get('result')
+        if res:
+            self.result = res
+            iou_v, dice_v = res['iou'], res['dice']
+            col = ACCENT2 if iou_v > 0.5 else (WARN if iou_v > 0.25 else ERR)
+            self.lbl_iou.setText(f'{iou_v:.3f}')
+            self.lbl_iou.setStyleSheet(f'font-size:22px;font-weight:700;color:{col};')
+            self.lbl_dice.setText(f'{dice_v:.3f}')
+            self.lbl_dice.setStyleSheet(f'font-size:22px;font-weight:700;color:{col};')
+            self.lbl_tx.setText(f'tx = {res["tx"]:+.1f} px')
+            self.lbl_ty.setText(f'ty = {res["ty"]:+.1f} px')
+            self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
+            self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
+            self._build_result(res)
+            self.tabs.setCurrentIndex(2)
+        else:
+            self.tabs.setCurrentIndex(1)
+        self._refresh_iter_list()
+        self._status(f'Iteration #{idx+1} chargee')
+
+    def _open_comparison(self):
+        """Ouvre le dialogue de comparaison des itérations."""
+        if len(self._iterations) < 2:
+            self._err('Au moins 2 iterations necessaires pour comparer.')
+            return
+        dlg = ComparisonDialog(self._iterations, parent=self)
+        dlg.exec_()
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Détection YOLO
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _load_yolo_default(self):
+        """Charge automatiquement le modèle YOLO par défaut s'il existe."""
+        default_path = 'data/model/best (3).pt'
+        if os.path.exists(default_path):
+            try:
+                yolo_load(default_path)
+                self.lbl_yolo.setText(os.path.basename(default_path))
+                self._update_checklist()
+                self._status(f'Modèle YOLO chargé automatiquement : {os.path.basename(default_path)}')
+            except Exception as ex:
+                self._status(f'Chargement YOLO auto échoué : {ex}')
 
     def _load_yolo_model(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Modèle YOLO', '', 'PyTorch (*.pt)')
@@ -3078,8 +3986,90 @@ class MainWindow(QMainWindow):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dialogue de comparaison 3 DRR
+# Dialogue de comparaison des itérations
 # ══════════════════════════════════════════════════════════════════════════════
+
+class ComparisonDialog(QDialog):
+    """Dialogue comparant les itérations DRR + recalage côte à côte."""
+
+    def __init__(self, iterations, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Comparaison des iterations')
+        self.resize(1100, 700)
+        self.setStyleSheet(STYLE)
+        self._iters = iterations
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10); root.setSpacing(8)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget(); inner.setStyleSheet(f'background:{PANEL_BG};')
+        grid = QGridLayout(inner); grid.setSpacing(8)
+
+        headers = ['#', 'DRR', 'LAO', 'CRAN', 'Table', 'IoU', 'Dice',
+                   'Tx', 'Ty', 'Rot', 'Scale']
+        for j, hdr in enumerate(headers):
+            lbl = QLabel(hdr)
+            lbl.setStyleSheet(f'color:{ACCENT};font-weight:700;font-size:11px;'
+                              f'border:none;background:transparent;')
+            lbl.setAlignment(Qt.AlignCenter)
+            grid.addWidget(lbl, 0, j)
+
+        for i, it in enumerate(self._iters):
+            row = i + 1
+            idx_lbl = QLabel(f'{i+1}')
+            idx_lbl.setAlignment(Qt.AlignCenter)
+            grid.addWidget(idx_lbl, row, 0)
+
+            thumb_lbl = QLabel()
+            thumb_lbl.setFixedSize(64, 64)
+            thumb_lbl.setAlignment(Qt.AlignCenter)
+            drr = it.get('drr_image')
+            if drr is not None:
+                u8 = (np.clip(drr, 0, 1) * 255).astype(np.uint8)
+                t = cv2.resize(u8, (64, 64), interpolation=cv2.INTER_AREA)
+                rgb = cv2.cvtColor(t, cv2.COLOR_GRAY2RGB)
+                qi = QImage(rgb.data, 64, 64, 64 * 3, QImage.Format_RGB888)
+                thumb_lbl.setPixmap(QPixmap.fromImage(qi).copy())
+            thumb_lbl.setStyleSheet(f'border:1px solid {BORDER2};border-radius:4px;')
+            grid.addWidget(thumb_lbl, row, 1, alignment=Qt.AlignCenter)
+
+            for j, key in enumerate(['lao', 'cran', 'table']):
+                val_lbl = QLabel(f'{it[key]:.1f}\u00b0')
+                val_lbl.setAlignment(Qt.AlignCenter)
+                grid.addWidget(val_lbl, row, 2 + j)
+
+            res = it.get('result')
+            if res:
+                iou_v = res['iou']; dice_v = res['dice']
+                col = ACCENT2 if iou_v > 0.5 else (WARN if iou_v > 0.25 else ERR)
+                iou_lbl = QLabel(f'{iou_v:.3f}')
+                iou_lbl.setStyleSheet(f'color:{col};font-weight:700;')
+                iou_lbl.setAlignment(Qt.AlignCenter)
+                dice_lbl = QLabel(f'{dice_v:.3f}')
+                dice_lbl.setStyleSheet(f'color:{col};font-weight:700;')
+                dice_lbl.setAlignment(Qt.AlignCenter)
+                grid.addWidget(iou_lbl, row, 5)
+                grid.addWidget(dice_lbl, row, 6)
+                grid.addWidget(QLabel(f'{res["tx"]:+.1f}'), row, 7, alignment=Qt.AlignCenter)
+                grid.addWidget(QLabel(f'{res["ty"]:+.1f}'), row, 8, alignment=Qt.AlignCenter)
+                grid.addWidget(QLabel(f'{res["angle"]:+.2f}\u00b0'), row, 9, alignment=Qt.AlignCenter)
+                grid.addWidget(QLabel(f'{res["scale"]:.3f}'), row, 10, alignment=Qt.AlignCenter)
+            else:
+                na = QLabel('\u2014')
+                na.setStyleSheet(f'color:{TEXT_DIM};')
+                na.setAlignment(Qt.AlignCenter)
+                grid.addWidget(na, row, 5, 1, 6)
+
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 1)
+
+        btn_close = QPushButton('Fermer')
+        btn_close.clicked.connect(self.accept)
+        root.addWidget(btn_close)
+
 
 def main():
     app=QApplication(sys.argv)
