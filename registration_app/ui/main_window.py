@@ -1018,11 +1018,21 @@ class MainWindow(QMainWindow):
             return
         if not self.proj_masks:
             return
+        if self.result.get('_auto'):
+            fov_for_projection = AUTO_PIPELINE_FOV_MM
+        else:
+            fov_for_projection = self.sp_fov.value()
         self.overlay_panel.set_data(
             fluoro=self.fluoro_image,
             proj_masks=self.proj_masks,
             result=self.result,
             reg_size=self.sp_size.value(),
+            seg_volumes=self.seg_masks,
+            ct_affine=self.ct_aff,
+            lao_deg=self.sp_lao.value(),
+            cran_deg=self.sp_cran.value() + 180.0,
+            table_angle=self.sp_table.value(),
+            fov_mm=fov_for_projection,
         )
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(3)

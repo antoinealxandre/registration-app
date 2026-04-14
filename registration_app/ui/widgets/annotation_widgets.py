@@ -810,6 +810,12 @@ class FinalOverlayPanel(QWidget):
         super().__init__(parent)
         self._fluoro = None
         self._proj_masks = {}
+        self._seg_volumes = {}
+        self._ct_affine = None
+        self._view_lao = 0.0
+        self._view_cran = 0.0
+        self._view_table = 0.0
+        self._view_fov_mm = None
         self._result = None
         self._reg_size = 512
         self._mode = 0
@@ -874,6 +880,10 @@ class FinalOverlayPanel(QWidget):
         btn_export = QPushButton('Exporter PNG')
         btn_export.clicked.connect(self._export)
         ctrl.addWidget(btn_export)
+
+        btn_3d = QPushButton('Vue 3D')
+        btn_3d.clicked.connect(self._open_3d_view)
+        ctrl.addWidget(btn_3d)
 
         root.addLayout(ctrl)
 
@@ -946,7 +956,13 @@ class FinalOverlayPanel(QWidget):
 
     # ── API publique ──────────────────────────────────────────────────────────
     def set_data(self, fluoro: np.ndarray, proj_masks: dict,
-                 result: dict, reg_size: int):
+                 result: dict, reg_size: int,
+                 seg_volumes: dict = None,
+                 ct_affine: np.ndarray = None,
+                 lao_deg: float = 0.0,
+                 cran_deg: float = 0.0,
+                 table_angle: float = 0.0,
+                 fov_mm: float = None):
         """
         fluoro     : float32 [0,1] image fluoroscopie (résolution native)
         proj_masks : {nom_structure: masque 2D float32 à reg_size}
@@ -955,6 +971,12 @@ class FinalOverlayPanel(QWidget):
         """
         self._fluoro = np.clip(fluoro, 0, 1).astype(np.float32)
         self._proj_masks = proj_masks or {}
+        self._seg_volumes = seg_volumes or {}
+        self._ct_affine = ct_affine
+        self._view_lao = float(lao_deg)
+        self._view_cran = float(cran_deg)
+        self._view_table = float(table_angle)
+        self._view_fov_mm = fov_mm
         self._result = result
         self._reg_size = reg_size
         self._colors = {}
@@ -1143,6 +1165,330 @@ class FinalOverlayPanel(QWidget):
         bgr = cv2.cvtColor(self._full_image, cv2.COLOR_RGB2BGR)
         cv2.imwrite(p, bgr)
         QMessageBox.information(self, 'Export', f'Sauvegardé :\n{p}')
+
+    def _apply_registration_to_points(self, pts_xy: np.ndarray) -> np.ndarray:
+        """Apply rigid + elastic registration to 2D points in reg_size coordinates."""
+        if pts_xy.size == 0 or self._result is None:
+            return pts_xy
+
+        reg = self._result
+        tx = float(reg.get('tx', 0.0))
+        ty = float(reg.get('ty', 0.0))
+        angle = float(reg.get('angle', 0.0))
+        scale = float(reg.get('scale', 1.0))
+        center = reg.get('center', (self._reg_size * 0.5, self._reg_size * 0.5))
+        cx, cy = float(center[0]), float(center[1])
+
+        mat = cv2.getRotationMatrix2D((cx, cy), angle, scale)
+        mat[0, 2] += tx
+        mat[1, 2] += ty
+
+        pts_h = np.column_stack([
+            pts_xy.astype(np.float32),
+            np.ones((pts_xy.shape[0],), dtype=np.float32),
+        ])
+        out = (mat @ pts_h.T).T.astype(np.float32)
+
+        if reg.get('elastic') and ('disp_x' in reg) and ('disp_y' in reg):
+            dx = reg['disp_x'].astype(np.float32)
+            dy = reg['disp_y'].astype(np.float32)
+            if dx.shape != (self._reg_size, self._reg_size):
+                dx = cv2.resize(dx, (self._reg_size, self._reg_size), interpolation=cv2.INTER_LINEAR)
+                dy = cv2.resize(dy, (self._reg_size, self._reg_size), interpolation=cv2.INTER_LINEAR)
+
+            def _sample_bilinear(field: np.ndarray, xq: np.ndarray, yq: np.ndarray) -> np.ndarray:
+                """Bilinear sampling with constant-zero border for arbitrary point count."""
+                h, w = field.shape
+                x0 = np.floor(xq).astype(np.int32)
+                y0 = np.floor(yq).astype(np.int32)
+                x1 = x0 + 1
+                y1 = y0 + 1
+
+                wx = xq - x0.astype(np.float32)
+                wy = yq - y0.astype(np.float32)
+
+                def _gather(ix: np.ndarray, iy: np.ndarray) -> np.ndarray:
+                    vals = np.zeros((xq.shape[0],), dtype=np.float32)
+                    valid = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+                    if np.any(valid):
+                        vals[valid] = field[iy[valid], ix[valid]]
+                    return vals
+
+                v00 = _gather(x0, y0)
+                v10 = _gather(x1, y0)
+                v01 = _gather(x0, y1)
+                v11 = _gather(x1, y1)
+
+                return (
+                    v00 * (1.0 - wx) * (1.0 - wy)
+                    + v10 * wx * (1.0 - wy)
+                    + v01 * (1.0 - wx) * wy
+                    + v11 * wx * wy
+                ).astype(np.float32)
+
+            sample_dx = _sample_bilinear(dx, out[:, 0], out[:, 1])
+            sample_dy = _sample_bilinear(dy, out[:, 0], out[:, 1])
+
+            # apply_full_transform uses inverse remap; forward point approximation is -disp
+            out[:, 0] -= sample_dx
+            out[:, 1] -= sample_dy
+
+        return out
+
+    def _fov_scale_for_mask(self, mask_3d: np.ndarray) -> float:
+        """Return the same in-plane scale correction used by project_mask_3d."""
+        fov = self._view_fov_mm
+        if fov is None or float(fov) <= 0 or self._ct_affine is None:
+            return 1.0
+        try:
+            vx = float(abs(self._ct_affine[0, 0]))
+            vz = float(abs(self._ct_affine[2, 2]))
+            nx = int(mask_3d.shape[0])
+            nz = int(mask_3d.shape[2])
+            ct_span_mm = max(nx * vx, nz * vz, 1e-6)
+            return float(np.clip(ct_span_mm / float(fov), 0.25, 4.0))
+        except Exception:
+            return 1.0
+
+    def _volume_to_registered_mesh(self, pv, mask_name: str,
+                                   mask_3d: np.ndarray, side: int):
+        """Build an anatomical 3D mesh from NIfTI segmentation and register its projection."""
+        if mask_3d is None:
+            return None
+
+        vol = (mask_3d > 0).astype(np.float32)
+        if vol.sum() == 0:
+            return None
+
+        # Adaptive downsample for interactive meshing on large volumes.
+        stride = 1
+        while (max(vol.shape) / stride) > 220:
+            stride *= 2
+        if stride > 1:
+            vol = vol[::stride, ::stride, ::stride]
+
+        from scipy.ndimage import rotate as nd_rotate
+
+        if abs(self._view_lao) > 0.1:
+            vol = nd_rotate(
+                vol,
+                -self._view_lao,
+                axes=(0, 1),
+                reshape=False,
+                order=0,
+                prefilter=False,
+                mode='constant',
+                cval=0.0,
+            )
+        if abs(self._view_cran) > 0.1:
+            vol = nd_rotate(
+                vol,
+                self._view_cran,
+                axes=(1, 2),
+                reshape=False,
+                order=0,
+                prefilter=False,
+                mode='constant',
+                cval=0.0,
+            )
+        if abs(self._view_table) > 0.1:
+            vol = nd_rotate(
+                vol,
+                self._view_table,
+                axes=(0, 2),
+                reshape=False,
+                order=0,
+                prefilter=False,
+                mode='constant',
+                cval=0.0,
+            )
+
+        if vol.sum() < 8:
+            return None
+
+        from skimage import measure
+
+        try:
+            verts, faces, _, _ = measure.marching_cubes(
+                vol,
+                level=0.5,
+                step_size=1,
+                allow_degenerate=False,
+            )
+        except Exception:
+            return None
+
+        if verts.shape[0] < 3 or faces.shape[0] == 0:
+            return None
+
+        nx, ny, nz = vol.shape
+        reg_size = float(self._reg_size)
+
+        # Projection to DRR in-plane coordinates (same convention as project_mask_3d).
+        x_plane = verts[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
+        y_plane = verts[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
+
+        fov_scale = self._fov_scale_for_mask(mask_3d)
+        if abs(fov_scale - 1.0) > 0.02:
+            c = reg_size * 0.5
+            x_plane = c + (x_plane - c) * fov_scale
+            y_plane = c + (y_plane - c) * fov_scale
+
+        pts_plane = np.column_stack([x_plane, y_plane]).astype(np.float32)
+        pts_plane = self._apply_registration_to_points(pts_plane)
+
+        # Overlay panel displays on fluoroscopy native size.
+        if side != self._reg_size:
+            sf = float(side) / float(self._reg_size)
+            pts_plane *= sf
+
+        # Use AP axis (axis 1) as real depth axis.
+        vy = 1.0
+        if self._ct_affine is not None:
+            try:
+                vy = float(abs(self._ct_affine[1, 1])) * float(stride)
+            except Exception:
+                vy = 1.0
+        depth = (verts[:, 1] - ((ny - 1.0) * 0.5)) * vy
+        
+        # Determine exact XYZ scaling to prevent flattening the 3D model
+        # The 2D projection scaled X by (side / nx), we match that depth-wise
+        depth_scale = float(side) / max(nx, 1) if nx > 0 else 1.0
+        z_world = 10.0 + depth * depth_scale
+
+        points_world = np.column_stack([
+            pts_plane[:, 0],
+            (side - 1.0) - pts_plane[:, 1],
+            z_world,
+        ]).astype(np.float32)
+
+        faces_vtk = np.hstack([
+            np.full((faces.shape[0], 1), 3, dtype=np.int64),
+            faces.astype(np.int64),
+        ]).ravel()
+        mesh = pv.PolyData(points_world, faces_vtk)
+        mesh = mesh.clean(tolerance=0.0)
+
+        if mesh.n_points > 250000:
+            try:
+                mesh = mesh.decimate_pro(0.65, preserve_topology=True)
+            except Exception:
+                pass
+
+        return mesh
+
+    def _open_3d_view(self):
+        """Open anatomical 3D meshes from NIfTI segmentations over fluoroscopy."""
+        if self._fluoro is None or self._result is None or not self._proj_masks:
+            QMessageBox.information(
+                self,
+                'Vue 3D',
+                'Lancez un recalage avec segmentations avant d\'ouvrir la vue 3D.',
+            )
+            return
+
+        if not self._seg_volumes:
+            QMessageBox.information(
+                self,
+                'Vue 3D',
+                'Aucune segmentation 3D disponible.\n'
+                'Chargez un fichier NIfTI de segmentation pour obtenir des maillages anatomiques.',
+            )
+            return
+
+        try:
+            import pyvista as pv
+        except Exception as ex:
+            QMessageBox.warning(
+                self,
+                'Vue 3D',
+                f'PyVista est indisponible : {ex}\nInstallez via: pip install pyvista',
+            )
+            return
+
+        fluoro = np.clip(self._fluoro, 0, 1).astype(np.float32)
+        side = int(max(fluoro.shape[:2]))
+        fluoro_u8 = (fluoro * 255).astype(np.uint8)
+        if fluoro_u8.shape[:2] != (side, side):
+            fluoro_u8 = cv2.resize(fluoro_u8, (side, side), interpolation=cv2.INTER_LINEAR)
+        fluoro_rgb = cv2.cvtColor(fluoro_u8, cv2.COLOR_GRAY2RGB)
+
+        texture = pv.numpy_to_texture(np.ascontiguousarray(fluoro_rgb))
+        plotter = pv.Plotter(window_size=(1280, 900))
+        plotter.set_background("#12151f")
+
+        plane = pv.Plane(
+            center=(side * 0.5, side * 0.5, 0.0),
+            direction=(0.0, 0.0, 1.0),
+            i_size=float(side),
+            j_size=float(side),
+            i_resolution=1,
+            j_resolution=1,
+        )
+        plane.texture_map_to_plane(inplace=True)
+        plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
+
+        added_meshes = 0
+
+        for idx, (name, _) in enumerate(self._proj_masks.items()):
+            if not self._vis.get(name, True):
+                continue
+
+            vol = self._seg_volumes.get(name)
+            if vol is None:
+                continue
+
+            mesh = self._volume_to_registered_mesh(pv, name, vol, side)
+            if mesh is None or mesh.n_points < 3:
+                continue
+
+            color = tuple(c / 255.0 for c in self._colors.get(name, (200, 200, 200)))
+
+            plotter.add_mesh(
+                mesh,
+                color=color,
+                opacity=min(0.9, max(0.2, self._alpha + 0.15)),
+                smooth_shading=True,
+                name=f'{name}_{idx}',
+            )
+            try:
+                edges = mesh.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=False,
+                    manifold_edges=False,
+                    non_manifold_edges=False,
+                )
+                if edges.n_points > 0:
+                    plotter.add_mesh(
+                        edges,
+                        color=color,
+                        line_width=max(1.2, self._lw),
+                        opacity=0.95,
+                    )
+            except Exception:
+                pass
+
+            added_meshes += 1
+
+        if added_meshes == 0:
+            plotter.close()
+            QMessageBox.information(
+                self,
+                'Vue 3D',
+                'Aucun maillage anatomique n\'a pu etre reconstruit.\n'
+                'Verifiez que les structures NIfTI chargees correspondent aux structures visibles.',
+            )
+            return
+
+        plotter.enable_parallel_projection()
+        plotter.add_text('Maillages anatomiques 3D recales sur fluoroscopie', font_size=10)
+        plotter.add_axes(line_width=2)
+        plotter.camera_position = [
+            (side * 0.5, side * 0.5, side * 1.7),
+            (side * 0.5, side * 0.5, 0.0),
+            (0.0, -1.0, 0.0),
+        ]
+        plotter.show(title='Vue 3D - Overlay recale', auto_close=True)
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._render()

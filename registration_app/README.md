@@ -48,7 +48,13 @@ python app.py
    → Recalage rigide (optionnellement élastique)
    → Résultat dans l'onglet "Résultat"
 
-8. Exporter
+8. Ouvrir la vue 3D overlay
+   → Onglet "Overlay" puis bouton "Vue 3D"
+   → La fluoroscopie est affichée comme plan de fond
+   → Les segmentations NIfTI sont reconstruites en maillages anatomiques 3D (marching cubes)
+   → Les maillages sont projetés et recalés dans le même repère que l'overlay 2D
+
+9. Exporter
    → JSON avec transformation (tx, ty, angle) + IoU/Dice
    → PNGs des masques et du DRR
 ```
