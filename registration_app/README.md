@@ -1,7 +1,7 @@
 # 2D/3D Registration App — EP Lab
 
 Application de recalage semi-automatique fluoroscopie ↔ CT-scan.
-Annotation manuelle + DRR Beer-Lambert + IoU optimization (3 DOF).
+Architecture modulaire (UI, services, utilitaires, coeur de calcul) avec pipeline DRR + annotation + YOLO + recalage.
 
 ## Installation
 
@@ -33,10 +33,8 @@ python app.py
    → Affichée dans l'onglet "Fluoroscopie"
 
 4. Annoter la fluoroscopie
-   → Onglet "Fluoroscopie" — dessiner les contours des vertèbres
-   → Outil Rectangle : cliquer-glisser
-   → Outil Polygone  : cliquer les points, double-clic pour fermer
-   → Outil Gomme     : effacer des zones du masque
+   → Onglet "Fluoroscopie" — dessiner les contours des structures
+   → Outils disponibles : crayon, rectangle, gomme
 
 5. Générer le DRR
    → Ajuster LAO/RAO et Cran/Caud si la vue n'est pas PA pure
@@ -47,8 +45,7 @@ python app.py
    → Onglet "DRR" — dessiner les mêmes vertèbres
 
 7. Lancer le Recalage
-   → Differential Evolution (global) + Nelder-Mead (local)
-   → Durée : 1-5 minutes selon la complexité
+   → Recalage rigide (optionnellement élastique)
    → Résultat dans l'onglet "Résultat"
 
 8. Exporter
@@ -56,31 +53,37 @@ python app.py
    → PNGs des masques et du DRR
 ```
 
-## Paramètres DRR clés
-
-| Paramètre | Valeur recommandée | Description |
-|---|---|---|
-| LAO/RAO | 0° pour PA pure | Rotation dans le plan coronal |
-| Cran/Caud | 0° pour PA pure | Inclinaison craniale/caudale |
-| Résolution | 512 px | 256 = rapide, 512 = qualité |
-
-## Structure
+## Structure (Refactor)
 
 ```
 registration_app/
-├── app.py                  # Application PyQt5 principale
+├── app.py                         # Point d'entrée (launcher léger)
 ├── requirements.txt
-├── core/
-│   ├── drr_generator.py    # Génération DRR (Beer-Lambert + CLAHE)
-│   └── registration.py     # Recalage IoU 3-DOF
+├── core/                          # Coeur scientifique (DRR, recalage, YOLO)
+│   ├── drr_generator.py
+│   ├── registration.py
+│   ├── refinement.py
+│   └── yolo_pipeline.py
+├── services/
+│   └── pipeline_workers.py        # Workers QThread (DRR/YOLO/recalage)
+├── ui/
+│   ├── main_window.py             # Orchestration UI principale
+│   ├── dialogs.py                 # Fenêtres annexes (YOLO, comparaison...)
+│   ├── theme.py                   # Design tokens + stylesheet global
+│   └── widgets/
+│       └── annotation_widgets.py  # Canvas et panneaux réutilisables
+├── utils/
+│   └── dicom_io.py                # Lecture DICOM et CSV metadata
 └── README.md
 ```
 
-## Interprétation des résultats
+## Validation rapide
 
-- **IoU > 0.6** : excellent recalage
-- **IoU 0.35–0.6** : bon, vérifier visuellement
-- **IoU < 0.35** : vérifier l'axe de projection ou redessiner les masques
+```bash
+python -m compileall registration_app
+```
 
-Si le DRR a la colonne à l'horizontale :
-→ Essayer LAO = 90° ou modifier `ap_axis` manuellement dans `core/drr_generator.py`
+```bash
+cd registration_app
+python -c "from ui.main_window import MainWindow; print('ok')"
+```
