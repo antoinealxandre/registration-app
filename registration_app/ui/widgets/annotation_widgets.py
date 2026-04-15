@@ -5,10 +5,10 @@ import cv2
 
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider,
-    QComboBox, QSizePolicy, QCheckBox, QFrame, QFileDialog, QMessageBox,
+    QComboBox, QGridLayout, QSizePolicy, QCheckBox, QFrame, QFileDialog, QMessageBox,
     QScrollArea,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QCursor, QPainter, QIcon
 
 from core.registration import apply_full_transform
@@ -565,6 +565,426 @@ class AnnotationCanvas(QLabel):
 # ══════════════════════════════════════════════════════════════════════════════
 # Panneau de visualisation du recalage
 # ══════════════════════════════════════════════════════════════════════════════
+
+class SegmentationReviewPanel(QWidget):
+    """Segmentation panel: axial/coronal/sagittal + external 3D window."""
+
+    request_3d_view = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ct_vol = None
+        self._seg_masks = {}
+        self._ax_idx = 0
+        self._co_idx = 0
+        self._sa_idx = 0
+        self._alpha = 0.45
+        self._lo = -1000.0
+        self._hi = 1000.0
+        self._struct_checks = {}
+        self._struct_order = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(5)
+
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
+
+        ctrl.addWidget(QLabel('Opacite :'))
+        self._sl_alpha = QSlider(Qt.Horizontal)
+        self._sl_alpha.setRange(5, 90)
+        self._sl_alpha.setValue(45)
+        self._sl_alpha.setFixedWidth(130)
+        self._sl_alpha.valueChanged.connect(self._on_alpha)
+        ctrl.addWidget(self._sl_alpha)
+        self._lbl_alpha = QLabel('45 %')
+        self._lbl_alpha.setObjectName('dim')
+        self._lbl_alpha.setFixedWidth(44)
+        ctrl.addWidget(self._lbl_alpha)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setObjectName('sep')
+        ctrl.addWidget(sep)
+
+        btn_open_3d = QPushButton('Ouvrir 3D')
+        btn_open_3d.clicked.connect(self.request_3d_view.emit)
+        ctrl.addWidget(btn_open_3d)
+
+        ctrl.addStretch()
+        root.addLayout(ctrl)
+
+        row_sl = QHBoxLayout(); row_sl.setSpacing(8)
+
+        row_sl.addWidget(QLabel('Axial'))
+        self._sl_ax = QSlider(Qt.Horizontal)
+        self._sl_ax.setRange(0, 0)
+        self._sl_ax.valueChanged.connect(self._on_ax)
+        row_sl.addWidget(self._sl_ax, 1)
+        self._lbl_ax = QLabel('0/0'); self._lbl_ax.setObjectName('dim'); self._lbl_ax.setFixedWidth(60)
+        row_sl.addWidget(self._lbl_ax)
+
+        row_sl.addWidget(QLabel('Coronal'))
+        self._sl_co = QSlider(Qt.Horizontal)
+        self._sl_co.setRange(0, 0)
+        self._sl_co.valueChanged.connect(self._on_co)
+        row_sl.addWidget(self._sl_co, 1)
+        self._lbl_co = QLabel('0/0'); self._lbl_co.setObjectName('dim'); self._lbl_co.setFixedWidth(60)
+        row_sl.addWidget(self._lbl_co)
+
+        row_sl.addWidget(QLabel('Sagittal'))
+        self._sl_sa = QSlider(Qt.Horizontal)
+        self._sl_sa.setRange(0, 0)
+        self._sl_sa.valueChanged.connect(self._on_sa)
+        row_sl.addWidget(self._sl_sa, 1)
+        self._lbl_sa = QLabel('0/0'); self._lbl_sa.setObjectName('dim'); self._lbl_sa.setFixedWidth(60)
+        row_sl.addWidget(self._lbl_sa)
+
+        root.addLayout(row_sl)
+
+        body = QHBoxLayout()
+        body.setSpacing(8)
+
+        views_wrap = QWidget()
+        views_wrap.setStyleSheet('background:transparent;')
+        views_row = QHBoxLayout(views_wrap)
+        views_row.setContentsMargins(0, 0, 0, 0)
+        views_row.setSpacing(6)
+
+        self._ax_view = self._mk_view('Axial', 'axial')
+        self._co_view = self._mk_view('Coronal', 'coronal')
+        self._sa_view = self._mk_view('Sagittal', 'sagittal')
+        views_row.addWidget(self._ax_view['box'], 1)
+        views_row.addWidget(self._co_view['box'], 1)
+        views_row.addWidget(self._sa_view['box'], 1)
+        body.addWidget(views_wrap, 1)
+
+        struct_frame = QFrame()
+        struct_frame.setObjectName('structPanel')
+        struct_frame.setMinimumWidth(280)
+        struct_frame.setMaximumWidth(360)
+        struct_frame.setStyleSheet(
+            f'#structPanel{{border:1px solid {BORDER2};border-radius:6px;background:transparent;}}'
+        )
+        sf = QVBoxLayout(struct_frame)
+        sf.setContentsMargins(8, 6, 8, 6)
+        sf.setSpacing(4)
+
+        sh = QHBoxLayout()
+        sh.setSpacing(6)
+        lbl_struct = QLabel('Structures visibles')
+        lbl_struct.setObjectName('mid')
+        sh.addWidget(lbl_struct)
+        sh.addStretch()
+        self._btn_struct_all = QPushButton('Tout')
+        self._btn_struct_all.setObjectName('tool')
+        self._btn_struct_all.setFixedHeight(24)
+        self._btn_struct_all.clicked.connect(lambda: self._set_all_structures(True))
+        sh.addWidget(self._btn_struct_all)
+        self._btn_struct_none = QPushButton('Aucun')
+        self._btn_struct_none.setObjectName('tool')
+        self._btn_struct_none.setFixedHeight(24)
+        self._btn_struct_none.clicked.connect(lambda: self._set_all_structures(False))
+        sh.addWidget(self._btn_struct_none)
+        sf.addLayout(sh)
+
+        self._struct_scroll = QScrollArea()
+        self._struct_scroll.setWidgetResizable(True)
+        self._struct_scroll.setFrameShape(QFrame.NoFrame)
+        self._struct_scroll.setStyleSheet('QScrollArea{background:transparent;border:none;}')
+
+        self._struct_widget = QWidget()
+        self._struct_layout = QVBoxLayout(self._struct_widget)
+        self._struct_layout.setContentsMargins(0, 0, 0, 0)
+        self._struct_layout.setSpacing(2)
+        self._struct_scroll.setWidget(self._struct_widget)
+        sf.addWidget(self._struct_scroll, 1)
+        body.addWidget(struct_frame)
+
+        root.addLayout(body, 1)
+
+        self._lbl_info = QLabel('Chargez un CT et une segmentation. Molette: changer de coupe.')
+        self._lbl_info.setObjectName('dim')
+        root.addWidget(self._lbl_info)
+
+    def _mk_view(self, title, plane):
+        box = QWidget()
+        box.setStyleSheet('background:transparent;')
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        lbl_title = QLabel(title)
+        lbl_title.setObjectName('dim')
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(f'background:{DARK_BG};border-radius:4px;')
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lbl.setToolTip('Molette souris: coupe precedente/suivante')
+        lbl.setProperty('plane', plane)
+        lbl.installEventFilter(self)
+        lay.addWidget(lbl_title)
+        lay.addWidget(lbl, 1)
+        return {'box': box, 'label': lbl}
+
+    def _clear_struct_widgets(self):
+        while self._struct_layout.count() > 0:
+            it = self._struct_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _rebuild_struct_controls(self):
+        self._clear_struct_widgets()
+        self._struct_checks = {}
+        self._struct_order = {}
+
+        names = sorted(self._seg_masks.keys(), key=lambda x: str(x).lower())
+        if not names:
+            lbl = QLabel('Aucune structure disponible')
+            lbl.setObjectName('dim')
+            self._struct_layout.addWidget(lbl)
+            self._struct_layout.addStretch(1)
+            return
+
+        for i, name in enumerate(names):
+            row = QWidget()
+            row.setStyleSheet('background:transparent;')
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(6)
+
+            col = _color_for_structure(name, i)
+            sw = QFrame()
+            sw.setFixedSize(14, 14)
+            sw.setStyleSheet(
+                f'background: rgb({col[0]}, {col[1]}, {col[2]});'
+                'border:1px solid #10131d;border-radius:3px;'
+            )
+            hl.addWidget(sw)
+
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.toggled.connect(self._on_structs_changed)
+            hl.addWidget(cb, 1)
+            self._struct_layout.addWidget(row)
+            self._struct_checks[name] = cb
+            self._struct_order[name] = i
+
+        self._struct_layout.addStretch(1)
+
+    def _set_all_structures(self, checked):
+        if not self._struct_checks:
+            return
+        for cb in self._struct_checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        self._on_structs_changed(checked)
+
+    def _selected_count(self):
+        return sum(1 for cb in self._struct_checks.values() if cb.isChecked())
+
+    def _on_structs_changed(self, _checked):
+        total = len(self._struct_checks)
+        if total:
+            self._lbl_info.setText(f'{self._selected_count()}/{total} structure(s) affichee(s) - molette: changer de coupe')
+        self._render_all()
+
+    def set_data(self, ct_vol, seg_masks):
+        self._ct_vol = ct_vol
+        self._seg_masks = seg_masks or {}
+        self._rebuild_struct_controls()
+
+        if self._ct_vol is None or self._ct_vol.ndim != 3:
+            self._sl_ax.setRange(0, 0)
+            self._sl_co.setRange(0, 0)
+            self._sl_sa.setRange(0, 0)
+            self._ax_idx = self._co_idx = self._sa_idx = 0
+            self._lbl_info.setText('CT absent: impossible d\'afficher la segmentation sur le scan.')
+            self._render_all()
+            return
+
+        sx, sy, sz = [int(v) for v in self._ct_vol.shape]
+        self._ax_idx = sz // 2
+        self._co_idx = sy // 2
+        self._sa_idx = sx // 2
+
+        self._sl_ax.blockSignals(True)
+        self._sl_ax.setRange(0, max(0, sz - 1))
+        self._sl_ax.setValue(self._ax_idx)
+        self._sl_ax.blockSignals(False)
+
+        self._sl_co.blockSignals(True)
+        self._sl_co.setRange(0, max(0, sy - 1))
+        self._sl_co.setValue(self._co_idx)
+        self._sl_co.blockSignals(False)
+
+        self._sl_sa.blockSignals(True)
+        self._sl_sa.setRange(0, max(0, sx - 1))
+        self._sl_sa.setValue(self._sa_idx)
+        self._sl_sa.blockSignals(False)
+
+        try:
+            self._lo, self._hi = np.percentile(self._ct_vol, [1, 99])
+        except Exception:
+            self._lo, self._hi = float(np.min(self._ct_vol)), float(np.max(self._ct_vol))
+        if self._hi <= self._lo:
+            self._hi = self._lo + 1.0
+
+        total = len(self._struct_checks)
+        self._lbl_info.setText(f'{total}/{total} structure(s) affichee(s) - molette: changer de coupe')
+        self._render_all()
+
+    def _on_ax(self, v):
+        self._ax_idx = int(v)
+        self._render_all()
+
+    def _on_co(self, v):
+        self._co_idx = int(v)
+        self._render_all()
+
+    def _on_sa(self, v):
+        self._sa_idx = int(v)
+        self._render_all()
+
+    def _on_alpha(self, v):
+        self._alpha = v / 100.0
+        self._lbl_alpha.setText(f'{v} %')
+        self._render_all()
+
+    def _orient(self, sl, _plane):
+        # Orientation fix: remove the vertical inversion that flipped anatomy upside-down.
+        return np.rot90(sl, 1)
+
+    def _iter_selected_masks(self):
+        if not self._seg_masks:
+            return []
+        if not self._struct_checks:
+            return list(self._seg_masks.items())
+        out = []
+        for name, mask in self._seg_masks.items():
+            cb = self._struct_checks.get(name)
+            if cb is None or cb.isChecked():
+                out.append((name, mask))
+        return out
+
+    def _slice_of(self, vol, plane, idx):
+        if plane == 'axial':
+            return vol[:, :, idx] if idx < vol.shape[2] else None
+        if plane == 'coronal':
+            return vol[:, idx, :] if idx < vol.shape[1] else None
+        return vol[idx, :, :] if idx < vol.shape[0] else None
+
+    def _render_plane(self, plane):
+        if self._ct_vol is None or self._ct_vol.ndim != 3:
+            return np.zeros((64, 64, 3), dtype=np.uint8)
+
+        if plane == 'axial':
+            idx = int(max(0, min(self._ax_idx, self._ct_vol.shape[2] - 1)))
+            self._lbl_ax.setText(f'{idx + 1}/{self._ct_vol.shape[2]}')
+        elif plane == 'coronal':
+            idx = int(max(0, min(self._co_idx, self._ct_vol.shape[1] - 1)))
+            self._lbl_co.setText(f'{idx + 1}/{self._ct_vol.shape[1]}')
+        else:
+            idx = int(max(0, min(self._sa_idx, self._ct_vol.shape[0] - 1)))
+            self._lbl_sa.setText(f'{idx + 1}/{self._ct_vol.shape[0]}')
+
+        sl = self._slice_of(self._ct_vol, plane, idx)
+        if sl is None:
+            return np.zeros((64, 64, 3), dtype=np.uint8)
+
+        sln = np.clip((sl.astype(np.float32) - self._lo) / (self._hi - self._lo), 0, 1)
+        base = self._orient((sln * 255).astype(np.uint8), plane)
+        rgb = cv2.cvtColor(base, cv2.COLOR_GRAY2RGB)
+
+        for i, (name, m3d) in enumerate(self._iter_selected_masks()):
+            if m3d is None or getattr(m3d, 'ndim', 0) != 3:
+                continue
+            msl = self._slice_of(m3d, plane, idx)
+            if msl is None:
+                continue
+            m = self._orient((msl > 0).astype(np.uint8), plane)
+            if m.shape != base.shape:
+                # Imported masks may be off by a few pixels versus CT shape.
+                m = cv2.resize(m, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_NEAREST)
+                m = (m > 0).astype(np.uint8)
+            if m.sum() == 0:
+                continue
+
+            color = _color_for_structure(name, self._struct_order.get(name, i))
+            ov = rgb.copy()
+            ov[m > 0] = color
+            rgb = cv2.addWeighted(rgb, 1 - self._alpha, ov, self._alpha, 0)
+
+            cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(rgb, cnts, -1, color, 1, lineType=cv2.LINE_AA)
+
+        return np.ascontiguousarray(rgb)
+
+    def _fit_to_label(self, rgb, lbl):
+        lh = max(96, lbl.height())
+        lw = max(96, lbl.width())
+        h, w = rgb.shape[:2]
+        if h <= 0 or w <= 0:
+            return np.zeros((lh, lw, 3), dtype=np.uint8)
+        s = min(lw / float(w), lh / float(h))
+        nw = max(1, int(round(w * s)))
+        nh = max(1, int(round(h * s)))
+        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((lh, lw, 3), 16, dtype=np.uint8)
+        y0 = (lh - nh) // 2
+        x0 = (lw - nw) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        return canvas
+
+    def _set_lbl_img(self, lbl, rgb):
+        img = self._fit_to_label(rgb, lbl)
+        img = np.ascontiguousarray(img)
+        h, w = img.shape[:2]
+        qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
+        lbl.setPixmap(QPixmap.fromImage(qimg).copy())
+
+    def _render_all(self):
+        if self._ct_vol is None or self._ct_vol.ndim != 3:
+            self._ax_view['label'].clear()
+            self._co_view['label'].clear()
+            self._sa_view['label'].clear()
+            return
+
+        self._set_lbl_img(self._ax_view['label'], self._render_plane('axial'))
+        self._set_lbl_img(self._co_view['label'], self._render_plane('coronal'))
+        self._set_lbl_img(self._sa_view['label'], self._render_plane('sagittal'))
+
+    def _step_slider(self, slider, steps):
+        new_val = max(slider.minimum(), min(slider.maximum(), slider.value() + int(steps)))
+        if new_val != slider.value():
+            slider.setValue(new_val)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and self._ct_vol is not None:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return True
+            steps = int(delta / 120)
+            if steps == 0:
+                steps = 1 if delta > 0 else -1
+
+            if obj is self._ax_view['label']:
+                self._step_slider(self._sl_ax, steps)
+                return True
+            if obj is self._co_view['label']:
+                self._step_slider(self._sl_co, steps)
+                return True
+            if obj is self._sa_view['label']:
+                self._step_slider(self._sl_sa, steps)
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render_all()
 
 class ResultPanel(QWidget):
     """

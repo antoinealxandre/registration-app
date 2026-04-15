@@ -10,3 +10,5 @@ SimpleITK
 pandas
 pyvista
 nanodrr
+TotalSegmentator
+pynrrd

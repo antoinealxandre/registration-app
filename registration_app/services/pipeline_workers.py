@@ -1,4 +1,4 @@
-"""Background workers for DRR generation, YOLO detection, and registration."""
+"""Background workers for DRR, YOLO, registration, and auto-segmentation."""
 
 import cv2
 import numpy as np
@@ -6,6 +6,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.drr_generator import generate_drr, project_mask_3d
 from core.registration import register, register_elastic
+from core.totalseg_runner import run_totalsegmentator_cli, build_seg_masks_from_totalseg
 from core.yolo_pipeline import detect_vertebrae, is_model_loaded as yolo_ready
 from ui.theme import AUTO_PIPELINE_FOV_MM
 
@@ -62,10 +63,46 @@ class WorkerThread(QThread):
                 'yolo_detect': self._yolo_detect,
                 'auto_pipeline': self._auto_pipeline,
                 'auto_phase2': self._auto_phase2,
+                'totalseg': self._totalseg,
             }[self.task]()
         except Exception as ex:
             import traceback
             self.error.emit(f'{ex}\n{traceback.format_exc()}')
+
+    def _totalseg(self):
+        kw = self.kw
+
+        def pcb(pct, msg):
+            self.progress.emit(pct, msg)
+
+        self.progress.emit(2, 'Preparation TotalSegmentator...')
+        run_res = run_totalsegmentator_cli(
+            input_path=kw['input_path'],
+            output_dir=kw['output_dir'],
+            task_name=kw.get('task_name', 'total'),
+            fast=bool(kw.get('fast', False)),
+            device=kw.get('device', 'gpu'),
+            license_key=kw.get('license_key', ''),
+            progress_cb=pcb,
+        )
+
+        self.progress.emit(96, 'Import des segmentations...')
+        load_res = build_seg_masks_from_totalseg(
+            output_dir=run_res['output_dir'],
+            profile=kw.get('profile', 'all'),
+            progress_cb=pcb,
+        )
+        self.progress.emit(100, f"Segmentation OK - {len(load_res['masks'])} structure(s)")
+        self.result.emit(
+            {
+                'task': 'totalseg',
+                'input_path': kw['input_path'],
+                'task_name': kw.get('task_name', 'total'),
+                'profile': kw.get('profile', 'registration'),
+                'output_dir': run_res['output_dir'],
+                **load_res,
+            }
+        )
 
     def _yolo_detect(self):
         kw = self.kw
