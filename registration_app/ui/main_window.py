@@ -211,10 +211,10 @@ class MainWindow(QMainWindow):
         def _lbl(t):
             l = QLabel(t); l.setObjectName('mid'); return l
 
-        gdl.addWidget(_lbl('LAO/RAO (deg)'), 0, 0)
+        gdl.addWidget(_lbl('Cran/Caud (deg)'), 0, 0)
         self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-180, 180); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
         gdl.addWidget(self.sp_lao, 0, 1)
-        gdl.addWidget(_lbl('Cran/Caud (deg)'), 1, 0)
+        gdl.addWidget(_lbl('LAO/RAO (deg)'), 1, 0)
         self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-180, 180); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
         gdl.addWidget(self.sp_cran, 1, 1)
         gdl.addWidget(_lbl('Table (deg)'), 2, 0)

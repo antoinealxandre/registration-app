@@ -68,12 +68,32 @@ def read_dicom_fluoro(path: str):
         except Exception:
             return default
 
-    lao = _get('PositionerPrimaryAngle', 0.0)
-    cran = _get('PositionerSecondaryAngle', 0.0)
+    def _get_float(tag, default):
+        val = getattr(ds, tag, None)
+        if val is None: return default
+        try: return float(str(val).split('\\')[0])
+        except: return default
 
-    sid = _get('DistanceSourceToDetector', 1020.0)
-    sod = _get('DistanceSourceToPatient', 510.0)
-    mag = _get('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
+    # GE Specific
+    # "AngleValuePArm" often corresponds to RAO/LAO. Positive is usually RAO, negative is LAO.
+    # "AngleValueCArm" usually CRA/CAU. Positive CRA, negative CAU.
+    arm_p = _get_private(0x0019, 0x1002, None)
+    arm_c = _get_private(0x0019, 0x1003, None)
+
+    # Standard Primary/Secondary angles
+    # For GE, typically PositionerPrimaryAngle is LAO/RAO and PositionerSecondaryAngle is CRA/CAUD.
+    primary = _get_float('PositionerPrimaryAngle', 0.0)
+    secondary = _get_float('PositionerSecondaryAngle', 0.0)
+    
+    # We map LAO to positive and RAO to negative. But sometimes DICOM stores it differently.
+    # Often RAO > 0, LAO < 0 or vice versa depending on manufacturer. 
+    # Usually: LAO = positive, RAO = negative, CRA = positive, CAU = negative
+    lao = -primary if arm_p is None else -arm_p
+    cran = secondary if arm_c is None else arm_c
+
+    sid = _get_float('DistanceSourceToDetector', 1020.0)
+    sod = _get_float('DistanceSourceToPatient', 510.0)
+    mag = _get_float('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
 
     ips = _get_multi('ImagerPixelSpacing')
     pixel_mm = ips[0] if ips else 0.2
@@ -81,23 +101,39 @@ def read_dicom_fluoro(path: str):
     rows = int(getattr(ds, 'Rows', img_uint8.shape[0]))
     cols = int(getattr(ds, 'Columns', img_uint8.shape[1]))
     fov_dim = _get_multi('FieldOfViewDimensions')
-    if fov_dim:
-        fov_dim_mm = tuple(fov_dim)
-        fov_mm = fov_dim_mm[0] * (sod / sid) if sid > 0 else fov_dim_mm[0]
-    else:
-        fov_mm = DEFAULT_FOV_MM
-        fov_det = fov_mm * (sid / sod) if sid > 0 and sod > 0 else (DEFAULT_FOV_MM * 2.0)
-        fov_dim_mm = (fov_det, fov_det)
+    
+    # Check GE private zoom
+    zoom_factor = _get_private(0x0019, 0x1018, 1.0)
+    # The FOV in mm at detector is typically pixel_mm * rows
+    if zoom_factor is None or zoom_factor <= 0:
+        zoom_factor = 1.0
+        
+    fov_det = rows * pixel_mm / zoom_factor
+    fov_mm = dict(
+        fov_dim_mm=(fov_det, fov_det),
+        fov_mm = fov_det / mag if mag > 0 else fov_det
+    )
+    
+    intensifier_mm = _get_float('IntensifierSize', 0.0)
 
-    intensifier_mm = _get('IntensifierSize', 0.0)
+    cx = _get_private(0x0019, 0x1019, 0.0)
+    cy = _get_private(0x0019, 0x101a, 0.0)
+
+    # Calculate actual FOV geometry and centers taking zoom into account
     fov_shape = _get_str('FieldOfViewShape', '')
     fov_origin_raw = _get_multi('FieldOfViewOrigin')
     fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
 
-    if not np.isfinite(fov_mm) or fov_mm <= 0:
-        fov_mm = DEFAULT_FOV_MM
+    table_angle = _get_float('TableAngle', 0.0)
 
-    table_angle = _get('TableAngle', 0.0)
+    arm_l = _get_private(0x0019, 0x1001, None)
+
+    # Extract centers
+    cx = _get_private(0x0019, 0x1019, 0.0)
+    cy = _get_private(0x0019, 0x101a, 0.0)
+
+    table_angle = _get_float('TableAngle', 0.0)
+
 
     arm_l = _get_private(0x0019, 0x1001, None)
     arm_p = _get_private(0x0019, 0x1002, None)
@@ -128,8 +164,8 @@ def read_dicom_fluoro(path: str):
         sod_mm=sod,
         magnification=mag,
         pixel_mm=pixel_mm,
-        fov_mm=fov_mm,
-        fov_dim_mm=fov_dim_mm,
+        fov_mm=fov_mm['fov_mm'],
+        fov_dim_mm=fov_mm['fov_dim_mm'],
         intensifier_mm=intensifier_mm,
         fov_shape=fov_shape,
         fov_origin=fov_origin,
