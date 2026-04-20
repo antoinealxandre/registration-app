@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime
 
 import cv2
 import nibabel as nib
@@ -26,6 +27,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QSpinBox,
     QDoubleSpinBox,
+    QComboBox,
     QProgressBar,
     QTabWidget,
     QSizePolicy,
@@ -43,6 +45,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 
 from core.drr_generator import load_ct
 from core.registration import apply_full_transform
+from core.totalseg_runner import export_multilabel_segmentation
 from core.yolo_pipeline import (
     load_yolo_model as yolo_load,
     is_model_loaded as yolo_ready,
@@ -74,6 +77,7 @@ from ui.widgets.annotation_widgets import (
     ImageCard,
     AnnotationCanvas,
     ResultPanel,
+    SegmentationReviewPanel,
     FinalOverlayPanel,
     _make_svg_icon,
 )
@@ -83,6 +87,9 @@ from ui.dialogs import (
     ComparisonDialog,
 )
 from utils.dicom_io import read_dicom_fluoro, read_metadata_csv
+
+
+TOTALSEG_LICENSE_KEY = 'aca_17SH96R9RRZYEV'
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -94,6 +101,9 @@ class MainWindow(QMainWindow):
         self.ct_path = None
         self.ap_axis = 1
         self.seg_masks = {}; self.proj_masks = {}; self.drr_image = None
+        self.seg_affine = None
+        self.tseg_output_dir = None
+        self.tseg_multilabel_path = None
         self.dicom_meta = {}
         self.fluoro_image = None; self.result = None
         self._loaded_images = []; self._pending_csv = None
@@ -188,6 +198,77 @@ class MainWindow(QMainWindow):
 
         ll.addWidget(sec_data)
 
+        # ── SEGMENTATION AUTO (TotalSegmentator) ───────────────────────────
+        sec_seg_auto = CollapsibleSection('SEGMENTATION AUTO', starts_open=False)
+
+        seg_info = QLabel(
+            'Segmentation automatique TotalSegmentator\n'
+            'Source : le meme CT NIfTI que celui charge pour le DRR')
+        seg_info.setObjectName('dim'); seg_info.setWordWrap(True)
+        sec_seg_auto.addWidget(seg_info)
+
+        self.lbl_tseg_src = QLabel('Source : CT courant')
+        self.lbl_tseg_src.setObjectName('dim')
+        self.lbl_tseg_src.setWordWrap(True)
+        sec_seg_auto.addWidget(self.lbl_tseg_src)
+
+        def _lbl_mid(t):
+            l = QLabel(t)
+            l.setObjectName('mid')
+            return l
+
+        tseg_grid = QWidget(); tseg_grid.setStyleSheet('background:transparent;')
+        tgl = QGridLayout(tseg_grid)
+        tgl.setContentsMargins(0, 0, 0, 0); tgl.setSpacing(4)
+        tgl.setColumnStretch(1, 1)
+
+        tgl.addWidget(_lbl_mid('Tache'), 0, 0)
+        self.cb_tseg_task = QComboBox()
+        self.cb_tseg_task.addItem('total')
+        self.cb_tseg_task.addItem('heartchambers_highres')
+        tgl.addWidget(self.cb_tseg_task, 0, 1)
+
+        tgl.addWidget(_lbl_mid('Device'), 1, 0)
+        self.cb_tseg_device = QComboBox()
+        self.cb_tseg_device.addItems(['gpu', 'cpu'])
+        tgl.addWidget(self.cb_tseg_device, 1, 1)
+
+        self.chk_tseg_fast = QCheckBox('Mode rapide (--fast)')
+        self.chk_tseg_fast.setChecked(False)
+        tgl.addWidget(self.chk_tseg_fast, 2, 0, 1, 2)
+
+        tgl.addWidget(_lbl_mid('Licence'), 3, 0)
+        lbl_lic = QLabel(f'Integree: {TOTALSEG_LICENSE_KEY}')
+        lbl_lic.setObjectName('dim')
+        lbl_lic.setWordWrap(True)
+        tgl.addWidget(lbl_lic, 3, 1)
+
+        sec_seg_auto.addWidget(tseg_grid)
+
+        self.btn_tseg_run = QPushButton('Segmenter automatiquement')
+        self.btn_tseg_run.setObjectName('primary')
+        self.btn_tseg_run.clicked.connect(self._run_totalseg)
+        sec_seg_auto.addWidget(self.btn_tseg_run)
+
+        exp_row = QHBoxLayout(); exp_row.setSpacing(4)
+        self.btn_tseg_export = QPushButton('Telecharger segmentation (fichier unique)')
+        self.btn_tseg_export.setEnabled(False)
+        self.btn_tseg_export.clicked.connect(self._export_totalseg_masks)
+        exp_row.addWidget(self.btn_tseg_export, 1)
+        sec_seg_auto.addLayout(exp_row)
+
+        self.btn_tseg_3d = QPushButton('Vue 3D segmentation')
+        self.btn_tseg_3d.setEnabled(False)
+        self.btn_tseg_3d.clicked.connect(self._open_segmentation_3d)
+        sec_seg_auto.addWidget(self.btn_tseg_3d)
+
+        self.lbl_tseg_status = QLabel('')
+        self.lbl_tseg_status.setObjectName('dim')
+        self.lbl_tseg_status.setWordWrap(True)
+        sec_seg_auto.addWidget(self.lbl_tseg_status)
+
+        ll.addWidget(sec_seg_auto)
+
         # ── IMAGES ────────────────────────────────────────────────────────────
         self._sec_images = CollapsibleSection('IMAGES', starts_open=False)
         self.lbl_no_images = QLabel('Aucune image chargee')
@@ -211,10 +292,10 @@ class MainWindow(QMainWindow):
         def _lbl(t):
             l = QLabel(t); l.setObjectName('mid'); return l
 
-        gdl.addWidget(_lbl('LAO/RAO (deg)'), 0, 0)
+        gdl.addWidget(_lbl('Cran/Caud (deg)'), 0, 0)
         self.sp_lao = QDoubleSpinBox(); self.sp_lao.setRange(-180, 180); self.sp_lao.setValue(0); self.sp_lao.setSingleStep(0.5)
         gdl.addWidget(self.sp_lao, 0, 1)
-        gdl.addWidget(_lbl('Cran/Caud (deg)'), 1, 0)
+        gdl.addWidget(_lbl('LAO/RAO (deg)'), 1, 0)
         self.sp_cran = QDoubleSpinBox(); self.sp_cran.setRange(-180, 180); self.sp_cran.setValue(0); self.sp_cran.setSingleStep(0.5)
         gdl.addWidget(self.sp_cran, 1, 1)
         gdl.addWidget(_lbl('Table (deg)'), 2, 0)
@@ -464,12 +545,15 @@ class MainWindow(QMainWindow):
         self.cv_fl = AnnotationCanvas(); self.cv_fl.mask_updated.connect(self._on_mask_upd)
         self.cv_drr = AnnotationCanvas(); self.cv_drr.mask_updated.connect(self._on_mask_upd)
         self.result_panel = ResultPanel()
+        self.seg_review_panel = SegmentationReviewPanel()
 
         for cv, hint, label in [
             (self.cv_fl, 'Image fixe -- dessiner les structures a recaler', 'Fixe'),
             (self.cv_drr, 'Image mobile -- dessiner les memes structures', 'Mobile'),
         ]:
             self.tabs.addTab(self._wrap(cv, hint), label)
+        self.tabs.addTab(self.seg_review_panel, 'Seg CT')
+        self.seg_review_panel.request_3d_view.connect(self._open_segmentation_3d)
         self.tabs.addTab(self.result_panel, 'Resultat')
 
         self.overlay_panel = FinalOverlayPanel()
@@ -636,7 +720,9 @@ class MainWindow(QMainWindow):
 
     def _load_seg_auto(self, path, csv_path=None):
         try:
-            sv = nib.load(path).get_fdata().astype(np.int16)
+            seg_img = nib.load(path)
+            sv = seg_img.get_fdata().astype(np.int16)
+            self.seg_affine = seg_img.affine
             self.seg_masks = {}
             if csv_path:
                 df = pd.read_csv(csv_path)
@@ -659,6 +745,10 @@ class MainWindow(QMainWindow):
                     self.seg_masks[f'label_{int(idx)}'] = m
             n = len(self.seg_masks)
             self.lbl_seg.setText(f'Seg : {os.path.basename(path)} ({n})')
+            if self.ct_vol is not None and self.seg_masks:
+                self.seg_review_panel.set_data(self.ct_vol, self.seg_masks)
+            if hasattr(self, 'btn_tseg_3d'):
+                self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
             self._update_checklist()
             self._status(f'Segmentation chargee -- {n} structures')
         except Exception as ex:
@@ -776,6 +866,8 @@ class MainWindow(QMainWindow):
             self.ct_codes = codes
             self.lbl_ct.setText(f'CT: {os.path.basename(p)}\n  {self.ct_vol.shape} | {self.voxel_mm.round(2)} mm | AP={self.ap_axis} {codes}')
             self.btn_drr.setEnabled(True)
+            if self.seg_masks:
+                self.seg_review_panel.set_data(self.ct_vol, self.seg_masks)
             self._update_checklist()
             self._status(f'CT chargé — axe AP={self.ap_axis} ({codes})')
         except Exception as ex: self._err(str(ex))
@@ -785,7 +877,9 @@ class MainWindow(QMainWindow):
         if not p: return
         cp,_=QFileDialog.getOpenFileName(self,'Label CSV','','CSV (*.csv)')
         try:
-            sv=nib.load(p).get_fdata().astype(np.int16)
+            seg_img = nib.load(p)
+            sv=seg_img.get_fdata().astype(np.int16)
+            self.seg_affine = seg_img.affine
             self.seg_masks={}
 
             if cp:
@@ -808,6 +902,10 @@ class MainWindow(QMainWindow):
             n=len(self.seg_masks)
             total=sum(v.sum() for v in self.seg_masks.values())
             self.lbl_seg.setText(f'Seg: {os.path.basename(p)}\n  {n} structures · {total:,} voxels')
+            if self.ct_vol is not None and self.seg_masks:
+                self.seg_review_panel.set_data(self.ct_vol, self.seg_masks)
+            if hasattr(self, 'btn_tseg_3d'):
+                self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
             self._update_checklist()
             self._status(f'Segmentation chargée — {n} structures : {", ".join(list(self.seg_masks)[:6])}{"…" if n>6 else ""}')
         except Exception as ex: self._err(str(ex))
@@ -824,13 +922,239 @@ class MainWindow(QMainWindow):
                     e['card'].set_role_external('fixed')
                 break
 
+    def _run_totalseg(self):
+        in_path = self.ct_path
+        if not in_path:
+            self._err('Chargez d\'abord un CT NIfTI (meme source que le DRR).')
+            return
+
+        self.lbl_tseg_src.setText(f'Source : {os.path.basename(in_path)}')
+
+        task_name = self.cb_tseg_task.currentText().strip() or 'total'
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_dir = os.path.join('data', 'totalseg_runs', f'{task_name}_{stamp}')
+        self.tseg_output_dir = out_dir
+
+        self.btn_tseg_run.setEnabled(False)
+        self.btn_tseg_export.setEnabled(False)
+        self.lbl_tseg_status.setText('Segmentation en cours...')
+
+        kw = dict(
+            input_path=in_path,
+            output_dir=out_dir,
+            task_name=task_name,
+            profile='all',
+            fast=self.chk_tseg_fast.isChecked(),
+            device=self.cb_tseg_device.currentText().strip().lower(),
+            license_key=TOTALSEG_LICENSE_KEY,
+        )
+        self.worker = WorkerThread('totalseg', kw)
+        self.worker.progress.connect(self._on_prog)
+        self.worker.result.connect(self._on_totalseg_done)
+        self.worker.error.connect(self._on_totalseg_err)
+        self.worker.start()
+
+    def _on_totalseg_done(self, res):
+        self.btn_tseg_run.setEnabled(True)
+
+        if res.get('task') != 'totalseg':
+            return
+
+        self.seg_masks = res.get('masks', {})
+        self.seg_affine = res.get('affine')
+        self.tseg_output_dir = res.get('output_dir')
+
+        # Si la source est un NIfTI CT et qu'aucun CT n'est charge, on l'importe.
+        src = res.get('input_path')
+        if self.ct_vol is None and isinstance(src, str) and src.lower().endswith(('.nii', '.nii.gz')):
+            try:
+                self.load_ct(src)
+            except Exception:
+                pass
+
+        n = len(self.seg_masks)
+        names = ', '.join(list(self.seg_masks.keys())[:6])
+        suffix = '...' if n > 6 else ''
+        self.lbl_seg.setText(f'Seg : TotalSegmentator ({n})')
+        self.lbl_tseg_status.setText(
+            f'Tache : {res.get("task_name", "total")}\n'
+            f'Sortie : {self.tseg_output_dir}\n'
+            f'Structures chargees : {names}{suffix}')
+
+        # Sortie par defaut: un seul fichier multilabel qui contient toutes les segmentations
+        self.tseg_multilabel_path = None
+        try:
+            default_out = os.path.join(self.tseg_output_dir, 'segmentation_multilabel.nii.gz')
+            aff = self.ct_aff if self.ct_aff is not None else self.seg_affine
+            exp = export_multilabel_segmentation(self.seg_masks, default_out, affine=aff)
+            self.tseg_multilabel_path = exp['out_path']
+            self.lbl_tseg_status.setText(
+                self.lbl_tseg_status.text() +
+                f'\nFichier multilabel : {self.tseg_multilabel_path}')
+
+            # Utiliser explicitement ce fichier unique comme segmentation active pour la suite.
+            self._load_seg_auto(exp['out_path'], exp.get('labels_csv'))
+            self.lbl_tseg_status.setText(
+                self.lbl_tseg_status.text() +
+                '\nSegmentation active: fichier multilabel unique charge.')
+        except Exception as ex:
+            self.lbl_tseg_status.setText(
+                self.lbl_tseg_status.text() +
+                f'\nAttention: export multilabel auto echoue ({ex}).')
+
+        if self.ct_vol is not None and self.seg_masks:
+            self.seg_review_panel.set_data(self.ct_vol, self.seg_masks)
+            self.tabs.setCurrentIndex(2)
+        elif self.seg_masks:
+            self.lbl_tseg_status.setText(
+                self.lbl_tseg_status.text() +
+                '\nCT non charge : la vue Seg CT requiert un CT NIfTI charge.')
+
+        self.btn_tseg_export.setEnabled(bool(self.seg_masks))
+        self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
+        self._update_checklist()
+        self._status(f'Segmentation automatique terminee ({n} structure(s)).')
+
+    def _on_totalseg_err(self, msg):
+        self.btn_tseg_run.setEnabled(True)
+        self.btn_tseg_export.setEnabled(bool(self.seg_masks))
+        self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
+        self.lbl_tseg_status.setText(f'Erreur : {msg.splitlines()[0]}')
+        self._err(msg)
+
+    def _export_totalseg_masks(self):
+        if not self.seg_masks:
+            self._err('Aucune segmentation a exporter. Lancez une segmentation auto ou chargez une seg.')
+            return
+
+        p, filt = QFileDialog.getSaveFileName(
+            self,
+            'Exporter segmentation multilabel',
+            'segmentation_multilabel.nii.gz',
+            'NIfTI (*.nii.gz *.nii);;NRRD (*.nrrd)')
+        if not p:
+            return
+
+        ext = os.path.splitext(p)[1].lower()
+        if not ext:
+            if 'NRRD' in filt:
+                p += '.nrrd'
+            else:
+                p += '.nii.gz'
+
+        aff = self.ct_aff if self.ct_aff is not None else self.seg_affine
+        try:
+            exp = export_multilabel_segmentation(self.seg_masks, p, affine=aff)
+        except Exception as ex:
+            self._err(str(ex))
+            return
+
+        self._status(f'Export segmentation -> {exp["out_path"]}')
+        QMessageBox.information(
+            self,
+            'Export segmentation',
+            f'Segmentation exportee:\n{exp["out_path"]}\n\nLabels:\n{exp["labels_csv"]}')
+
+    def _open_segmentation_3d(self):
+        if not self.seg_masks:
+            self._err('Aucune segmentation disponible pour la vue 3D.')
+            return
+
+        try:
+            import pyvista as pv
+            from skimage import measure
+        except Exception as ex:
+            self._err(f'Vue 3D indisponible: {ex}')
+            return
+
+        plotter = pv.Plotter(window_size=(1280, 860))
+        plotter.set_background('#12151f')
+
+        spacing = (1.0, 1.0, 1.0)
+        if self.ct_aff is not None:
+            try:
+                spacing = (
+                    float(abs(self.ct_aff[0, 0])),
+                    float(abs(self.ct_aff[1, 1])),
+                    float(abs(self.ct_aff[2, 2])),
+                )
+            except Exception:
+                spacing = (1.0, 1.0, 1.0)
+        elif self.voxel_mm is not None:
+            try:
+                spacing = tuple(float(v) for v in self.voxel_mm)
+            except Exception:
+                spacing = (1.0, 1.0, 1.0)
+
+        added = 0
+        for idx, (name, vol) in enumerate(self.seg_masks.items()):
+            if vol is None or getattr(vol, 'ndim', 0) != 3 or np.sum(vol) == 0:
+                continue
+
+            arr = (vol > 0).astype(np.uint8)
+            stride = 1
+            if arr.size > 180_000_000:
+                stride = 2
+                arr = arr[::2, ::2, ::2]
+
+            try:
+                verts, faces, _, _ = measure.marching_cubes(arr, level=0.5)
+            except Exception:
+                continue
+            if verts.size == 0 or faces.size == 0:
+                continue
+
+            sx, sy, sz = spacing
+            verts = verts * np.array([sx * stride, sy * stride, sz * stride], dtype=np.float32)
+            faces_vtk = np.hstack([
+                np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                faces.astype(np.int64),
+            ]).ravel()
+            mesh = pv.PolyData(verts.astype(np.float32), faces_vtk)
+            mesh = mesh.clean(tolerance=0.0)
+
+            if name in STRUCT:
+                rgb = STRUCT[name]['rgb']
+            else:
+                # Couleur deterministe pour les labels hors STRUCT
+                h = abs(hash(name))
+                rgb = (80 + (h % 150), 80 + ((h // 3) % 150), 80 + ((h // 7) % 150))
+
+            color = tuple(c / 255.0 for c in rgb)
+            plotter.add_mesh(mesh, color=color, opacity=0.45, name=f'{name}_{idx}')
+            added += 1
+
+        if added == 0:
+            plotter.close()
+            self._err('Aucun maillage 3D n\'a pu etre reconstruit.')
+            return
+
+        plotter.add_axes(line_width=2)
+        plotter.add_text(f'Segmentations 3D ({added})', font_size=10)
+        plotter.show()
+
+    def _projection_seg_masks(self):
+        """Return segmentation masks for DRR projection while preserving class names."""
+        if not self.seg_masks:
+            return {}
+
+        out = {}
+        for name, m in self.seg_masks.items():
+            if m is None:
+                continue
+            if m.sum() == 0:
+                continue
+            key = str(name).strip() or str(name)
+            out[key] = (m > 0).astype(np.uint8)
+        return out
+
     def generate_drr(self):
         if self.ct_path is None: self._err('Charger un CT d\'abord'); return
         self.btn_drr.setEnabled(False)
         kw=dict(ct_path=self.ct_path, ct_aff=self.ct_aff,
                 lao_deg=self.sp_lao.value(), cran_deg=self.sp_cran.value() + 180,
                 table_angle=self.sp_table.value(),
-                output_size=self.sp_size.value(), masks=self.seg_masks,
+                output_size=self.sp_size.value(), masks=self._projection_seg_masks(),
                 fov_mm=self.sp_fov.value(),
             sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
             sod_mm=self.dicom_meta.get('sod_mm', 510.0),
@@ -920,7 +1244,7 @@ class MainWindow(QMainWindow):
         self.lbl_ty.setText(f'ty = {res["ty"]:+.1f} px')
         self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
         self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
-        self._build_result(res); self.tabs.setCurrentIndex(2)
+        self._build_result(res); self.tabs.setCurrentIndex(3)
         if 0 <= self._current_iter_idx < len(self._iterations):
             self._iterations[self._current_iter_idx]['result'] = res
             self._refresh_iter_list()
@@ -1027,7 +1351,7 @@ class MainWindow(QMainWindow):
             proj_masks=self.proj_masks,
             result=self.result,
             reg_size=self.sp_size.value(),
-            seg_volumes=self.seg_masks,
+            seg_volumes=self._projection_seg_masks(),
             ct_affine=self.ct_aff,
             lao_deg=self.sp_lao.value(),
             cran_deg=self.sp_cran.value() + 180.0,
@@ -1035,7 +1359,7 @@ class MainWindow(QMainWindow):
             fov_mm=fov_for_projection,
         )
         # Basculer automatiquement sur l'onglet Overlay
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setCurrentIndex(4)
 
     # ── Pipeline automatique complet ──────────────────────────────────────────
 
@@ -1057,7 +1381,7 @@ class MainWindow(QMainWindow):
             ct_path=self.ct_path,
             ct_aff=self.ct_aff,
             fluoro=self.fluoro_image,
-            seg_masks=self.seg_masks,
+            seg_masks=self._projection_seg_masks(),
             output_size=self.sp_size.value(),
             lao_deg=self.sp_lao.value(),
             cran_deg=self.sp_cran.value() + 180,  # convention UI 0° = PA (180°)
@@ -1173,7 +1497,7 @@ class MainWindow(QMainWindow):
 
         # Construire le panneau résultat visuel
         self._build_result(res)
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentIndex(3)
 
         # Mettre à jour l'onglet overlay final
         self._update_overlay()
@@ -1329,7 +1653,7 @@ class MainWindow(QMainWindow):
             self.lbl_rot.setText(f'rot = {res["angle"]:+.2f} deg')
             self.lbl_scale.setText(f'scale = {res["scale"]:.3f}')
             self._build_result(res)
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(3)
         else:
             self.tabs.setCurrentIndex(1)
         self._refresh_iter_list()
