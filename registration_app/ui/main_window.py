@@ -14,6 +14,11 @@ try:
 except ImportError:
     pydicom = None
 
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
+
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -653,7 +658,7 @@ class MainWindow(QMainWindow):
         other_files = []
         for f in files:
             ext = os.path.splitext(f)[1].lower()
-            if f.lower().endswith('.nii.gz') or ext == '.nii':
+            if f.lower().endswith('.nii.gz') or ext in ('.nii', '.nrrd'):
                 nifti_files.append(f)
             elif ext == '.csv':
                 # Distinguer les CSV de labels (segmentation) des CSV de métadonnées DICOM
@@ -711,38 +716,179 @@ class MainWindow(QMainWindow):
     def _on_browse(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, 'Selectionner des fichiers', '',
-            'Tous (*.nii *.nii.gz *.csv *.png *.jpg *.jpeg *.bmp *.tiff *.tif *.dcm *);;'
-            'NIfTI (*.nii *.nii.gz);;Images (*.png *.jpg *.jpeg *.tiff *.bmp *.dcm);;'
+            'Tous (*.nii *.nii.gz *.nrrd *.csv *.png *.jpg *.jpeg *.bmp *.tiff *.tif *.dcm *);;'
+            'Segmentations/Volumes (*.nii *.nii.gz *.nrrd);;Images (*.png *.jpg *.jpeg *.tiff *.bmp *.dcm);;'
             'DICOM (*.dcm *);;'
             'CSV labels/meta (*.csv)')
         if files:
             self._on_files_dropped(files)
 
-    def _load_seg_auto(self, path, csv_path=None):
-        try:
+    def _read_segmentation_volume(self, path):
+        """Read NIfTI or NRRD segmentation and return (label_volume, affine, label_names)."""
+        p = path.lower()
+        if p.endswith('.nii') or p.endswith('.nii.gz'):
             seg_img = nib.load(path)
             sv = seg_img.get_fdata().astype(np.int16)
-            self.seg_affine = seg_img.affine
-            self.seg_masks = {}
-            if csv_path:
-                df = pd.read_csv(csv_path)
-                c = df.columns.tolist()
-                for _, row in df.iterrows():
-                    try:
-                        idx = int(row[c[0]])
-                    except (ValueError, TypeError):
-                        continue  # skip non-integer rows (metadata CSV loaded by mistake)
-                    name = str(row[c[1]]).strip()
-                    if not name or idx == 0: continue
-                    m = (sv == idx).astype(np.uint8)
-                    if m.sum() == 0: continue
-                    self.seg_masks[name] = m
-            else:
-                for idx in np.unique(sv):
-                    if idx == 0: continue
-                    m = (sv == idx).astype(np.uint8)
-                    if m.sum() == 0: continue
-                    self.seg_masks[f'label_{int(idx)}'] = m
+            return sv, seg_img.affine, None
+
+        if not p.endswith('.nrrd'):
+            raise ValueError(f'Format segmentation non supporte: {path}')
+
+        if sitk is None:
+            raise RuntimeError('Lecture NRRD indisponible: installez SimpleITK (pip install SimpleITK)')
+
+        img = sitk.ReadImage(path)
+        arr = sitk.GetArrayFromImage(img)
+
+        aff = np.eye(4, dtype=np.float64)
+        try:
+            direction = np.array(img.GetDirection(), dtype=np.float64)
+            spacing = np.array(img.GetSpacing(), dtype=np.float64)
+            origin = np.array(img.GetOrigin(), dtype=np.float64)
+            if direction.size >= 9 and spacing.size >= 3 and origin.size >= 3:
+                aff[:3, :3] = direction[:9].reshape(3, 3) @ np.diag(spacing[:3])
+                aff[:3, 3] = origin[:3]
+        except Exception:
+            pass
+
+        keys = set(img.GetMetaDataKeys())
+        seg_defs = []
+        idx = 0
+        while f'Segment{idx}_Name' in keys:
+            name = img.GetMetaData(f'Segment{idx}_Name').strip() or f'segment_{idx + 1}'
+            try:
+                layer = int(float(img.GetMetaData(f'Segment{idx}_Layer'))) if f'Segment{idx}_Layer' in keys else idx
+            except Exception:
+                layer = idx
+            try:
+                label_val = int(float(img.GetMetaData(f'Segment{idx}_LabelValue'))) if f'Segment{idx}_LabelValue' in keys else 1
+            except Exception:
+                label_val = 1
+            seg_defs.append((name, layer, label_val))
+            idx += 1
+
+        if arr.ndim == 3:
+            sv = np.transpose(arr, (2, 1, 0)).astype(np.int16)
+            label_names = None
+            if seg_defs:
+                label_names = {}
+                for name, _, label_val in seg_defs:
+                    label_names[int(label_val)] = name
+            return sv, aff, label_names
+
+        if arr.ndim != 4:
+            raise ValueError(f'NRRD segmentation invalide (ndim={arr.ndim}), attendu 3D ou 4D')
+
+        if seg_defs:
+            layer_count = max((d[1] for d in seg_defs), default=-1) + 1
+        else:
+            layer_count = arr.shape[0] if arr.shape[0] <= arr.shape[-1] else arr.shape[-1]
+
+        if arr.shape[0] == layer_count:
+            layer_axis = 0
+            layer_dim = arr.shape[0]
+        elif arr.shape[-1] == layer_count:
+            layer_axis = 3
+            layer_dim = arr.shape[-1]
+        else:
+            layer_axis = 0 if arr.shape[0] <= arr.shape[-1] else 3
+            layer_dim = arr.shape[0] if layer_axis == 0 else arr.shape[-1]
+
+        def _get_layer(layer_idx):
+            layer = arr[layer_idx, ...] if layer_axis == 0 else arr[..., layer_idx]
+            if layer.ndim != 3:
+                raise ValueError('NRRD 4D invalide: impossible d\'extraire une couche 3D')
+            return np.transpose(layer, (2, 1, 0))
+
+        sample = _get_layer(0)
+        sv = np.zeros(sample.shape, dtype=np.int16)
+        label_names = {}
+        out_idx = 1
+
+        if seg_defs:
+            for name, layer, label_val in seg_defs:
+                if layer < 0 or layer >= layer_dim:
+                    continue
+                lay = _get_layer(layer)
+                m = (lay == label_val)
+                if m.sum() == 0:
+                    m = lay > 0
+                if m.sum() == 0:
+                    continue
+                sv[m] = out_idx
+                label_names[out_idx] = name
+                out_idx += 1
+        else:
+            for layer in range(layer_dim):
+                lay = _get_layer(layer)
+                m = lay > 0
+                if m.sum() == 0:
+                    continue
+                sv[m] = out_idx
+                label_names[out_idx] = f'label_{out_idx}'
+                out_idx += 1
+
+        return sv, aff, label_names
+
+    def _build_seg_masks(self, seg_volume, csv_path=None, label_names=None):
+        """Build per-structure binary masks from a multilabel segmentation volume."""
+        masks = {}
+
+        def _unique_name(base):
+            root = str(base).strip() or 'label'
+            if root not in masks:
+                return root
+            i = 2
+            while f'{root}_{i}' in masks:
+                i += 1
+            return f'{root}_{i}'
+
+        if csv_path:
+            df = pd.read_csv(csv_path)
+            cols = df.columns.tolist()
+            for _, row in df.iterrows():
+                try:
+                    idx = int(row[cols[0]])
+                except (ValueError, TypeError):
+                    continue
+                name = str(row[cols[1]]).strip() if len(cols) > 1 else f'label_{idx}'
+                if not name or idx == 0:
+                    continue
+                m = (seg_volume == idx).astype(np.uint8)
+                if m.sum() == 0:
+                    continue
+                masks[_unique_name(name)] = m
+            return masks
+
+        if label_names:
+            for idx, name in label_names.items():
+                try:
+                    idx_i = int(idx)
+                except Exception:
+                    continue
+                if idx_i == 0:
+                    continue
+                m = (seg_volume == idx_i).astype(np.uint8)
+                if m.sum() == 0:
+                    continue
+                masks[_unique_name(name)] = m
+            if masks:
+                return masks
+
+        for idx in np.unique(seg_volume):
+            if idx == 0:
+                continue
+            m = (seg_volume == idx).astype(np.uint8)
+            if m.sum() == 0:
+                continue
+            masks[_unique_name(f'label_{int(idx)}')] = m
+        return masks
+
+    def _load_seg_auto(self, path, csv_path=None):
+        try:
+            sv, aff, label_names = self._read_segmentation_volume(path)
+            self.seg_affine = aff
+            self.seg_masks = self._build_seg_masks(sv, csv_path=csv_path, label_names=label_names)
             n = len(self.seg_masks)
             self.lbl_seg.setText(f'Seg : {os.path.basename(path)} ({n})')
             if self.ct_vol is not None and self.seg_masks:
@@ -873,42 +1019,10 @@ class MainWindow(QMainWindow):
         except Exception as ex: self._err(str(ex))
 
     def load_seg(self):
-        p,_=QFileDialog.getOpenFileName(self,'Segmentation','','NIfTI (*.nii *.nii.gz)')
+        p,_=QFileDialog.getOpenFileName(self,'Segmentation','','Segmentations (*.nii *.nii.gz *.nrrd)')
         if not p: return
         cp,_=QFileDialog.getOpenFileName(self,'Label CSV','','CSV (*.csv)')
-        try:
-            seg_img = nib.load(p)
-            sv=seg_img.get_fdata().astype(np.int16)
-            self.seg_affine = seg_img.affine
-            self.seg_masks={}
-
-            if cp:
-                df=pd.read_csv(cp); c=df.columns.tolist()
-                # c[0] = index/valeur voxel, c[1] = nom du label
-                for _,row in df.iterrows():
-                    idx=int(row[c[0]]); name=str(row[c[1]]).strip()
-                    if not name or idx==0: continue   # ignorer fond
-                    m=(sv==idx).astype(np.uint8)
-                    if m.sum()==0: continue            # ignorer labels vides
-                    self.seg_masks[name]=m
-            else:
-                # Pas de CSV : une structure par valeur unique non nulle
-                for idx in np.unique(sv):
-                    if idx==0: continue
-                    m=(sv==idx).astype(np.uint8)
-                    if m.sum()==0: continue
-                    self.seg_masks[f'label_{int(idx)}']=m
-
-            n=len(self.seg_masks)
-            total=sum(v.sum() for v in self.seg_masks.values())
-            self.lbl_seg.setText(f'Seg: {os.path.basename(p)}\n  {n} structures · {total:,} voxels')
-            if self.ct_vol is not None and self.seg_masks:
-                self.seg_review_panel.set_data(self.ct_vol, self.seg_masks)
-            if hasattr(self, 'btn_tseg_3d'):
-                self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
-            self._update_checklist()
-            self._status(f'Segmentation chargée — {n} structures : {", ".join(list(self.seg_masks)[:6])}{"…" if n>6 else ""}')
-        except Exception as ex: self._err(str(ex))
+        self._load_seg_auto(p, cp or None)
 
     def load_fluoro(self):
         p,_=QFileDialog.getOpenFileName(self,'Fluoroscopie','','Images & DICOM (*.png *.jpg *.tiff *.bmp *.dcm)')

@@ -85,11 +85,10 @@ def read_dicom_fluoro(path: str):
     primary = _get_float('PositionerPrimaryAngle', 0.0)
     secondary = _get_float('PositionerSecondaryAngle', 0.0)
     
-    # We map LAO to positive and RAO to negative. But sometimes DICOM stores it differently.
-    # Often RAO > 0, LAO < 0 or vice versa depending on manufacturer. 
-    # Usually: LAO = positive, RAO = negative, CRA = positive, CAU = negative
-    lao = -primary if arm_p is None else -arm_p
-    cran = secondary if arm_c is None else arm_c
+    # Requested convention swap: LAO/RAO comes from Secondary (or C-arm private),
+    # CRA/CAUD comes from Primary (or P-arm private).
+    lao = secondary if arm_c is None else arm_c
+    cran = primary if arm_p is None else arm_p
 
     sid = _get_float('DistanceSourceToDetector', 1020.0)
     sod = _get_float('DistanceSourceToPatient', 510.0)
@@ -234,8 +233,11 @@ def read_metadata_csv(path: str):
         except Exception:
             return None
 
-    lao = _f('PositionerPrimaryAngle', 0.0)
-    cran = _f('PositionerSecondaryAngle', 0.0)
+    primary = _f('PositionerPrimaryAngle', 0.0)
+    secondary = _f('PositionerSecondaryAngle', 0.0)
+    # Requested convention swap: Secondary -> LAO/RAO, Primary -> CRA/CAUD.
+    lao = secondary
+    cran = primary
     sid = _f('DistanceSourceToDetector', 1020.0)
     sod = _f('DistanceSourceToPatient', 510.0)
     mag = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
