@@ -266,6 +266,10 @@ class ImageCard(QWidget):
         pm = QPixmap.fromImage(qi).copy()
         self._thumb_lbl.setPixmap(pm)
 
+    def set_array(self, array):
+        self.array = array
+        self._update_thumb()
+
     def _on_fixed(self):
         self._btn_mobile.setChecked(False)
         if self._btn_fixed.isChecked():
@@ -308,6 +312,7 @@ class ImageCard(QWidget):
 
 class AnnotationCanvas(QLabel):
     mask_updated = pyqtSignal()
+    wheel_scrolled = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -336,7 +341,18 @@ class AnnotationCanvas(QLabel):
 
     # ── API ───────────────────────────────────────────────────────────────────
 
-    def set_image(self, img: np.ndarray):
+    def set_image(self, img: np.ndarray, preserve_masks: bool = False):
+        old_masks = None
+        old_history = None
+        if preserve_masks and self._img_np is not None:
+            old_masks = {
+                k: (self._masks[k].copy() if self._masks.get(k) is not None else None)
+                for k in STRUCT
+            }
+            old_history = {
+                k: [m.copy() for m in self._history.get(k, [])]
+                for k in STRUCT
+            }
         h, w = img.shape[:2]
         s = max(h, w)
         u8 = (np.clip(img,0,1)*255).astype(np.uint8) if img.dtype != np.uint8 else img.copy()
@@ -348,8 +364,16 @@ class AnnotationCanvas(QLabel):
         self._size = s
         self._img_np = u8
         for k in STRUCT:
-            self._masks[k] = np.zeros((s,s), np.float32)
-            self._history[k] = []
+            if old_masks and old_masks.get(k) is not None:
+                mask = old_masks[k]
+                if mask.shape != (s, s):
+                    mask = cv2.resize(mask.astype(np.float32), (s, s), interpolation=cv2.INTER_NEAREST)
+                    mask = (mask > 0.5).astype(np.float32)
+                self._masks[k] = mask.astype(np.float32)
+                self._history[k] = old_history.get(k, []) if old_history else []
+            else:
+                self._masks[k] = np.zeros((s,s), np.float32)
+                self._history[k] = []
         self._raw_pts=[]; self._poly_pts=[]
         self._refresh()
 
@@ -402,6 +426,16 @@ class AnnotationCanvas(QLabel):
             if self._masks[k] is not None: self._masks[k][:]=0
             self._history[k]=[]
         self._raw_pts=[]; self._poly_pts=[]; self._refresh(); self.mask_updated.emit()
+
+    def wheelEvent(self, e):
+        steps = int(e.angleDelta().y() / 120)
+        if steps == 0 and e.angleDelta().y() != 0:
+            steps = 1 if e.angleDelta().y() > 0 else -1
+        if steps != 0:
+            self.wheel_scrolled.emit(steps)
+            e.accept()
+            return
+        super().wheelEvent(e)
 
     # ── Historique ────────────────────────────────────────────────────────────
 
@@ -1068,6 +1102,12 @@ class ResultPanel(QWidget):
         self._contours = contours
         self._render()
 
+    def clear_data(self):
+        self._img_a = None
+        self._img_b = None
+        self._contours = []
+        self._lbl_img.clear()
+
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_mode(self, idx):
         self._mode = idx
@@ -1408,6 +1448,20 @@ class FinalOverlayPanel(QWidget):
         self._zoom = 1.0; self._pan_x = self._pan_y = 0
         self._sl_zoom.blockSignals(True); self._sl_zoom.setValue(100); self._sl_zoom.blockSignals(False)
         self._render()
+
+    def clear_data(self):
+        self._fluoro = None
+        self._proj_masks = {}
+        self._seg_volumes = {}
+        self._ct_affine = None
+        self._result = None
+        self._full_image = None
+        self._vis = {}
+        self._colors = {}
+        self._chks = {}
+        self._rebuild_list()
+        self._lbl_img.clear()
+        self._lbl_info.setText('En attente de données…')
 
     def has_data(self):
         return self._fluoro is not None and self._result is not None and bool(self._proj_masks)

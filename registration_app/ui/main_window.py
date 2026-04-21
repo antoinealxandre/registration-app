@@ -48,7 +48,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont
 
-from core.drr_generator import load_ct
+from core.drr_generator import load_ct, DRR_POSTPROCESS_PRESETS, enhance_drr_image
 from core.registration import apply_full_transform
 from core.totalseg_runner import export_multilabel_segmentation
 from core.yolo_pipeline import (
@@ -91,7 +91,7 @@ from ui.dialogs import (
     DualYoloSelectionDialog,
     ComparisonDialog,
 )
-from utils.dicom_io import read_dicom_fluoro, read_metadata_csv
+from utils.dicom_io import read_dicom_fluoro_series, read_metadata_csv
 
 
 TOTALSEG_LICENSE_KEY = 'aca_17SH96R9RRZYEV'
@@ -111,10 +111,14 @@ class MainWindow(QMainWindow):
         self.tseg_multilabel_path = None
         self.dicom_meta = {}
         self.fluoro_image = None; self.result = None
+        self._drr_base_image = None
         self._loaded_images = []; self._pending_csv = None
+        self._fixed_image_index = None
+        self._mobile_image_index = None
         self._iterations = []
         self._current_iter_idx = -1
         self._build_ui()
+        self._on_drr_preset_changed(self.cb_drr_preset.currentIndex())
         self._load_yolo_default()  # Charger modèle auto au démarrage
         self._status('Deposez vos fichiers pour commencer')
 
@@ -193,6 +197,32 @@ class MainWindow(QMainWindow):
         sec_data.addLayout(_dot_row(self.lbl_ct, 'ct'))
         sec_data.addLayout(_dot_row(self.lbl_seg, 'seg'))
         sec_data.addLayout(_dot_row(self.lbl_fluoro_meta, 'fluoro'))
+
+        self._fluoro_frame_box = QWidget()
+        self._fluoro_frame_box.setStyleSheet('background:transparent;')
+        frame_box = QVBoxLayout(self._fluoro_frame_box)
+        frame_box.setContentsMargins(0, 0, 0, 0)
+        frame_box.setSpacing(3)
+        frame_row = QHBoxLayout(); frame_row.setSpacing(6); frame_row.setContentsMargins(0, 0, 0, 0)
+        self.lbl_fluoro_frame = QLabel('Frame :')
+        self.lbl_fluoro_frame.setObjectName('mid')
+        self.sl_fluoro_frame = QSlider(Qt.Horizontal)
+        self.sl_fluoro_frame.setRange(1, 1)
+        self.sl_fluoro_frame.setValue(1)
+        self.sl_fluoro_frame.valueChanged.connect(self._on_fluoro_frame_slider)
+        self.lbl_fluoro_frame_value = QLabel('-- / --')
+        self.lbl_fluoro_frame_value.setObjectName('dim')
+        self.lbl_fluoro_frame_value.setFixedWidth(54)
+        frame_row.addWidget(self.lbl_fluoro_frame)
+        frame_row.addWidget(self.sl_fluoro_frame, 1)
+        frame_row.addWidget(self.lbl_fluoro_frame_value)
+        frame_box.addLayout(frame_row)
+        self.lbl_fluoro_frame_hint = QLabel('Molette sur la fluoroscopie pour changer de frame')
+        self.lbl_fluoro_frame_hint.setObjectName('dim')
+        self.lbl_fluoro_frame_hint.setWordWrap(True)
+        frame_box.addWidget(self.lbl_fluoro_frame_hint)
+        self._fluoro_frame_box.hide()
+        sec_data.addWidget(self._fluoro_frame_box)
 
         # Dots fantômes pour DRR / YOLO / Reg (non affichés, mis à jour par _update_checklist)
         for _key in ('drr', 'yolo', 'reg'):
@@ -312,7 +342,49 @@ class MainWindow(QMainWindow):
         gdl.addWidget(_lbl('Resolution (px)'), 4, 0)
         self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
         gdl.addWidget(self.sp_size, 4, 1)
+        gdl.addWidget(_lbl('Preset rendu'), 5, 0)
+        self.cb_drr_preset = QComboBox()
+        self.cb_drr_preset.addItem('Equilibre', 'balanced')
+        self.cb_drr_preset.addItem('Contours osseux', 'bone')
+        self.cb_drr_preset.addItem('Contraste doux', 'soft')
+        self.cb_drr_preset.setCurrentIndex(1)
+        self.cb_drr_preset.currentIndexChanged.connect(self._on_drr_preset_changed)
+        gdl.addWidget(self.cb_drr_preset, 5, 1)
+        self.chk_drr_soft = QCheckBox('Attenuer tissus mous')
+        self.chk_drr_soft.setChecked(True)
+        gdl.addWidget(self.chk_drr_soft, 6, 0, 1, 2)
+        self.chk_drr_clahe = QCheckBox('Contraste local (CLAHE)')
+        self.chk_drr_clahe.setChecked(True)
+        gdl.addWidget(self.chk_drr_clahe, 7, 0, 1, 2)
+        self.chk_drr_edges = QCheckBox('Renforcer gradient et contours')
+        self.chk_drr_edges.setChecked(True)
+        gdl.addWidget(self.chk_drr_edges, 8, 0, 1, 2)
+        gdl.addWidget(_lbl('Gain os'), 9, 0)
+        self.sp_drr_bone = QDoubleSpinBox(); self.sp_drr_bone.setRange(0.2, 2.5); self.sp_drr_bone.setValue(1.0); self.sp_drr_bone.setSingleStep(0.1)
+        gdl.addWidget(self.sp_drr_bone, 9, 1)
+        gdl.addWidget(_lbl('Gain contours'), 10, 0)
+        self.sp_drr_edges = QDoubleSpinBox(); self.sp_drr_edges.setRange(0.0, 2.5); self.sp_drr_edges.setValue(1.0); self.sp_drr_edges.setSingleStep(0.1)
+        gdl.addWidget(self.sp_drr_edges, 10, 1)
+        gdl.addWidget(_lbl('Gamma'), 11, 0)
+        self.sp_drr_gamma = QDoubleSpinBox(); self.sp_drr_gamma.setRange(0.3, 1.6); self.sp_drr_gamma.setValue(0.74); self.sp_drr_gamma.setSingleStep(0.02)
+        gdl.addWidget(self.sp_drr_gamma, 11, 1)
         sec_drr.addWidget(drr_grid)
+        lbl_drr_hint = QLabel(
+            'La generation DRR revient au rendu precedent.\n'
+            'Les filtres ci-dessous s appliquent apres generation sur le DRR courant.')
+        lbl_drr_hint.setObjectName('dim')
+        lbl_drr_hint.setWordWrap(True)
+        sec_drr.addWidget(lbl_drr_hint)
+        row_drr_filters = QHBoxLayout(); row_drr_filters.setSpacing(6)
+        self.btn_drr_apply_filters = QPushButton('Appliquer filtres')
+        self.btn_drr_apply_filters.clicked.connect(self._apply_drr_filters)
+        self.btn_drr_apply_filters.setEnabled(False)
+        row_drr_filters.addWidget(self.btn_drr_apply_filters, 1)
+        self.btn_drr_reset_filters = QPushButton('DRR de base')
+        self.btn_drr_reset_filters.clicked.connect(self._reset_drr_filters)
+        self.btn_drr_reset_filters.setEnabled(False)
+        row_drr_filters.addWidget(self.btn_drr_reset_filters, 1)
+        sec_drr.addLayout(row_drr_filters)
         self.btn_drr = QPushButton('Generer DRR'); self.btn_drr.setObjectName('primary')
         self.btn_drr.clicked.connect(self.generate_drr); self.btn_drr.setEnabled(False)
         sec_drr.addWidget(self.btn_drr)
@@ -548,6 +620,7 @@ class MainWindow(QMainWindow):
         # ── Onglets ───────────────────────────────────────────────────────────
         self.tabs = QTabWidget(); self.tabs.setDocumentMode(True)
         self.cv_fl = AnnotationCanvas(); self.cv_fl.mask_updated.connect(self._on_mask_upd)
+        self.cv_fl.wheel_scrolled.connect(self._step_fluoro_frame)
         self.cv_drr = AnnotationCanvas(); self.cv_drr.mask_updated.connect(self._on_mask_upd)
         self.result_panel = ResultPanel()
         self.seg_review_panel = SegmentationReviewPanel()
@@ -633,6 +706,68 @@ class MainWindow(QMainWindow):
     def _on_pen(self,v): self.lbl_pen.setText(f'{v}px'); [cv.set_pen_radius(v) for cv in [self.cv_fl,self.cv_drr]]
     def _undo(self): self._active_cv().undo()
     def _clear_all(self): self._active_cv().clear_all()
+
+    def _on_drr_preset_changed(self, _idx):
+        preset_name = self.cb_drr_preset.currentData() or 'balanced'
+        preset = DRR_POSTPROCESS_PRESETS.get(preset_name, DRR_POSTPROCESS_PRESETS['balanced'])
+        self.sp_drr_bone.blockSignals(True)
+        self.sp_drr_edges.blockSignals(True)
+        self.sp_drr_gamma.blockSignals(True)
+        self.sp_drr_bone.setValue(1.0)
+        self.sp_drr_edges.setValue(1.0)
+        self.sp_drr_gamma.setValue(float(preset.get('gamma', 1.0)))
+        self.sp_drr_bone.blockSignals(False)
+        self.sp_drr_edges.blockSignals(False)
+        self.sp_drr_gamma.blockSignals(False)
+
+    def _drr_postprocess_kw(self):
+        preset_name = self.cb_drr_preset.currentData() or 'balanced'
+        preset = dict(DRR_POSTPROCESS_PRESETS.get(preset_name, DRR_POSTPROCESS_PRESETS['balanced']))
+        preset['bone_boost'] = float(preset.get('bone_boost', 0.0)) * self.sp_drr_bone.value()
+        preset['gradient_boost'] = float(preset.get('gradient_boost', 0.0)) * self.sp_drr_edges.value()
+        preset['gamma'] = self.sp_drr_gamma.value()
+        if not self.chk_drr_soft.isChecked():
+            preset['soft_tissue_suppression'] = 0.0
+        if not self.chk_drr_clahe.isChecked():
+            preset['clahe_enabled'] = False
+        if not self.chk_drr_edges.isChecked():
+            preset['gradient_boost'] = 0.0
+            preset['tophat_enabled'] = False
+            preset['unsharp_amount'] = min(float(preset.get('unsharp_amount', 0.0)), 0.18)
+        return preset
+
+    def _update_drr_filter_buttons(self):
+        has_drr = self._drr_base_image is not None
+        self.btn_drr_apply_filters.setEnabled(has_drr)
+        self.btn_drr_reset_filters.setEnabled(has_drr)
+
+    def _set_drr_base_image(self, img):
+        self._drr_base_image = None if img is None else img.astype(np.float32).copy()
+        self._update_drr_filter_buttons()
+
+    def _refresh_drr_after_filter(self, status_msg=''):
+        if self.drr_image is None:
+            return
+        self.cv_drr.set_image(self.drr_image, preserve_masks=True)
+        if 0 <= self._current_iter_idx < len(self._iterations):
+            self._iterations[self._current_iter_idx]['drr_image'] = self.drr_image.copy()
+            self._refresh_iter_list()
+        if self.result is not None:
+            self._build_result(self.result)
+        if status_msg:
+            self._status(status_msg)
+
+    def _apply_drr_filters(self):
+        if self._drr_base_image is None:
+            self._err('Generez ou chargez un DRR d abord.'); return
+        self.drr_image = enhance_drr_image(self._drr_base_image, self._drr_postprocess_kw())
+        self._refresh_drr_after_filter('Filtres appliques sur le DRR courant')
+
+    def _reset_drr_filters(self):
+        if self._drr_base_image is None:
+            self._err('Aucun DRR de base disponible.'); return
+        self.drr_image = self._drr_base_image.copy()
+        self._refresh_drr_after_filter('Retour au DRR genere')
 
     def _save_mask(self):
         cv=self._active_cv(); m=cv.get_mask()
@@ -909,13 +1044,17 @@ class MainWindow(QMainWindow):
         ext = os.path.splitext(path)[1].lower()
         img = None
         dicom_meta = None
+        dicom_frames_u8 = None
+        frame_index = 0
         # Tenter DICOM pour .dcm ou fichiers sans extension (ex: IM0)
         is_dicom_ext = ext == '.dcm' or ext == ''
         if is_dicom_ext and pydicom is not None:
             try:
-                img, dicom_meta = read_dicom_fluoro(path)
-                if img.ndim == 3:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                series = read_dicom_fluoro_series(path)
+                dicom_frames_u8 = series['frames_u8']
+                dicom_meta = dict(series['meta'])
+                frame_index = max(0, int(dicom_meta.get('frame_used', 1)) - 1)
+                img = dicom_frames_u8[frame_index]
             except Exception:
                 img = None  # fallback to cv2
         if img is None:
@@ -924,8 +1063,16 @@ class MainWindow(QMainWindow):
             self._err(f'Impossible de charger : {name}'); return
         img_float = img.astype(np.float32) / 255.0
         idx = len(self._loaded_images)
-        entry = {'path': path, 'name': name, 'array': img_float, 'role': None, 'card': None,
-                 'dicom_meta': dicom_meta}
+        entry = {
+            'path': path,
+            'name': name,
+            'array': img_float,
+            'role': None,
+            'card': None,
+            'dicom_meta': dicom_meta,
+            'dicom_frames_u8': dicom_frames_u8,
+            'frame_index': frame_index,
+        }
         self._loaded_images.append(entry)
         self.lbl_no_images.hide()
         card = ImageCard(idx, name, img_float)
@@ -946,41 +1093,154 @@ class MainWindow(QMainWindow):
                     if e['card']:
                         e['card'].set_role_external(None)
         self._loaded_images[index]['role'] = role or None
-        img = self._loaded_images[index]['array']
-        name = self._loaded_images[index]['name']
         if role == 'fixed':
-            self.fluoro_image = img           # résolution native conservée
-            self.cv_fl.set_image(img)
-            self.tabs.setCurrentIndex(0)
-            self._update_checklist()
-            # Auto-remplir les paramètres DRR depuis les métadonnées DICOM
-            meta = self._loaded_images[index].get('dicom_meta')
-            if meta:
-                self.dicom_meta = meta
-                self._apply_dicom_meta(meta)
-                self._status(f'Fluoro DICOM chargee — LAO={meta["lao"]:+.1f}deg  '
-                              f'CRAN={meta["cran"]:+.1f}deg  FOV={meta["fov_mm"]:.0f}mm — '
-                              'parametres DRR auto-remplis')
-            else:
-                self.dicom_meta = {}
-                self.lbl_fluoro_meta.setText(f'Fluoro : {name}')
-                self._status(f'Image fixe : {name}')
+            self._set_fixed_image(index)
         elif role == 'mobile':
-            self.drr_image = img
-            self.proj_masks = {}
-            self.cv_drr.set_image(img)
-            self.tabs.setTabText(1, 'Mobile')
-            self.tabs.setCurrentIndex(1)
-            self._status(f'Image mobile : {name}')
+            self._set_mobile_image(index)
 
-    def _apply_dicom_meta(self, meta):
+    def _set_fixed_image(self, index, frame_changed=False):
+        entry = self._loaded_images[index]
+        self._fixed_image_index = index
+        self.fluoro_image = entry['array']
+        self.cv_fl.set_image(self.fluoro_image)
+        self.tabs.setCurrentIndex(0)
+        self._invalidate_registration_state(
+            'Frame fluoroscopique changee.'
+            if frame_changed else
+            f'Nouvelle image fixe : {entry["name"]}')
+
+        meta = entry.get('dicom_meta')
+        if meta:
+            self.dicom_meta = dict(meta)
+            self._apply_dicom_meta(self.dicom_meta, update_controls=not frame_changed)
+            self._sync_fluoro_frame_controls(entry)
+            fps = float(meta.get('cine_rate_fps', 0.0) or 0.0)
+            fps_txt = f' | {fps:.1f} img/s' if fps > 0 else ''
+            self._status(
+                f'Fluoro DICOM chargee — frame {entry.get("frame_index", 0) + 1}/'
+                f'{meta.get("n_frames", 1)}{fps_txt}')
+        else:
+            self.dicom_meta = {}
+            self.lbl_fluoro_meta.setText(f'Fluoro : {entry["name"]}')
+            self._sync_fluoro_frame_controls(None)
+            self._status(
+                f'Image fixe : {entry["name"]}'
+                if not frame_changed else
+                f'Image fixe mise a jour : {entry["name"]}')
+        self._update_checklist()
+
+    def _set_mobile_image(self, index):
+        entry = self._loaded_images[index]
+        self._mobile_image_index = index
+        self.drr_image = entry['array']
+        self._set_drr_base_image(self.drr_image)
+        self.proj_masks = {}
+        self.cv_drr.set_image(self.drr_image)
+        self._invalidate_registration_state(f'Nouvelle image mobile : {entry["name"]}')
+        self.tabs.setTabText(1, 'Mobile')
+        self.tabs.setCurrentIndex(1)
+        self._status(f'Image mobile : {entry["name"]}')
+        self._update_checklist()
+
+    def _invalidate_registration_state(self, reason=''):
+        self.result = None
+        self._yolo_det_fl = None
+        self.lbl_iou.setText('--')
+        self.lbl_iou.setStyleSheet('')
+        self.lbl_dice.setText('--')
+        self.lbl_dice.setStyleSheet('')
+        self.lbl_tx.setText('tx : --')
+        self.lbl_ty.setText('ty : --')
+        self.lbl_rot.setText('rot : --')
+        self.lbl_scale.setText('scale : --')
+        self.result_panel.clear_data()
+        self.overlay_panel.clear_data()
+        self.btn_reg.setEnabled(False)
+        self.lbl_auto_status.setText('')
+        if self._iterations:
+            self._iterations = []
+            self._current_iter_idx = -1
+            self._refresh_iter_list()
+        self._update_checklist()
+        if reason:
+            self.lbl_prog.setText(reason)
+
+    def _sync_fluoro_frame_controls(self, entry):
+        if not entry:
+            self.lbl_fluoro_frame_value.setText('-- / --')
+            self._fluoro_frame_box.hide()
+            return
+        frames = entry.get('dicom_frames_u8')
+        if frames is None or frames.shape[0] <= 1:
+            self.lbl_fluoro_frame_value.setText('-- / --')
+            self._fluoro_frame_box.hide()
+            return
+        n_frames = int(frames.shape[0])
+        frame_idx = int(entry.get('frame_index', 0))
+        self.sl_fluoro_frame.blockSignals(True)
+        self.sl_fluoro_frame.setRange(1, n_frames)
+        self.sl_fluoro_frame.setValue(frame_idx + 1)
+        self.sl_fluoro_frame.blockSignals(False)
+        self.lbl_fluoro_frame_value.setText(f'{frame_idx + 1} / {n_frames}')
+        fps = float(entry.get('dicom_meta', {}).get('cine_rate_fps', 0.0) or 0.0)
+        if fps > 0:
+            self.lbl_fluoro_frame_hint.setText(
+                f'Molette sur la fluoroscopie pour changer de frame ({fps:.1f} img/s)')
+        else:
+            self.lbl_fluoro_frame_hint.setText(
+                'Molette sur la fluoroscopie pour changer de frame')
+        self._fluoro_frame_box.show()
+
+    def _on_fluoro_frame_slider(self, value):
+        self._set_fluoro_frame((value or 1) - 1)
+
+    def _step_fluoro_frame(self, steps):
+        entry = None
+        if self._fixed_image_index is not None and self._fixed_image_index < len(self._loaded_images):
+            entry = self._loaded_images[self._fixed_image_index]
+        if not entry:
+            return
+        frames = entry.get('dicom_frames_u8')
+        if frames is None or frames.shape[0] <= 1:
+            return
+        cur = int(entry.get('frame_index', 0))
+        self._set_fluoro_frame(cur + int(steps))
+
+    def _set_fluoro_frame(self, frame_index):
+        if self._fixed_image_index is None or self._fixed_image_index >= len(self._loaded_images):
+            return
+        entry = self._loaded_images[self._fixed_image_index]
+        frames = entry.get('dicom_frames_u8')
+        if frames is None or frames.shape[0] <= 1:
+            return
+        new_idx = max(0, min(int(frame_index), frames.shape[0] - 1))
+        if new_idx == int(entry.get('frame_index', 0)):
+            self._sync_fluoro_frame_controls(entry)
+            return
+
+        entry['frame_index'] = new_idx
+        entry['array'] = frames[new_idx].astype(np.float32) / 255.0
+        if entry.get('dicom_meta') is not None:
+            entry['dicom_meta'] = dict(entry['dicom_meta'])
+            entry['dicom_meta']['frame_used'] = new_idx + 1
+        if entry.get('card'):
+            entry['card'].set_array(entry['array'])
+
+        self._sync_fluoro_frame_controls(entry)
+        if entry.get('role') == 'fixed':
+            self._set_fixed_image(self._fixed_image_index, frame_changed=True)
+
+    def _apply_dicom_meta(self, meta, update_controls=True):
         """Remplit les spinboxes et labels UI depuis un dict de métadonnées."""
-        self.sp_lao.setValue(meta['lao'])
-        self.sp_cran.setValue(meta['cran'])
-        self.sp_table.setValue(meta.get('table_angle', 0.0))
-        self.sp_fov.setValue(float(meta.get('fov_mm', DEFAULT_FOV_MM) or DEFAULT_FOV_MM))
+        if update_controls:
+            self.sp_lao.setValue(meta['lao'])
+            self.sp_cran.setValue(meta['cran'])
+            self.sp_table.setValue(meta.get('table_angle', 0.0))
+            self.sp_fov.setValue(float(meta.get('fov_mm', DEFAULT_FOV_MM) or DEFAULT_FOV_MM))
 
         fov = meta['fov_mm']
+        fps = float(meta.get('cine_rate_fps', 0.0) or 0.0)
+        fps_str = f'\nCadence={fps:.1f} img/s' if fps > 0 else ''
         # Label résumé dans DONNEES
         arm_str = ''
         if meta.get('arm_l') is not None:
@@ -993,6 +1253,7 @@ class MainWindow(QMainWindow):
                f'Mag={meta.get("magnification", 1):.3f}\n'
                f'FOV isoctr={fov:.1f}mm  '
                f'[frame {meta["frame_used"]}/{meta["n_frames"]}]'
+               f'{fps_str}'
                f'{arm_str}')
         self.lbl_fluoro_meta.setText(lbl)
 
@@ -1265,20 +1526,25 @@ class MainWindow(QMainWindow):
     def generate_drr(self):
         if self.ct_path is None: self._err('Charger un CT d\'abord'); return
         self.btn_drr.setEnabled(False)
-        kw=dict(ct_path=self.ct_path, ct_aff=self.ct_aff,
-                lao_deg=self.sp_lao.value(), cran_deg=self.sp_cran.value() + 180,
-                table_angle=self.sp_table.value(),
-                output_size=self.sp_size.value(), masks=self._projection_seg_masks(),
-                fov_mm=self.sp_fov.value(),
+        kw = dict(
+            ct_path=self.ct_path,
+            ct_aff=self.ct_aff,
+            lao_deg=self.sp_lao.value(),
+            cran_deg=self.sp_cran.value() + 180,
+            table_angle=self.sp_table.value(),
+            output_size=self.sp_size.value(),
+            masks=self._projection_seg_masks(),
+            fov_mm=self.sp_fov.value(),
             sid_mm=self.dicom_meta.get('sid_mm', 1020.0),
             sod_mm=self.dicom_meta.get('sod_mm', 510.0),
-                renderer='siddon')
+            renderer='siddon',
+        )
         self.worker=WorkerThread('drr',kw)
         self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
         self.worker.error.connect(self._on_err); self.worker.start()
 
     def _drr_done(self,res):
-        self.drr_image=res['drr']; self.proj_masks=res.get('masks',{})
+        self.drr_image=res['drr']; self._set_drr_base_image(self.drr_image); self.proj_masks=res.get('masks',{})
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
         self._update_checklist()
@@ -1529,6 +1795,7 @@ class MainWindow(QMainWindow):
 
             # Injecter le DRR dans l'UI dès maintenant
             self.drr_image = res['drr_image']
+            self._set_drr_base_image(self.drr_image)
             self.proj_masks = res.get('all_proj_masks', {})
             self.cv_drr.set_image(self.drr_image)
             self.tabs.setTabText(1, 'DRR')
@@ -1577,6 +1844,7 @@ class MainWindow(QMainWindow):
 
         # Injecter le DRR généré dans l'UI
         self.drr_image = res['drr_image']
+        self._set_drr_base_image(self.drr_image)
         self.proj_masks = res.get('proj_masks', {})
         self.cv_drr.set_image(self.drr_image)
         self.tabs.setTabText(1, 'DRR')
@@ -1742,6 +2010,7 @@ class MainWindow(QMainWindow):
         self.sp_fov.setValue(it['fov'])
         self.sp_size.setValue(it['size'])
         self.drr_image = it['drr_image']
+        self._set_drr_base_image(self.drr_image)
         self.proj_masks = it['proj_masks']
         if self.drr_image is not None:
             self.cv_drr.set_image(self.drr_image)

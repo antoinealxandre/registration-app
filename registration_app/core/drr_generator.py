@@ -20,6 +20,185 @@ from scipy.ndimage import rotate as _ndrot
 _DEVICE = None
 _NANODRR_BONE_GAIN = 2.4
 
+DRR_POSTPROCESS_PRESETS = {
+    'balanced': {
+        'robust_lo': 0.3,
+        'robust_hi': 99.7,
+        'flip_horizontal': True,
+        'soft_tissue_suppression': 0.50,
+        'soft_tissue_sigma': 6.0,
+        'intensity_lift': 0.22,
+        'bone_boost': 0.85,
+        'bone_threshold': 0.45,
+        'gradient_boost': 0.80,
+        'detail_sigma': 1.25,
+        'gamma': 0.78,
+        'clahe_enabled': True,
+        'clahe_clip': 2.8,
+        'clahe_tile': 8,
+        'tophat_enabled': True,
+        'tophat_kernel': 17,
+        'tophat_strength': 0.55,
+        'unsharp_amount': 0.45,
+        'unsharp_sigma': 1.0,
+    },
+    'bone': {
+        'robust_lo': 0.2,
+        'robust_hi': 99.8,
+        'flip_horizontal': True,
+        'soft_tissue_suppression': 0.62,
+        'soft_tissue_sigma': 6.5,
+        'intensity_lift': 0.20,
+        'bone_boost': 1.10,
+        'bone_threshold': 0.42,
+        'gradient_boost': 1.10,
+        'detail_sigma': 1.10,
+        'gamma': 0.72,
+        'clahe_enabled': True,
+        'clahe_clip': 3.2,
+        'clahe_tile': 8,
+        'tophat_enabled': True,
+        'tophat_kernel': 19,
+        'tophat_strength': 0.70,
+        'unsharp_amount': 0.55,
+        'unsharp_sigma': 1.0,
+    },
+    'soft': {
+        'robust_lo': 0.5,
+        'robust_hi': 99.5,
+        'flip_horizontal': True,
+        'soft_tissue_suppression': 0.28,
+        'soft_tissue_sigma': 5.5,
+        'intensity_lift': 0.18,
+        'bone_boost': 0.45,
+        'bone_threshold': 0.48,
+        'gradient_boost': 0.35,
+        'detail_sigma': 1.40,
+        'gamma': 0.90,
+        'clahe_enabled': True,
+        'clahe_clip': 2.0,
+        'clahe_tile': 8,
+        'tophat_enabled': True,
+        'tophat_kernel': 13,
+        'tophat_strength': 0.20,
+        'unsharp_amount': 0.22,
+        'unsharp_sigma': 1.1,
+    },
+}
+
+
+def get_drr_postprocess_preset(name: str = 'balanced') -> dict:
+    preset = DRR_POSTPROCESS_PRESETS.get(name, DRR_POSTPROCESS_PRESETS['balanced'])
+    return dict(preset)
+
+
+def _resolve_postprocess_kw(postprocess_kw: dict = None) -> dict:
+    params = get_drr_postprocess_preset('balanced')
+    if postprocess_kw:
+        for key, value in postprocess_kw.items():
+            if value is not None:
+                params[key] = value
+    return params
+
+
+def enhance_drr_image(img_np: np.ndarray, filter_kw: dict = None) -> np.ndarray:
+    """
+    Apply optional 2D enhancement on an already generated DRR image.
+
+    This is intentionally separate from the projection step so users can keep
+    the previous DRR generation and experiment with filters afterward.
+    """
+    params = _resolve_postprocess_kw(filter_kw)
+
+    def _gradient_map(arr: np.ndarray) -> np.ndarray:
+        gx = cv2.Sobel(arr, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(arr, cv2.CV_32F, 0, 1, ksize=3)
+        grad = cv2.magnitude(gx, gy)
+        scale = np.percentile(grad, 99.5)
+        if scale > 1e-6:
+            grad = np.clip(grad / scale, 0.0, 1.0)
+        else:
+            grad = np.zeros_like(arr, dtype=np.float32)
+        return grad.astype(np.float32)
+
+    def _scaled_odd_kernel(base_size: int, ref_side: int) -> int:
+        side = max(int(ref_side), 32)
+        scaled = int(round(float(base_size) * side / 512.0))
+        if scaled < 3:
+            scaled = 3
+        if scaled % 2 == 0:
+            scaled += 1
+        return scaled
+
+    img = img_np.astype(np.float32)
+    if img.size == 0:
+        return img
+    if img.max() > 1.0:
+        img = np.clip(img / 255.0, 0.0, 1.0)
+    else:
+        img = np.clip(img, 0.0, 1.0)
+
+    soft_weight = max(0.0, float(params.get('soft_tissue_suppression', 0.0)))
+    if soft_weight > 1e-4:
+        sigma = max(0.4, float(params.get('soft_tissue_sigma', 6.0)) * 0.55)
+        low = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        img = np.clip(img - 0.18 * soft_weight * low + 0.08 * soft_weight, 0.0, 1.0)
+
+    bone_boost = max(0.0, float(params.get('bone_boost', 0.0)))
+    if bone_boost > 1e-4:
+        threshold = np.clip(float(params.get('bone_threshold', 0.45)), 0.05, 0.95)
+        dense = np.clip((img - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+        img = np.clip(img + 0.14 * bone_boost * np.power(dense, 1.1), 0.0, 1.0)
+
+    grad_boost = max(0.0, float(params.get('gradient_boost', 0.0)))
+    if grad_boost > 1e-4:
+        sigma = max(0.35, float(params.get('detail_sigma', 1.25)))
+        detail = img - cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        detail = np.clip(detail, 0.0, None)
+        scale = np.percentile(detail, 99.5)
+        if scale > 1e-6:
+            detail = np.clip(detail / scale, 0.0, 1.0)
+        else:
+            detail = np.zeros_like(img, dtype=np.float32)
+        edge = np.maximum(_gradient_map(img), detail.astype(np.float32))
+        img = np.clip(img + 0.16 * grad_boost * edge, 0.0, 1.0)
+
+    gamma = max(0.2, float(params.get('gamma', 1.0)))
+    if abs(gamma - 1.0) > 1e-4:
+        img = np.power(img, gamma)
+
+    img_u8 = np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    if params.get('clahe_enabled', True):
+        tile = max(2, int(params.get('clahe_tile', 8)))
+        clahe = cv2.createCLAHE(
+            clipLimit=max(0.1, float(params.get('clahe_clip', 2.8))),
+            tileGridSize=(tile, tile),
+        )
+        img_u8 = clahe.apply(img_u8)
+
+    if params.get('tophat_enabled', True) and grad_boost > 1e-4:
+        kernel_size = _scaled_odd_kernel(
+            int(params.get('tophat_kernel', 17)),
+            max(img_u8.shape[:2]),
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        tophat = cv2.morphologyEx(img_u8, cv2.MORPH_TOPHAT, kernel)
+        strength = 0.45 * max(0.0, float(params.get('tophat_strength', 0.0)))
+        if strength > 1e-4:
+            img_u8 = cv2.addWeighted(img_u8, 1.0, tophat, strength, 0)
+
+    unsharp = 0.65 * max(0.0, float(params.get('unsharp_amount', 0.0)))
+    if unsharp > 1e-4:
+        sigma = max(0.2, float(params.get('unsharp_sigma', 1.0)))
+        blur = cv2.GaussianBlur(img_u8, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        img_u8 = cv2.addWeighted(img_u8, 1.0 + unsharp, blur, -unsharp, 0)
+
+    return np.clip(img_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+
 # ── nanoDRR (preferred) ──────────────────────────────────────────────────────
 try:
     import torch
@@ -92,6 +271,7 @@ def generate_drr(
     fov_mm: float = None,
     renderer: str = "siddon",
     progress_cb=None,
+    postprocess_kw: dict = None,
 ) -> np.ndarray:
     """
     Génère un DRR.
@@ -111,13 +291,14 @@ def generate_drr(
     """
     if renderer == "cpu":
         return _generate_drr_cpu(
-            ct_path, lao_deg, cran_deg, table_angle, output_size, progress_cb)
+            ct_path, lao_deg, cran_deg, table_angle, output_size, progress_cb,
+            postprocess_kw)
 
     # ── nanoDRR (preferred GPU backend) ───────────────────────────────────
     if HAS_NANODRR and renderer != "trilinear":
         return _generate_drr_nanodrr(
             ct_path, lao_deg, cran_deg, table_angle,
-            output_size, sid_mm, sod_mm, fov_mm, progress_cb)
+            output_size, sid_mm, sod_mm, fov_mm, progress_cb, postprocess_kw)
 
     # ── DiffDRR fallback ──────────────────────────────────────────────────
     if HAS_DIFFDRR:
@@ -125,7 +306,7 @@ def generate_drr(
             ct_path, lao_deg, cran_deg, table_angle,
             output_size, sid_mm, sod_mm, fov_mm,
             renderer if renderer in ("siddon", "trilinear") else "siddon",
-            progress_cb)
+            progress_cb, postprocess_kw)
 
     raise RuntimeError(
         'Aucun backend GPU disponible — installez nanodrr ou diffdrr')
@@ -137,7 +318,7 @@ def generate_drr(
 
 def _generate_drr_nanodrr(
     ct_path, lao_deg, cran_deg, table_angle,
-    output_size, sid_mm, sod_mm, fov_mm, progress_cb,
+    output_size, sid_mm, sod_mm, fov_mm, progress_cb, postprocess_kw,
 ):
     if progress_cb:
         progress_cb(5, 'Chargement CT (nanoDRR)…')
@@ -182,7 +363,7 @@ def _generate_drr_nanodrr(
     if progress_cb:
         progress_cb(70, 'Post-traitement…')
 
-    return _postprocess(img_np)
+    return _postprocess(img_np, postprocess_kw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,7 +372,7 @@ def _generate_drr_nanodrr(
 
 def _generate_drr_diffdrr(
     ct_path, lao_deg, cran_deg, table_angle,
-    output_size, sid_mm, sod_mm, fov_mm, renderer, progress_cb,
+    output_size, sid_mm, sod_mm, fov_mm, renderer, progress_cb, postprocess_kw,
 ):
     if progress_cb:
         progress_cb(5, f'Chargement CT (DiffDRR {renderer})…')
@@ -227,7 +408,7 @@ def _generate_drr_diffdrr(
     if progress_cb:
         progress_cb(70, 'Post-traitement…')
 
-    return _postprocess(img_np)
+    return _postprocess(img_np, postprocess_kw)
 
 
 def project_mask_3d(
@@ -312,7 +493,8 @@ def project_mask_3d(
 
 def create_fast_generator(ct_path: str, output_size: int = 256,
                           sid_mm: float = 1020.0, sod_mm: float = 510.0,
-                          fov_mm: float = None, table_angle: float = 0.0):
+                          fov_mm: float = None, table_angle: float = 0.0,
+                          postprocess_kw: dict = None):
     """
     Retourne un callable ``gen(lao_deg, cran_deg) -> float32 [0,1]``
     qui génère un DRR *sans* recharger le CT à chaque appel.
@@ -351,7 +533,10 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
                 img_t = _nanodrr_render(
                     subject, k_inv, rt_inv, sdd_t,
                     output_size, output_size)
-            return _postprocess(img_t.sum(dim=1).squeeze(0).cpu().numpy())
+            return _postprocess(
+                img_t.sum(dim=1).squeeze(0).cpu().numpy(),
+                postprocess_kw,
+            )
 
         return _gen_nano
 
@@ -374,7 +559,7 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
                 img_t = drr_module(rot, tra,
                                    parameterization="euler_angles",
                                    convention="ZXY", degrees=True)
-            return _postprocess(img_t.squeeze().cpu().numpy())
+            return _postprocess(img_t.squeeze().cpu().numpy(), postprocess_kw)
 
         return _gen_diffdrr
 
@@ -390,6 +575,7 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
             sod_mm=sod_mm,
             fov_mm=fov_mm,
             renderer="cpu",
+            postprocess_kw=postprocess_kw,
         )
 
     return _gen_cpu
@@ -399,7 +585,110 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
 # Helpers internes
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _postprocess(img_np: np.ndarray) -> np.ndarray:
+def _postprocess(img_np: np.ndarray, postprocess_kw: dict = None) -> np.ndarray:
+    """
+    Post-traitement orienté lisibilité anatomique osseuse (float32 [0, 1]).
+
+    Le pipeline peut être modulé par preset ou par paramètres unitaires afin
+    d'accentuer davantage les vertèbres sans imposer un rendu unique.
+    """
+    if postprocess_kw is None:
+        return _postprocess_legacy(img_np)
+
+    params = _resolve_postprocess_kw(postprocess_kw)
+
+    def _robust_norm(arr: np.ndarray, lo_pct: float, hi_pct: float) -> np.ndarray:
+        lo, hi = np.percentile(arr, (lo_pct, hi_pct))
+        if hi > lo:
+            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+        return np.zeros_like(arr, dtype=np.float32)
+
+    def _scaled_odd_kernel(base_size: int, ref_side: int) -> int:
+        side = max(int(ref_side), 32)
+        scaled = int(round(float(base_size) * side / 512.0))
+        if scaled < 3:
+            scaled = 3
+        if scaled % 2 == 0:
+            scaled += 1
+        return scaled
+
+    def _gradient_map(arr: np.ndarray) -> np.ndarray:
+        gx = cv2.Sobel(arr, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(arr, cv2.CV_32F, 0, 1, ksize=3)
+        grad = cv2.magnitude(gx, gy)
+        scale = np.percentile(grad, 99.5)
+        if scale > 1e-6:
+            grad = np.clip(grad / scale, 0.0, 1.0)
+        else:
+            grad = np.zeros_like(arr, dtype=np.float32)
+        return grad.astype(np.float32)
+
+    img = np.log1p(np.clip(img_np, 0, None)).astype(np.float32)
+    img = _robust_norm(img, params['robust_lo'], params['robust_hi'])
+
+    if params.get('flip_horizontal', True):
+        img = np.fliplr(img)
+
+    soft_weight = max(0.0, float(params.get('soft_tissue_suppression', 0.0)))
+    if soft_weight > 1e-4:
+        sigma = max(0.5, float(params.get('soft_tissue_sigma', 6.0)))
+        low = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        lift = float(params.get('intensity_lift', 0.20))
+        img = np.clip(img - soft_weight * low + lift, 0.0, 1.0)
+
+    bone_boost = max(0.0, float(params.get('bone_boost', 0.0)))
+    if bone_boost > 1e-4:
+        threshold = np.clip(float(params.get('bone_threshold', 0.45)), 0.05, 0.95)
+        dense = np.clip((img - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+        img = np.clip(img + 0.35 * bone_boost * np.power(dense, 1.15), 0.0, 1.0)
+
+    grad_boost = max(0.0, float(params.get('gradient_boost', 0.0)))
+    if grad_boost > 1e-4:
+        sigma = max(0.35, float(params.get('detail_sigma', 1.25)))
+        high_pass = img - cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        high_pass = _robust_norm(np.clip(high_pass, 0.0, None), 5.0, 99.5)
+        grad = _gradient_map(img)
+        edge = np.maximum(grad, high_pass)
+        img = np.clip(img + 0.22 * grad_boost * edge, 0.0, 1.0)
+
+    gamma = max(0.2, float(params.get('gamma', 1.0)))
+    if abs(gamma - 1.0) > 1e-4:
+        img = np.power(img, gamma)
+
+    img_u8 = np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    if params.get('clahe_enabled', True):
+        tile = max(2, int(params.get('clahe_tile', 8)))
+        clahe = cv2.createCLAHE(
+            clipLimit=max(0.1, float(params.get('clahe_clip', 2.8))),
+            tileGridSize=(tile, tile),
+        )
+        img_u8 = clahe.apply(img_u8)
+
+    if params.get('tophat_enabled', True):
+        kernel_size = _scaled_odd_kernel(
+            int(params.get('tophat_kernel', 17)),
+            max(img_u8.shape[:2]),
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        tophat = cv2.morphologyEx(img_u8, cv2.MORPH_TOPHAT, kernel)
+        strength = max(0.0, float(params.get('tophat_strength', 0.0)))
+        if strength > 1e-4:
+            img_u8 = cv2.addWeighted(img_u8, 1.0, tophat, strength, 0)
+
+    unsharp = max(0.0, float(params.get('unsharp_amount', 0.0)))
+    if unsharp > 1e-4:
+        sigma = max(0.2, float(params.get('unsharp_sigma', 1.0)))
+        blur = cv2.GaussianBlur(img_u8, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        img_u8 = cv2.addWeighted(img_u8, 1.0 + unsharp, blur, -unsharp, 0)
+
+    return np.clip(img_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+
+
+def _postprocess_legacy(img_np: np.ndarray) -> np.ndarray:
     """
     Post-traitement orienté lisibilité anatomique osseuse (float32 [0, 1]).
 
@@ -465,6 +754,7 @@ def _generate_drr_cpu(
     table_angle: float = 0.0,
     output_size: int = 256,
     progress_cb=None,
+    postprocess_kw: dict = None,
 ) -> np.ndarray:
     """
     Projection CPU ray-sum (scipy.ndimage) — pas besoin de DiffDRR/GPU.
@@ -507,4 +797,4 @@ def _generate_drr_cpu(
     if progress_cb:
         progress_cb(85, 'Post-traitement CPU…')
 
-    return _postprocess(proj)
+    return _postprocess(proj, postprocess_kw)

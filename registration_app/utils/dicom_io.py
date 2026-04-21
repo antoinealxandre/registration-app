@@ -13,31 +13,85 @@ except ImportError:  # pragma: no cover - optional dependency
 from ui.theme import DEFAULT_FOV_MM
 
 
-def read_dicom_fluoro(path: str):
-    """
-    Read fluoroscopy DICOM (single or multi-frame) and extract C-arm geometry.
+def _frame_to_gray_float(frame: np.ndarray) -> np.ndarray:
+    """Return a grayscale float32 view of a DICOM frame."""
+    arr = np.asarray(frame)
+    if arr.ndim == 2:
+        return arr.astype(np.float32)
+    if arr.ndim == 3:
+        if arr.shape[-1] == 1:
+            return arr[..., 0].astype(np.float32)
+        if arr.shape[-1] >= 3:
+            rgb = arr[..., :3].astype(np.float32)
+            return (0.299 * rgb[..., 0]
+                    + 0.587 * rgb[..., 1]
+                    + 0.114 * rgb[..., 2]).astype(np.float32)
+        return arr.mean(axis=-1).astype(np.float32)
+    raise ValueError(f'Frame DICOM invalide (ndim={arr.ndim})')
 
-    Returns (img_uint8, meta) where meta contains geometry and acquisition fields.
+
+def _normalize_dicom_frame(frame: np.ndarray, photometric: str = 'MONOCHROME2') -> np.ndarray:
+    """Normalize one fluoroscopy frame to uint8 for display/annotation."""
+    gray = _frame_to_gray_float(frame)
+    finite = np.isfinite(gray)
+    if not np.any(finite):
+        return np.zeros(gray.shape[:2], dtype=np.uint8)
+
+    values = gray[finite]
+    lo, hi = np.percentile(values, (0.5, 99.7))
+    if hi <= lo:
+        lo = float(values.min())
+        hi = float(values.max())
+
+    if hi > lo:
+        gray = np.clip((gray - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        gray = np.zeros_like(gray, dtype=np.float32)
+
+    if str(photometric).upper() == 'MONOCHROME1':
+        gray = 1.0 - gray
+
+    return np.clip(gray * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def read_dicom_fluoro_series(path: str):
+    """
+    Read a fluoroscopy DICOM series and return normalized uint8 frames + metadata.
+
+    Returns:
+      {
+        'frames_u8': uint8 array shaped (N, H, W),
+        'meta': compatible metadata dict,
+      }
     """
     if pydicom is None:
         raise RuntimeError('pydicom non disponible — installez-le : pip install pydicom')
 
     ds = pydicom.dcmread(path)
     arr = ds.pixel_array
+    samples_per_pixel = int(getattr(ds, 'SamplesPerPixel', 1) or 1)
+    photometric = str(getattr(ds, 'PhotometricInterpretation', 'MONOCHROME2') or 'MONOCHROME2')
 
-    if arr.ndim == 3:
-        n_frames = arr.shape[0]
-        rep = int(getattr(ds, 'RepresentativeFrameNumber', (n_frames + 1) // 2))
-        frame_idx = max(0, min(rep - 1, n_frames - 1))
-        frame = arr[frame_idx].astype(np.float32)
+    if arr.ndim == 2:
+        frame_list = [arr]
+    elif arr.ndim == 3 and samples_per_pixel > 1 and arr.shape[-1] in (3, 4):
+        frame_list = [arr]
+    elif arr.ndim == 3:
+        frame_list = [arr[i] for i in range(arr.shape[0])]
+    elif arr.ndim == 4:
+        frame_list = [arr[i] for i in range(arr.shape[0])]
     else:
-        n_frames, frame_idx = 1, 0
-        frame = arr.astype(np.float32)
+        raise ValueError(f'Format DICOM non pris en charge (shape={arr.shape})')
 
-    fmin, fmax = frame.min(), frame.max()
-    if fmax > fmin:
-        frame = (frame - fmin) / (fmax - fmin)
-    img_uint8 = (frame * 255).astype(np.uint8)
+    frames_u8 = np.stack(
+        [_normalize_dicom_frame(frame, photometric=photometric) for frame in frame_list],
+        axis=0,
+    )
+
+    n_frames = int(frames_u8.shape[0])
+    rep = int(getattr(ds, 'RepresentativeFrameNumber', (n_frames + 1) // 2))
+    frame_idx = max(0, min(rep - 1, n_frames - 1))
+    img_uint8 = frames_u8[frame_idx]
 
     def _get(tag, default):
         val = getattr(ds, tag, None)
@@ -99,7 +153,6 @@ def read_dicom_fluoro(path: str):
 
     rows = int(getattr(ds, 'Rows', img_uint8.shape[0]))
     cols = int(getattr(ds, 'Columns', img_uint8.shape[1]))
-    fov_dim = _get_multi('FieldOfViewDimensions')
     
     # Check GE private zoom
     zoom_factor = _get_private(0x0019, 0x1018, 1.0)
@@ -155,6 +208,10 @@ def read_dicom_fluoro(path: str):
 
     manufacturer = _get_str('Manufacturer', '')
     model = _get_str('ManufacturerModelName', '')
+    frame_time_ms = _get_float('FrameTime', 0.0)
+    cine_rate_fps = _get_float('CineRate', _get_float('RecommendedDisplayFrameRate', 0.0))
+    if (cine_rate_fps <= 0) and frame_time_ms > 0:
+        cine_rate_fps = 1000.0 / frame_time_ms
 
     meta = dict(
         lao=lao,
@@ -179,10 +236,27 @@ def read_dicom_fluoro(path: str):
         cols=cols,
         n_frames=n_frames,
         frame_used=frame_idx + 1,
+        frame_time_ms=frame_time_ms,
+        cine_rate_fps=cine_rate_fps,
         manufacturer=manufacturer,
         model=model,
     )
-    return img_uint8, meta
+    return {'frames_u8': frames_u8, 'meta': meta}
+
+
+def read_dicom_fluoro(path: str, frame_index: int = None):
+    """
+    Read one fluoroscopy frame and extract C-arm geometry.
+
+    Returns (img_uint8, meta) where meta contains geometry and acquisition fields.
+    """
+    series = read_dicom_fluoro_series(path)
+    frames_u8 = series['frames_u8']
+    meta = dict(series['meta'])
+    idx = int(meta.get('frame_used', 1)) - 1 if frame_index is None else int(frame_index)
+    idx = max(0, min(idx, frames_u8.shape[0] - 1))
+    meta['frame_used'] = idx + 1
+    return frames_u8[idx], meta
 
 
 def read_metadata_csv(path: str):

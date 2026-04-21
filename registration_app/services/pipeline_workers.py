@@ -136,6 +136,7 @@ class WorkerThread(QThread):
             fov_mm=self.kw.get('fov_mm'),
             renderer=renderer,
             progress_cb=pcb,
+            postprocess_kw=self.kw.get('postprocess_kw'),
         )
         pcb(80, 'Projection segmentations...')
         masks_out = {}
@@ -208,6 +209,7 @@ class WorkerThread(QThread):
             ct_path=ct_path,
             renderer='siddon',
             progress_cb=lambda p, m: self.progress.emit(5 + int(p * 0.18), m),
+            postprocess_kw=kw.get('postprocess_kw'),
             **geom_kw,
         )
 
