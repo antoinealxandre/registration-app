@@ -283,6 +283,7 @@ ROLE_LABELS = {None: '', 'fixed': 'FIXE', 'mobile': 'MOBILE'}
 
 class ImageCard(QWidget):
     role_changed = pyqtSignal(int, str)   # index, role ('fixed'/'mobile'/'')
+    remove_requested = pyqtSignal(int)    # index
 
     def __init__(self, index, name, array, parent=None):
         super().__init__(parent)
@@ -321,7 +322,21 @@ class ImageCard(QWidget):
         name_lbl = QLabel(short)
         name_lbl.setObjectName('mid')
         name_lbl.setWordWrap(False)
-        vr.addWidget(name_lbl)
+
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        header.setContentsMargins(0, 0, 0, 0)
+        self._btn_remove = QPushButton('Retirer')
+        self._btn_remove.setFixedHeight(22)
+        self._btn_remove.setStyleSheet(
+            f'QPushButton{{font-size:10px;padding:2px 8px;border-radius:4px;'
+            f'background:#2a0c10;border:1px solid {ERR};color:{ERR};min-height:20px;}}'
+            f'QPushButton:hover{{background:#3a1117;border-color:#ff7a87;color:#ff7a87;}}'
+        )
+        self._btn_remove.clicked.connect(lambda: self.remove_requested.emit(self.index))
+        header.addWidget(name_lbl, 1)
+        header.addWidget(self._btn_remove)
+        vr.addLayout(header)
 
         # Role buttons
         br = QHBoxLayout()
@@ -2389,8 +2404,8 @@ def read_dicom_fluoro(path: str):
             return default
 
     # ── Angles positionneur ──────────────────────────────────────────────────
-    lao  = _get('PositionerPrimaryAngle',   0.0)
-    cran = _get('PositionerSecondaryAngle', 0.0)
+    cran = _get('PositionerPrimaryAngle',   0.0)
+    lao  = _get('PositionerSecondaryAngle', 0.0)
 
     # ── Distances et grossissement ───────────────────────────────────────────
     sid  = _get('DistanceSourceToDetector', 1020.0)
@@ -2516,8 +2531,8 @@ def read_metadata_csv(path: str):
         except Exception:
             return None
 
-    lao  = _f('PositionerPrimaryAngle', 0.0)
-    cran = _f('PositionerSecondaryAngle', 0.0)
+    cran = _f('PositionerPrimaryAngle', 0.0)
+    lao  = _f('PositionerSecondaryAngle', 0.0)
     sid  = _f('DistanceSourceToDetector', 1020.0)
     sod  = _f('DistanceSourceToPatient', 510.0)
     mag  = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
@@ -2702,6 +2717,11 @@ class MainWindow(QMainWindow):
         self.lbl_no_images = QLabel('Aucune image chargee')
         self.lbl_no_images.setObjectName('dim')
         self._sec_images.addWidget(self.lbl_no_images)
+        self.btn_clear_images = QPushButton('Retirer toutes les images')
+        self.btn_clear_images.setObjectName('danger')
+        self.btn_clear_images.setEnabled(False)
+        self.btn_clear_images.clicked.connect(self._remove_all_images)
+        self._sec_images.addWidget(self.btn_clear_images)
         self._images_container = QWidget()
         self._images_container.setStyleSheet('background:transparent;')
         self._images_vbox = QVBoxLayout(self._images_container)
@@ -3171,6 +3191,44 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             self._err(str(ex))
 
+    def _blank_canvas_image(self):
+        s = int(self.sp_size.value()) if hasattr(self, 'sp_size') else 512
+        return np.zeros((s, s), np.float32)
+
+    def _clear_fixed_assignment(self):
+        self.fluoro_image = None
+        self.dicom_meta = {}
+        self.lbl_fluoro_meta.setText('Fluoro : --')
+        self.cv_fl.set_image(self._blank_canvas_image())
+        self._yolo_det_fl = None
+
+    def _clear_mobile_assignment(self):
+        self.drr_image = None
+        self.proj_masks = {}
+        self.cv_drr.set_image(self._blank_canvas_image())
+        self.tabs.setTabText(1, 'Mobile')
+        self._yolo_det_drr = None
+
+    def _clear_registration_result(self):
+        self.result = None
+        self.lbl_iou.setText('--')
+        self.lbl_iou.setStyleSheet(f'font-size:22px;font-weight:700;color:{ACCENT2};')
+        self.lbl_dice.setText('--')
+        self.lbl_dice.setStyleSheet(f'font-size:22px;font-weight:700;color:{ACCENT2};')
+        self.lbl_tx.setText('tx : --')
+        self.lbl_ty.setText('ty : --')
+        self.lbl_rot.setText('rot : --')
+        self.lbl_scale.setText('scale : --')
+
+    def _refresh_loaded_images_ui(self):
+        has_images = bool(self._loaded_images)
+        self.lbl_no_images.setVisible(not has_images)
+        self.btn_clear_images.setEnabled(has_images)
+        for i, entry in enumerate(self._loaded_images):
+            card = entry.get('card')
+            if card is not None:
+                card.index = i
+
     def _add_image(self, path):
         name = os.path.basename(path)
         for entry in self._loaded_images:
@@ -3198,34 +3256,94 @@ class MainWindow(QMainWindow):
         entry = {'path': path, 'name': name, 'array': img_float, 'role': None, 'card': None,
                  'dicom_meta': dicom_meta}
         self._loaded_images.append(entry)
-        self.lbl_no_images.hide()
         card = ImageCard(idx, name, img_float)
         card.role_changed.connect(self._assign_image)
+        card.remove_requested.connect(self._remove_image)
         entry['card'] = card
         self._images_vbox.addWidget(card)
+        self._refresh_loaded_images_ui()
         if idx == 0:
             card.set_role_external('fixed')
             self._assign_image(idx, 'fixed')
 
+    def _remove_image(self, index, quiet=False):
+        if index < 0 or index >= len(self._loaded_images):
+            return
+        entry = self._loaded_images.pop(index)
+        card = entry.get('card')
+        if card is not None:
+            self._images_vbox.removeWidget(card)
+            card.deleteLater()
+
+        removed_role = entry.get('role')
+        if removed_role == 'fixed':
+            self._clear_fixed_assignment()
+            self._clear_registration_result()
+        if removed_role == 'mobile':
+            self._clear_mobile_assignment()
+            self._clear_registration_result()
+
+        self._refresh_loaded_images_ui()
+        self._update_checklist()
+        self._on_mask_upd()
+        if not quiet:
+            self._status(f'Image retiree : {entry.get("name", "")}'.strip())
+
+    def _remove_all_images(self):
+        if not self._loaded_images:
+            return
+        ans = QMessageBox.question(
+            self,
+            'Retirer toutes les images',
+            'Supprimer toutes les images chargees ?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        while self._loaded_images:
+            self._remove_image(len(self._loaded_images) - 1, quiet=True)
+
+        self._clear_fixed_assignment()
+        self._clear_mobile_assignment()
+        self._clear_registration_result()
+        self._refresh_loaded_images_ui()
+        self._update_checklist()
+        self._on_mask_upd()
+        self._status('Toutes les images ont ete retirees')
+
     def _assign_image(self, index, role):
         if index >= len(self._loaded_images):
             return
+        entry = self._loaded_images[index]
+        prev_role = entry.get('role')
+
         if role:
             for i, e in enumerate(self._loaded_images):
                 if i != index and e['role'] == role:
                     e['role'] = None
                     if e['card']:
                         e['card'].set_role_external(None)
-        self._loaded_images[index]['role'] = role or None
-        img = self._loaded_images[index]['array']
-        name = self._loaded_images[index]['name']
+
+        entry['role'] = role or None
+        img = entry['array']
+        name = entry['name']
+
+        if prev_role == 'fixed' and role != 'fixed':
+            self._clear_fixed_assignment()
+            self._clear_registration_result()
+        if prev_role == 'mobile' and role != 'mobile':
+            self._clear_mobile_assignment()
+            self._clear_registration_result()
+
         if role == 'fixed':
             self.fluoro_image = img           # résolution native conservée
             self.cv_fl.set_image(img)
             self.tabs.setCurrentIndex(0)
-            self._update_checklist()
+            self._yolo_det_fl = None
             # Auto-remplir les paramètres DRR depuis les métadonnées DICOM
-            meta = self._loaded_images[index].get('dicom_meta')
+            meta = entry.get('dicom_meta')
             if meta:
                 self.dicom_meta = meta
                 self._apply_dicom_meta(meta)
@@ -3242,7 +3360,13 @@ class MainWindow(QMainWindow):
             self.cv_drr.set_image(img)
             self.tabs.setTabText(1, 'Mobile')
             self.tabs.setCurrentIndex(1)
+            self._yolo_det_drr = None
             self._status(f'Image mobile : {name}')
+        elif prev_role and not role:
+            self._status(f'Image desassignee : {name}')
+
+        self._update_checklist()
+        self._on_mask_upd()
 
     def _apply_dicom_meta(self, meta):
         """Remplit les spinboxes et labels UI depuis un dict de métadonnées."""
