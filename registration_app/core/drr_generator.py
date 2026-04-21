@@ -18,6 +18,7 @@ import cv2
 from scipy.ndimage import rotate as _ndrot
 
 _DEVICE = None
+_NANODRR_BONE_GAIN = 2.4
 
 # ── nanoDRR (preferred) ──────────────────────────────────────────────────────
 try:
@@ -141,10 +142,10 @@ def _generate_drr_nanodrr(
     if progress_cb:
         progress_cb(5, 'Chargement CT (nanoDRR)…')
 
-    # mu_bone augmenté (×2) pour renforcer le contraste osseux
+    # mu_bone augmenté pour renforcer le contraste osseux
     from nanodrr.data.preprocess import MU_BONE
     subject = _NanoSubject.from_filepath(
-        ct_path, mu_bone=MU_BONE * 2.0,
+        ct_path, mu_bone=MU_BONE * _NANODRR_BONE_GAIN,
     ).to(_DEVICE)
 
     delx = _compute_delx(fov_mm, sid_mm, sod_mm, output_size)
@@ -327,7 +328,7 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
     if HAS_NANODRR:
         from nanodrr.data.preprocess import MU_BONE
         subject = _NanoSubject.from_filepath(
-            ct_path, mu_bone=MU_BONE * 2.0,
+            ct_path, mu_bone=MU_BONE * _NANODRR_BONE_GAIN,
         ).to(_DEVICE)
         k_inv = _make_k_inv(
             sdd=sid_mm, delx=delx, dely=delx,
@@ -400,45 +401,59 @@ def create_fast_generator(ct_path: str, output_size: int = 256,
 
 def _postprocess(img_np: np.ndarray) -> np.ndarray:
     """
-    Post-traitement réaliste du DRR brut → float32 [0, 1] aspect radio.
+    Post-traitement orienté lisibilité anatomique osseuse (float32 [0, 1]).
+
+    Objectifs :
+      - renforcer les contours osseux,
+      - atténuer les structures molles étendues (ex. aorte),
+      - conserver une image nette sans lissage global excessif.
 
     Pipeline :
-      1. Log-transform (loi de Beer-Lambert) — compresse la dynamique,
-         réduit la surbrillance de l'aorte et des zones denses.
-      2. Normalisation robuste (percentiles serrés p0.5/p99.5).
-      3. Inversion — os clairs sur fond sombre (convention radio positive).
-      4. Gamma correction (γ = 0.6) — réhausse le contraste dans les tons moyens.
-      5. CLAHE adapté médical — fait ressortir les vertèbres.
-      6. Unsharp-mask léger — netteté des contours osseux.
+      1. Compression dynamique logarithmique.
+      2. Normalisation robuste (p0.3/p99.7).
+      3. Flip horizontal (cohérence C-arm PA / fluoro).
+      4. Suppression des composantes basses fréquences (tissus mous lisses).
+      5. Accentuation des structures denses + gamma modéré.
+      6. CLAHE local + top-hat morphologique pour contours osseux.
+      7. Unsharp-mask final pour une image plus nette.
     """
-    # 1. Log-transform : line-integral → "épaisseur d'atténuation" logarithmique
-    #    eps évite log(0) ; log1p = log(1 + x) compresse naturellement les hautes valeurs
+
+    # 1. Compression dynamique (line-integral -> échelle logarithmique)
     img = np.log1p(np.clip(img_np, 0, None))
 
-    # 2. Normalisation robuste — écrêtage des outliers (metal, bord CT)
-    p_lo, p_hi = np.percentile(img, (0.5, 99.5))
+    # 2. Normalisation robuste — écrêtage des outliers
+    p_lo, p_hi = np.percentile(img, (0.3, 99.7))
     if p_hi > p_lo:
         img = np.clip((img - p_lo) / (p_hi - p_lo), 0, 1)
     else:
         img = np.zeros_like(img)
 
-    # 3. Flip horizontal — C-arm PA : l'image est miroitée gauche-droite
-    #    pour correspondre à la fluoro
+    # 3. Flip horizontal pour correspondre à la fluoro
     img = np.fliplr(img)
 
-    # 4. Gamma correction — γ < 1 éclaircit les tons moyens,
-    #    fait mieux ressortir les vertèbres par rapport au fond
-    gamma = 0.6
+    # 4. Suppression des tissus mous (structures larges et lisses)
+    low = cv2.GaussianBlur(img, (0, 0), sigmaX=6.0, sigmaY=6.0)
+    img = np.clip(img - 0.50 * low + 0.22, 0, 1)
+
+    # 5. Accentuation des structures denses (os) + gamma modéré
+    dense = np.clip((img - 0.45) / 0.55, 0, 1)
+    img = np.clip(0.75 * img + 0.85 * np.power(dense, 1.2), 0, 1)
+    gamma = 0.78
     img = np.power(img, gamma)
 
-    # 5. CLAHE à contraste adaptatif — rehausse les structures locales (vertèbres)
+    # 6. CLAHE à contraste adaptatif local
     img_u8 = (img * 255).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
     img_u8 = clahe.apply(img_u8)
 
-    # 6. Unsharp-mask léger pour la netteté des contours
-    blur = cv2.GaussianBlur(img_u8, (0, 0), sigmaX=1.5)
-    img_u8 = cv2.addWeighted(img_u8, 1.3, blur, -0.3, 0)
+    # 6b. Top-hat : retire les composantes lisses étendues et renforce les contours
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    tophat = cv2.morphologyEx(img_u8, cv2.MORPH_TOPHAT, kernel)
+    img_u8 = cv2.addWeighted(img_u8, 1.0, tophat, 0.55, 0)
+
+    # 7. Unsharp-mask final pour limiter l'aspect flou
+    blur = cv2.GaussianBlur(img_u8, (0, 0), sigmaX=1.0)
+    img_u8 = cv2.addWeighted(img_u8, 1.45, blur, -0.45, 0)
 
     return img_u8.astype(np.float32) / 255.0
 
