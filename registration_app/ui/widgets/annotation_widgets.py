@@ -6,10 +6,10 @@ import cv2
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider,
     QComboBox, QGridLayout, QSizePolicy, QCheckBox, QFrame, QFileDialog, QMessageBox,
-    QScrollArea, QProgressBar,
+    QScrollArea, QProgressBar, QGraphicsBlurEffect,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent
-from PyQt5.QtGui import QImage, QPixmap, QCursor, QPainter, QIcon
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent, QRect
+from PyQt5.QtGui import QImage, QPixmap, QCursor, QPainter, QIcon, QBrush, QColor
 
 from core.registration import apply_full_transform
 from ui.theme import (
@@ -342,17 +342,29 @@ class BusyOverlay(QWidget):
         self._title_text = ''
         self._message_text = ''
         self._progress_value = 0
+        self._blur_snapshot = None
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet('background:rgba(5, 10, 24, 94);')
+        # Fond transparent pour permettre le snapshot flou
+        self.setStyleSheet('background:transparent;')
         self.hide()
+
+        # Widget d'arrière-plan avec snapshot flou
+        self._blur_bg = QLabel(self)
+        self._blur_bg.setAlignment(Qt.AlignCenter)
+        
+        # Appliquer le flou (QGraphicsBlurEffect - forte intensité)
+        self._blur_effect = QGraphicsBlurEffect(self)
+        self._blur_effect.setBlurRadius(35)  # Flou très accentué
+        self._blur_bg.setGraphicsEffect(self._blur_effect)
 
         self._panel = QFrame(self)
         self._panel.setFixedSize(460, 170)
+        # Design glassmorphism : cadre #1a1d2a, transparence, pas de border blanc
         self._panel.setStyleSheet(
             'QFrame{'
-            'border-radius:10px;'
-            'border:1px solid #2d4e84;'
-            'background:#0e2649;'
+            'border-radius:12px;'
+            'border:none;'
+            'background:rgba(26, 29, 42, 0.85);'
             '}'
         )
         panel_l = QVBoxLayout(self._panel)
@@ -362,7 +374,7 @@ class BusyOverlay(QWidget):
         self._title = QLabel('Chargement')
         self._title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._title.setStyleSheet(
-            'background:transparent;color:#cfe3ff;font-size:11px;font-weight:700;letter-spacing:1px;'
+            'background:transparent;color:#b8c8e6;font-size:11px;font-weight:700;letter-spacing:0.5px;opacity:0.9;'
         )
         panel_l.addWidget(self._title)
 
@@ -370,23 +382,28 @@ class BusyOverlay(QWidget):
         self._message.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._message.setWordWrap(True)
         self._message.setStyleSheet(
-            'background:transparent;color:#eef5ff;font-size:16px;font-weight:700;'
+            'background:transparent;color:#d8e6f0;font-size:16px;font-weight:600;'
         )
         panel_l.addWidget(self._message)
 
         self._progress = QProgressBar(self._panel)
         self._progress.setRange(0, 100)
         self._progress.setTextVisible(False)
-        self._progress.setFixedHeight(9)
+        self._progress.setFixedHeight(10)
+        # Dégradé moderne sans border blanc
         self._progress.setStyleSheet(
             'QProgressBar{'
-            'background:#132e57;'
-            'border:1px solid #2d4e84;'
-            'border-radius:4px;'
+            'background:rgba(15, 25, 50, 0.6);'
+            'border:none;'
+            'border-radius:5px;'
+            'padding:1px;'
             '}'
             'QProgressBar::chunk{'
             'border-radius:4px;'
-            'background:#4f89d8;'
+            'background:qlineargradient(x1:0, y1:0.5, x2:1, y2:0.5, '
+            'stop:0 rgba(0, 59, 87, 1), '
+            'stop:0.5 rgba(0, 212, 255, 1), '
+            'stop:1 rgba(0, 227, 163, 1));'
             '}'
         )
         panel_l.addWidget(self._progress)
@@ -394,7 +411,7 @@ class BusyOverlay(QWidget):
         self._pct = QLabel('0 %')
         self._pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._pct.setStyleSheet(
-            'background:transparent;color:#9fbde9;font-size:11px;font-weight:600;'
+            'background:transparent;color:#7fa3d1;font-size:11px;font-weight:600;opacity:0.85;'
         )
         panel_l.addWidget(self._pct)
 
@@ -405,10 +422,24 @@ class BusyOverlay(QWidget):
         parent = self.parentWidget()
         if parent is not None:
             self.setGeometry(parent.rect())
-        _ = snapshot_widget
+            # Capturer snapshot du parent et le flouter
+            self._create_blur_snapshot(parent)
         self._apply_state()
         self.show()
         self.raise_()
+
+    def _create_blur_snapshot(self, parent_widget):
+        """Capture un snapshot du parent et l'applique avec flou."""
+        try:
+            # Capturer le screenshot du parent
+            pixmap = parent_widget.grab(parent_widget.rect())
+            if not pixmap.isNull():
+                self._blur_snapshot = pixmap
+                # Mettre à jour le label d'arrière-plan avec le snapshot
+                self._blur_bg.setPixmap(pixmap)
+                self._blur_bg.setGeometry(self.rect())
+        except Exception:
+            pass
 
     def update_progress(self, progress: int, message: str = None):
         self._progress_value = int(max(0, min(100, progress)))
@@ -427,6 +458,9 @@ class BusyOverlay(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Mettre à jour la géométrie du snapshot d'arrière-plan
+        self._blur_bg.setGeometry(self.rect())
+        # Centrer le panel
         rect = self.rect()
         px = (rect.width() - self._panel.width()) // 2
         py = (rect.height() - self._panel.height()) // 2
