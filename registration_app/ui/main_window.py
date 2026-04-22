@@ -809,12 +809,11 @@ class MainWindow(QMainWindow):
     def _show_busy_overlay(self, title, message='Preparation...'):
         if not hasattr(self, '_busy_overlay'):
             return
-        self._busy_overlay.setGeometry(self.centralWidget().rect())
         self._busy_overlay.show_busy(
             title=title,
             message=message,
             progress=self.prog_bar.value(),
-            snapshot_widget=self.centralWidget(),
+            snapshot_widget=self.tabs,
         )
 
     def _hide_busy_overlay(self):
