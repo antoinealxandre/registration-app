@@ -111,14 +111,15 @@ def enhance_drr_image(img_np: np.ndarray, filter_kw: dict = None) -> np.ndarray:
     params = _resolve_postprocess_kw(filter_kw)
 
     def _gradient_map(arr: np.ndarray) -> np.ndarray:
-        gx = cv2.Sobel(arr, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(arr, cv2.CV_32F, 0, 1, ksize=3)
+        src = np.ascontiguousarray(arr, dtype=np.float32)
+        gx = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=3)
         grad = cv2.magnitude(gx, gy)
         scale = np.percentile(grad, 99.5)
         if scale > 1e-6:
             grad = np.clip(grad / scale, 0.0, 1.0)
         else:
-            grad = np.zeros_like(arr, dtype=np.float32)
+            grad = np.zeros_like(src, dtype=np.float32)
         return grad.astype(np.float32)
 
     def _scaled_odd_kernel(base_size: int, ref_side: int) -> int:
@@ -613,14 +614,15 @@ def _postprocess(img_np: np.ndarray, postprocess_kw: dict = None) -> np.ndarray:
         return scaled
 
     def _gradient_map(arr: np.ndarray) -> np.ndarray:
-        gx = cv2.Sobel(arr, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(arr, cv2.CV_32F, 0, 1, ksize=3)
+        src = np.ascontiguousarray(arr, dtype=np.float32)
+        gx = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=3)
         grad = cv2.magnitude(gx, gy)
         scale = np.percentile(grad, 99.5)
         if scale > 1e-6:
             grad = np.clip(grad / scale, 0.0, 1.0)
         else:
-            grad = np.zeros_like(arr, dtype=np.float32)
+            grad = np.zeros_like(src, dtype=np.float32)
         return grad.astype(np.float32)
 
     img = np.log1p(np.clip(img_np, 0, None)).astype(np.float32)
