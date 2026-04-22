@@ -7,7 +7,13 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from core.drr_generator import generate_drr, project_mask_3d
 from core.registration import register, register_elastic
 from core.totalseg_runner import run_totalsegmentator_cli, build_seg_masks_from_totalseg
-from core.yolo_pipeline import detect_vertebrae, is_model_loaded as yolo_ready
+from core.yolo_pipeline import (
+    boxes_to_mask,
+    detect_vertebrae,
+    detection_center,
+    is_model_loaded as yolo_ready,
+    scale_detection,
+)
 from ui.theme import AUTO_PIPELINE_FOV_MM
 
 
@@ -21,7 +27,7 @@ def _match_centroids(boxes_drr: list, boxes_fl: list, img_size: int):
     thr = img_size * 0.30
 
     def _cx(box):
-        return ((box['x1'] + box['x2']) / 2.0, (box['y1'] + box['y2']) / 2.0)
+        return detection_center(box)
 
     used = set()
     matched_drr, matched_fl = [], []
@@ -259,14 +265,7 @@ class WorkerThread(QThread):
         )
         scale_f = reg_size / yolo_size
         boxes_fl = [
-            {
-                'x1': int(b['x1'] * scale_f),
-                'y1': int(b['y1'] * scale_f),
-                'x2': int(b['x2'] * scale_f),
-                'y2': int(b['y2'] * scale_f),
-                'conf': b['conf'],
-                'cls_name': b.get('cls_name', ''),
-            }
+            scale_detection(b, scale_f, scale_f, w=reg_size, h=reg_size)
             for b in det_fl['boxes']
         ]
 
@@ -287,12 +286,8 @@ class WorkerThread(QThread):
         matched_drr, matched_fl = _match_centroids(boxes_drr, boxes_fl, reg_size)
         self.progress.emit(48, f'{len(matched_drr)} paire(s) - recalage...')
 
-        mask_drr = np.zeros((reg_size, reg_size), dtype=np.float32)
-        for b in matched_drr:
-            mask_drr[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
-        mask_fl = np.zeros((reg_size, reg_size), dtype=np.float32)
-        for b in matched_fl:
-            mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
+        mask_drr = boxes_to_mask(matched_drr, reg_size, reg_size).astype(np.float32) / 255.0
+        mask_fl = boxes_to_mask(matched_fl, reg_size, reg_size).astype(np.float32) / 255.0
 
         use_elastic = kw.get('elastic', True)
         if use_elastic:
@@ -340,13 +335,8 @@ class WorkerThread(QThread):
 
         self.progress.emit(55, 'Construction des masques...')
 
-        mask_drr = np.zeros((reg_size, reg_size), dtype=np.float32)
-        for b in boxes_drr:
-            mask_drr[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
-
-        mask_fl = np.zeros((reg_size, reg_size), dtype=np.float32)
-        for b in boxes_fl:
-            mask_fl[b['y1']:b['y2'], b['x1']:b['x2']] = 1.0
+        mask_drr = boxes_to_mask(boxes_drr, reg_size, reg_size).astype(np.float32) / 255.0
+        mask_fl = boxes_to_mask(boxes_fl, reg_size, reg_size).astype(np.float32) / 255.0
 
         self.progress.emit(58, 'Recalage elastique (rigide + FFD)...')
 

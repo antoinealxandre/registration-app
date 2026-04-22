@@ -6,7 +6,7 @@ import cv2
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider,
     QComboBox, QGridLayout, QSizePolicy, QCheckBox, QFrame, QFileDialog, QMessageBox,
-    QScrollArea,
+    QScrollArea, QProgressBar,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QCursor, QPainter, QIcon
@@ -183,6 +183,7 @@ ROLE_LABELS = {None: '', 'fixed': 'FIXE', 'mobile': 'MOBILE'}
 
 class ImageCard(QWidget):
     role_changed = pyqtSignal(int, str)   # index, role ('fixed'/'mobile'/'')
+    image_delete_requested = pyqtSignal(int)
 
     def __init__(self, index, name, array, parent=None):
         super().__init__(parent)
@@ -251,7 +252,29 @@ class ImageCard(QWidget):
         self._btn_mobile.clicked.connect(self._on_mobile)
         br.addWidget(self._btn_fixed)
         br.addWidget(self._btn_mobile)
+        self._btn_delete = QPushButton()
+        self._btn_delete.setObjectName('tool')
+        self._btn_delete.setFixedSize(22, 22)
+        self._btn_delete.setToolTip('Retirer cette image')
+        trash_icon = _make_svg_icon(
+            'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12z'
+            'M19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
+            color='#ef6666',
+            size=16,
+        )
+        if trash_icon:
+            self._btn_delete.setIcon(trash_icon)
+            self._btn_delete.setIconSize(QSize(16, 16))
+        else:
+            self._btn_delete.setText('x')
+        self._btn_delete.setStyleSheet(
+            f'QPushButton{{font-size:10px;padding:2px;border-radius:4px;'
+            f'background:{CARD_BG};border:1px solid {BORDER2};color:#ef6666;min-height:20px;}}'
+            f'QPushButton:hover{{border-color:#ef6666;background:#2a0a0a;}}'
+        )
+        self._btn_delete.clicked.connect(self._on_delete)
         br.addStretch()
+        br.addWidget(self._btn_delete)
         vr.addLayout(br)
         vr.addStretch()
         lay.addWidget(right, 1)
@@ -284,6 +307,9 @@ class ImageCard(QWidget):
         else:
             self._set_role(None)
 
+    def _on_delete(self):
+        self.image_delete_requested.emit(self.index)
+
     def _set_role(self, role):
         self._role = role
         color = ROLE_COLORS.get(role, BORDER2)
@@ -304,6 +330,107 @@ class ImageCard(QWidget):
         self._thumb_lbl.setStyleSheet(
             f'border:2px solid {color};border-radius:5px;background:{DARK_BG};'
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Overlay de chargement
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BusyOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._title_text = ''
+        self._message_text = ''
+        self._progress_value = 0
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet('background:rgba(5, 10, 24, 94);')
+        self.hide()
+
+        self._panel = QFrame(self)
+        self._panel.setFixedSize(460, 170)
+        self._panel.setStyleSheet(
+            'QFrame{'
+            'border-radius:10px;'
+            'border:1px solid #2d4e84;'
+            'background:#0e2649;'
+            '}'
+        )
+        panel_l = QVBoxLayout(self._panel)
+        panel_l.setContentsMargins(16, 14, 16, 14)
+        panel_l.setSpacing(8)
+
+        self._title = QLabel('Chargement')
+        self._title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._title.setStyleSheet(
+            'background:transparent;color:#cfe3ff;font-size:11px;font-weight:700;letter-spacing:1px;'
+        )
+        panel_l.addWidget(self._title)
+
+        self._message = QLabel('Preparation...')
+        self._message.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._message.setWordWrap(True)
+        self._message.setStyleSheet(
+            'background:transparent;color:#eef5ff;font-size:16px;font-weight:700;'
+        )
+        panel_l.addWidget(self._message)
+
+        self._progress = QProgressBar(self._panel)
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(9)
+        self._progress.setStyleSheet(
+            'QProgressBar{'
+            'background:#132e57;'
+            'border:1px solid #2d4e84;'
+            'border-radius:4px;'
+            '}'
+            'QProgressBar::chunk{'
+            'border-radius:4px;'
+            'background:#4f89d8;'
+            '}'
+        )
+        panel_l.addWidget(self._progress)
+
+        self._pct = QLabel('0 %')
+        self._pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._pct.setStyleSheet(
+            'background:transparent;color:#9fbde9;font-size:11px;font-weight:600;'
+        )
+        panel_l.addWidget(self._pct)
+
+    def show_busy(self, title: str, message: str = '', progress: int = 0, snapshot_widget=None):
+        self._title_text = str(title or 'Chargement')
+        self._message_text = str(message or '')
+        self._progress_value = int(max(0, min(100, progress)))
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        _ = snapshot_widget
+        self._apply_state()
+        self.show()
+        self.raise_()
+
+    def update_progress(self, progress: int, message: str = None):
+        self._progress_value = int(max(0, min(100, progress)))
+        if message is not None:
+            self._message_text = str(message)
+        self._apply_state()
+
+    def hide_busy(self):
+        self.hide()
+
+    def _apply_state(self):
+        self._title.setText(self._title_text or 'Chargement')
+        self._message.setText(self._message_text or 'Preparation...')
+        self._pct.setText(f'{self._progress_value} %')
+        self._progress.setValue(self._progress_value)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        rect = self.rect()
+        px = (rect.width() - self._panel.width()) // 2
+        py = (rect.height() - self._panel.height()) // 2
+        self._panel.move(max(0, px), max(0, py))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,6 +469,18 @@ class AnnotationCanvas(QLabel):
     # ── API ───────────────────────────────────────────────────────────────────
 
     def set_image(self, img: np.ndarray, preserve_masks: bool = False):
+        if img is None:
+            self._img_np = None
+            self._size = 512
+            self._masks = {k: np.zeros((self._size, self._size), np.float32) for k in STRUCT}
+            self._history = {k: [] for k in STRUCT}
+            self._raw_pts = []
+            self._poly_pts = []
+            self._rect_start = None
+            self._rect_cur = None
+            self._cursor_pos = None
+            self.clear()
+            return
         old_masks = None
         old_history = None
         if preserve_masks and self._img_np is not None:
@@ -467,6 +606,14 @@ class AnnotationCanvas(QLabel):
     def _draw_poly(self, pts):
         self._push_history(); cv2.fillPoly(self._m(), [np.array(pts,np.int32)], 1.0)
 
+    def _commit_polygon(self):
+        if len(self._poly_pts) < 3:
+            return
+        self._draw_poly(self._poly_pts)
+        self._poly_pts = []
+        self._refresh()
+        self.mask_updated.emit()
+
     def _draw_rect(self, x0, y0, x1, y1):
         self._push_history()
         x0,x1=sorted([x0,x1]); y0,y1=sorted([y0,y1])
@@ -523,6 +670,12 @@ class AnnotationCanvas(QLabel):
             for p in self._poly_pts: cv2.circle(base,p,5,(r,g,b),-1)
             if self._cursor_pos:
                 cv2.line(base,self._poly_pts[-1],self._cursor_pos,(r,g,b),1)
+                d0 = np.linalg.norm(np.array(self._cursor_pos, float) - np.array(self._poly_pts[0], float))
+                hint_col = (60, 255, 80) if d0 < 14 and len(self._poly_pts) >= 3 else (215, 230, 240)
+                cv2.circle(base, self._poly_pts[0], 8, hint_col, 2)
+                if len(self._poly_pts) >= 3 and d0 < 14:
+                    cv2.putText(base, 'Fermer ici', (self._poly_pts[0][0] + 12, self._poly_pts[0][1] + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, hint_col, 1)
 
         # Preview rectangle
         if self._tool=='rectangle' and self._rect_start and self._rect_cur:
@@ -553,12 +706,31 @@ class AnnotationCanvas(QLabel):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y())
         if self._tool=='pencil':
+            if e.button() != Qt.LeftButton:
+                return
             self._drawing=True; self._raw_pts=[(ix,iy)]; self._refresh()
         elif self._tool=='polygon':
-            self._poly_pts.append((ix,iy)); self._refresh()
+            if e.button() == Qt.RightButton:
+                if self._poly_pts:
+                    self._poly_pts.pop()
+                    self._refresh()
+                return
+            if e.button() != Qt.LeftButton:
+                return
+            if (self._poly_pts and len(self._poly_pts) >= 3 and
+                    np.linalg.norm(np.array((ix, iy), float) - np.array(self._poly_pts[0], float)) < 14):
+                self._commit_polygon()
+                return
+            if not self._poly_pts or (ix, iy) != self._poly_pts[-1]:
+                self._poly_pts.append((ix,iy))
+            self._refresh()
         elif self._tool=='rectangle':
+            if e.button() != Qt.LeftButton:
+                return
             self._drawing=True; self._rect_start=self._rect_cur=(ix,iy)
         elif self._tool=='eraser':
+            if e.button() != Qt.LeftButton:
+                return
             self._drawing=True; self._push_history(); self._erase(ix,iy); self._refresh()
 
     def mouseMoveEvent(self,e):
@@ -590,8 +762,7 @@ class AnnotationCanvas(QLabel):
 
     def mouseDoubleClickEvent(self,e):
         if self._tool=='polygon' and len(self._poly_pts)>=3:
-            self._draw_poly(self._poly_pts); self._poly_pts=[]
-            self._refresh(); self.mask_updated.emit()
+            self._commit_polygon()
 
     def resizeEvent(self,e): self._refresh()
 

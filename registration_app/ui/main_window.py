@@ -81,6 +81,7 @@ from ui.widgets.annotation_widgets import (
     CollapsibleSection,
     ImageCard,
     AnnotationCanvas,
+    BusyOverlay,
     ResultPanel,
     SegmentationReviewPanel,
     FinalOverlayPanel,
@@ -306,6 +307,14 @@ class MainWindow(QMainWindow):
 
         # ── IMAGES ────────────────────────────────────────────────────────────
         self._sec_images = CollapsibleSection('IMAGES', starts_open=False)
+        img_actions = QHBoxLayout(); img_actions.setSpacing(6); img_actions.setContentsMargins(0, 0, 0, 0)
+        self.btn_clear_images = QPushButton('Tout retirer')
+        self.btn_clear_images.setObjectName('danger')
+        self.btn_clear_images.setEnabled(False)
+        self.btn_clear_images.clicked.connect(self._remove_all_images)
+        img_actions.addWidget(self.btn_clear_images)
+        img_actions.addStretch()
+        self._sec_images.addLayout(img_actions)
         self.lbl_no_images = QLabel('Aucune image chargee')
         self.lbl_no_images.setObjectName('dim')
         self._sec_images.addWidget(self.lbl_no_images)
@@ -406,6 +415,10 @@ class MainWindow(QMainWindow):
                      'M20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39'
                      '-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z')
         _rect_d   = 'M3 3v18h18V3H3zm16 16H5V5h14v14z'
+        _poly_d   = ('M4 6a2 2 0 1 0 0.01 0zM10 4a2 2 0 1 0 0.01 0z'
+                     'M18 7a2 2 0 1 0 0.01 0zM16 18a2 2 0 1 0 0.01 0z'
+                     'M6 17a2 2 0 1 0 0.01 0zM5.7 7.5l2.7-1.8M11.9 5.3l4.2 1.1'
+                     'M17.2 8.7l-1.1 7M14.4 17.8l-6.8-.3M5.7 15.3l-.8-6')
         _eraser_d = ('M15.14 3c-.51 0-1.02.2-1.41.59L2.59 14.73c-.78.77-.78 2.04'
                      ' 0 2.83L5.03 20h7.66l8.72-8.73c.79-.78.79-2.05 0-2.83l-4.85'
                      '-4.85c-.39-.39-.9-.59-1.42-.59zM6.04 19l-2.06-2.07 5.23-5.22'
@@ -425,6 +438,13 @@ class MainWindow(QMainWindow):
         if _ic: self.btn_rect.setIcon(_ic); self.btn_rect.setIconSize(QSize(20, 20))
         else: self.btn_rect.setText('⬜')
 
+        self.btn_poly = QPushButton(); self.btn_poly.setObjectName('tool')
+        self.btn_poly.setCheckable(True)
+        self.btn_poly.setFixedSize(34, 34); self.btn_poly.setToolTip('Polygone point par point')
+        _ic = _make_svg_icon(_poly_d)
+        if _ic: self.btn_poly.setIcon(_ic); self.btn_poly.setIconSize(QSize(20, 20))
+        else: self.btn_poly.setText('P')
+
         self.btn_eraser = QPushButton(); self.btn_eraser.setObjectName('tool')
         self.btn_eraser.setCheckable(True)
         self.btn_eraser.setFixedSize(34, 34); self.btn_eraser.setToolTip('Gomme (effacer)')
@@ -434,8 +454,9 @@ class MainWindow(QMainWindow):
 
         self.btn_pencil.clicked.connect(lambda: self._set_tool('pencil'))
         self.btn_rect.clicked.connect(lambda: self._set_tool('rectangle'))
+        self.btn_poly.clicked.connect(lambda: self._set_tool('polygon'))
         self.btn_eraser.clicked.connect(lambda: self._set_tool('eraser'))
-        tr.addWidget(self.btn_pencil); tr.addWidget(self.btn_rect); tr.addWidget(self.btn_eraser)
+        tr.addWidget(self.btn_pencil); tr.addWidget(self.btn_rect); tr.addWidget(self.btn_poly); tr.addWidget(self.btn_eraser)
         tr.addStretch()
         sec_ann.addLayout(tr)
 
@@ -641,6 +662,8 @@ class MainWindow(QMainWindow):
             cv.set_tool('pencil'); cv.set_active('vertebrae')
 
         root.addWidget(self.tabs, 1)
+        self._busy_overlay = BusyOverlay(cw)
+        self._busy_overlay.setGeometry(cw.rect())
         self.setStatusBar(QStatusBar())
 
     def _wrap(self, cv, hint):
@@ -684,13 +707,19 @@ class MainWindow(QMainWindow):
     # ── Slots UI ──────────────────────────────────────────────────────────────
 
     def _set_tool(self, tool):
-        for btn, t in [(self.btn_pencil, 'pencil'), (self.btn_rect, 'rectangle'), (self.btn_eraser, 'eraser')]:
+        for btn, t in [
+            (self.btn_pencil, 'pencil'),
+            (self.btn_rect, 'rectangle'),
+            (self.btn_poly, 'polygon'),
+            (self.btn_eraser, 'eraser'),
+        ]:
             btn.setChecked(t == tool)
         for cv in [self.cv_fl, self.cv_drr]:
             cv.set_tool(tool)
         hints = {
             'pencil':    'Tracer le contour en continu, relacher pour valider',
             'rectangle': 'Cliquer-glisser pour dessiner un rectangle',
+            'polygon':   'Cliquer pour poser les sommets, double-cliquer ou revenir au premier point pour fermer',
             'eraser':    'Cliquer-glisser pour effacer des annotations',
         }
         self._status(hints.get(tool, ''))
@@ -776,6 +805,31 @@ class MainWindow(QMainWindow):
         if p: cv2.imwrite(p,(m*255).astype(np.uint8)); self._status(f'Masque sauvegardé → {p}')
 
     def _active_cv(self): return self.cv_fl if self.tabs.currentIndex()==0 else self.cv_drr
+
+    def _show_busy_overlay(self, title, message='Preparation...'):
+        if not hasattr(self, '_busy_overlay'):
+            return
+        self._busy_overlay.setGeometry(self.centralWidget().rect())
+        self._busy_overlay.show_busy(
+            title=title,
+            message=message,
+            progress=self.prog_bar.value(),
+            snapshot_widget=self.centralWidget(),
+        )
+
+    def _hide_busy_overlay(self):
+        if hasattr(self, '_busy_overlay'):
+            self._busy_overlay.hide_busy()
+
+    def _start_worker(self, task, kw, result_slot, error_slot,
+                      busy_title=None, busy_message='Preparation...'):
+        if busy_title:
+            self._show_busy_overlay(busy_title, busy_message)
+        self.worker = WorkerThread(task, kw)
+        self.worker.progress.connect(self._on_prog)
+        self.worker.result.connect(result_slot)
+        self.worker.error.connect(error_slot)
+        self.worker.start()
 
     def _on_mask_upd(self):
         mask_fl = self.cv_fl.get_mask()
@@ -1077,11 +1131,83 @@ class MainWindow(QMainWindow):
         self.lbl_no_images.hide()
         card = ImageCard(idx, name, img_float)
         card.role_changed.connect(self._assign_image)
+        card.image_delete_requested.connect(self._remove_image)
         entry['card'] = card
         self._images_vbox.addWidget(card)
+        self._sync_image_actions()
         if idx == 0:
             card.set_role_external('fixed')
             self._assign_image(idx, 'fixed')
+
+    def _sync_image_actions(self):
+        has_images = bool(self._loaded_images)
+        self.lbl_no_images.setVisible(not has_images)
+        self.btn_clear_images.setEnabled(has_images)
+
+    def _clear_fixed_image(self, reason=''):
+        self._fixed_image_index = None
+        self.fluoro_image = None
+        self.cv_fl.set_image(None)
+        self.dicom_meta = {}
+        self.lbl_fluoro_meta.setText('Fluoro : --')
+        self._sync_fluoro_frame_controls(None)
+        self._invalidate_registration_state(reason or 'Image fixe retiree.')
+        self._update_checklist()
+
+    def _clear_mobile_image(self, reason=''):
+        self._mobile_image_index = None
+        self.drr_image = None
+        self._set_drr_base_image(None)
+        self.proj_masks = {}
+        self.cv_drr.set_image(None)
+        self.tabs.setTabText(1, 'Mobile')
+        self._invalidate_registration_state(reason or 'Image mobile retiree.')
+        self._update_checklist()
+
+    def _remove_image(self, index):
+        if index < 0 or index >= len(self._loaded_images):
+            return
+
+        entry = self._loaded_images[index]
+        name = entry['name']
+        role = entry.get('role')
+        fixed_index = self._fixed_image_index
+        mobile_index = self._mobile_image_index
+
+        if role == 'fixed':
+            self._clear_fixed_image(f'Image fixe retiree : {name}')
+        elif role == 'mobile':
+            self._clear_mobile_image(f'Image mobile retiree : {name}')
+
+        card = entry.get('card')
+        if card:
+            self._images_vbox.removeWidget(card)
+            card.deleteLater()
+
+        self._loaded_images.pop(index)
+        if role != 'fixed' and fixed_index is not None and index < fixed_index:
+            self._fixed_image_index = fixed_index - 1
+        if role != 'mobile' and mobile_index is not None and index < mobile_index:
+            self._mobile_image_index = mobile_index - 1
+        for i, img_entry in enumerate(self._loaded_images):
+            img_entry['card'].index = i
+
+        self._sync_image_actions()
+        self._status(f'Image retiree : {name}')
+
+    def _remove_all_images(self):
+        if not self._loaded_images:
+            return
+        for entry in list(self._loaded_images):
+            card = entry.get('card')
+            if card:
+                self._images_vbox.removeWidget(card)
+                card.deleteLater()
+        self._loaded_images = []
+        self._clear_fixed_image('Toutes les images ont ete retirees.')
+        self._clear_mobile_image('')
+        self._sync_image_actions()
+        self._status('Toutes les images ont ete retirees')
 
     def _assign_image(self, index, role):
         if index >= len(self._loaded_images):
@@ -1323,13 +1449,17 @@ class MainWindow(QMainWindow):
             device=self.cb_tseg_device.currentText().strip().lower(),
             license_key=TOTALSEG_LICENSE_KEY,
         )
-        self.worker = WorkerThread('totalseg', kw)
-        self.worker.progress.connect(self._on_prog)
-        self.worker.result.connect(self._on_totalseg_done)
-        self.worker.error.connect(self._on_totalseg_err)
-        self.worker.start()
+        self._start_worker(
+            'totalseg',
+            kw,
+            self._on_totalseg_done,
+            self._on_totalseg_err,
+            busy_title='Segmentation automatique',
+            busy_message='Analyse du volume et preparation des structures...',
+        )
 
     def _on_totalseg_done(self, res):
+        self._hide_busy_overlay()
         self.btn_tseg_run.setEnabled(True)
 
         if res.get('task') != 'totalseg':
@@ -1391,6 +1521,7 @@ class MainWindow(QMainWindow):
         self._status(f'Segmentation automatique terminee ({n} structure(s)).')
 
     def _on_totalseg_err(self, msg):
+        self._hide_busy_overlay()
         self.btn_tseg_run.setEnabled(True)
         self.btn_tseg_export.setEnabled(bool(self.seg_masks))
         self.btn_tseg_3d.setEnabled(bool(self.seg_masks))
@@ -1539,11 +1670,17 @@ class MainWindow(QMainWindow):
             sod_mm=self.dicom_meta.get('sod_mm', 510.0),
             renderer='siddon',
         )
-        self.worker=WorkerThread('drr',kw)
-        self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._drr_done)
-        self.worker.error.connect(self._on_err); self.worker.start()
+        self._start_worker(
+            'drr',
+            kw,
+            self._drr_done,
+            self._on_err,
+            busy_title='Generation du DRR',
+            busy_message='Projection du volume CT et preparation du rendu...',
+        )
 
     def _drr_done(self,res):
+        self._hide_busy_overlay()
         self.drr_image=res['drr']; self._set_drr_base_image(self.drr_image); self.proj_masks=res.get('masks',{})
         self.cv_drr.set_image(self.drr_image); self.btn_drr.setEnabled(True)
         self.tabs.setTabText(1,'DRR')
@@ -1607,11 +1744,17 @@ class MainWindow(QMainWindow):
         
         self.btn_reg.setEnabled(False)
         kw=dict(moving=md, fixed=mf, elastic=self.chk_elastic.isChecked())
-        self.worker=WorkerThread('register',kw)
-        self.worker.progress.connect(self._on_prog); self.worker.result.connect(self._reg_done)
-        self.worker.error.connect(self._on_err); self.worker.start()
+        self._start_worker(
+            'register',
+            kw,
+            self._reg_done,
+            self._on_err,
+            busy_title='Recalage 2D/3D',
+            busy_message='Alignement des formes et optimisation en cours...',
+        )
 
     def _reg_done(self,res):
+        self._hide_busy_overlay()
         self.result=res; self.btn_reg.setEnabled(True)
         iou=res['iou']; dice=res['dice']
         self._update_checklist()
@@ -1779,14 +1922,18 @@ class MainWindow(QMainWindow):
                     'contrast': self.sp_yolo_contrast.value(),
                     'invert': self.chk_yolo_invert.isChecked()}),
         )
-        self.worker = WorkerThread('auto_pipeline', kw)
-        self.worker.progress.connect(self._on_prog)
-        self.worker.result.connect(self._auto_done)
-        self.worker.error.connect(self._on_auto_err)
-        self.worker.start()
+        self._start_worker(
+            'auto_pipeline',
+            kw,
+            self._auto_done,
+            self._on_auto_err,
+            busy_title='Pipeline automatique',
+            busy_message='Generation du DRR, detection et appariement des vertebres...',
+        )
 
     def _auto_done(self, res):
         """Callback quand le pipeline auto émet un résultat (phase 1 ou final)."""
+        self._hide_busy_overlay()
 
         # ── Phase 1 : sélection des vertèbres fluoro + DRR ───────────────────
         if res.get('_phase') == 'select_vertebrae':
@@ -1813,15 +1960,10 @@ class MainWindow(QMainWindow):
                 self.lbl_auto_status.setText('Annulé par l\'utilisateur.')
                 return
 
-            sel_fl, sel_drr = dlg.get_selections()
-            if not sel_fl or not sel_drr:
+            selected_fl, selected_drr = dlg.get_selected_detections()
+            if not selected_fl or not selected_drr:
                 self._on_auto_err('Sélectionnez au moins une vertèbre de chaque côté.')
                 return
-
-            selected_fl = [res['boxes_fl'][i] for i in sel_fl
-                           if i < len(res['boxes_fl'])]
-            selected_drr = [res['drr_boxes'][i] for i in sel_drr
-                            if i < len(res['drr_boxes'])]
 
             # Lancer la phase 2 (recalage élastique) en worker
             kw2 = dict(
@@ -1831,11 +1973,14 @@ class MainWindow(QMainWindow):
                 drr_image=res['drr_image'],
                 all_proj_masks=res['all_proj_masks'],
             )
-            self.worker = WorkerThread('auto_phase2', kw2)
-            self.worker.progress.connect(self._on_prog)
-            self.worker.result.connect(self._auto_done)
-            self.worker.error.connect(self._on_auto_err)
-            self.worker.start()
+            self._start_worker(
+                'auto_phase2',
+                kw2,
+                self._auto_done,
+                self._on_auto_err,
+                busy_title='Recalage en cours',
+                busy_message='Application des formes selectionnees et optimisation elastique...',
+            )
             return
 
         # ── Phase finale : résultat complet ───────────────────────────────────
@@ -1894,14 +2039,19 @@ class MainWindow(QMainWindow):
             f'Pipeline auto terminé — IoU={iou:.4f}  Dice={dice:.4f}')
 
     def _on_auto_err(self, msg):
+        self._hide_busy_overlay()
         self.btn_auto.setEnabled(True)
         self.btn_drr.setEnabled(True)
         self.btn_reg.setEnabled(True)
         self.lbl_auto_status.setText(f'Erreur : {msg.splitlines()[0]}')
         self._err(msg)
 
-    def _on_prog(self,pct,msg): self.prog_bar.setValue(pct); self.lbl_prog.setText(msg); self._status(msg)
-    def _on_err(self,msg): self.btn_drr.setEnabled(True); self.btn_reg.setEnabled(True); self.btn_detect_fl.setEnabled(True); self.btn_detect_drr.setEnabled(True); self._err(msg)
+    def _on_prog(self,pct,msg):
+        self.prog_bar.setValue(pct); self.lbl_prog.setText(msg); self._status(msg)
+        self._busy_overlay.update_progress(pct, msg)
+    def _on_err(self,msg):
+        self._hide_busy_overlay()
+        self.btn_drr.setEnabled(True); self.btn_reg.setEnabled(True); self.btn_detect_fl.setEnabled(True); self.btn_detect_drr.setEnabled(True); self._err(msg)
     def _status(self,msg): self.statusBar().showMessage(msg)
     def _err(self,msg): self.statusBar().showMessage(msg); QMessageBox.warning(self,'Erreur',msg)
 
@@ -2116,9 +2266,6 @@ class MainWindow(QMainWindow):
     def _on_yolo_result(self, res):
         target = res['target']
         n = res['n_detections']
-        if n == 0:
-            self._err(f'Aucune vertèbre détectée sur {target}.')
-            return
         if target == 'fluoro':
             self._yolo_det_fl = res
         else:
@@ -2127,12 +2274,11 @@ class MainWindow(QMainWindow):
         # Ouvrir le panneau de sélection YOLO
         dlg = YoloDetectionPanel(res, target, parent=self)
         if dlg.exec_() == QDialog.Accepted:
-            sel = dlg.get_selection()
-            if not sel:
+            selected_boxes = dlg.get_selected_detections()
+            if not selected_boxes:
                 self._err('Aucune détection sélectionnée.'); return
-            selected_boxes = [res['boxes'][i] for i in sel]
         else:
-            selected_boxes = res['boxes']
+            selected_boxes = dlg.get_selected_detections() or res['boxes']
 
         # Construire le masque et l'injecter
         canvas = self.cv_fl if target == 'fluoro' else self.cv_drr
@@ -2149,6 +2295,11 @@ class MainWindow(QMainWindow):
             f'{target.upper()} : {n_sel}/{n} vertèbre(s) retenue(s)\n'
             f'Masque injecté dans l\'onglet {"Fixe" if target=="fluoro" else "DRR"}')
         self._status(f'YOLO {target} : {n_sel} vertèbre(s)')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_busy_overlay') and self.centralWidget() is not None:
+            self._busy_overlay.setGeometry(self.centralWidget().rect())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
