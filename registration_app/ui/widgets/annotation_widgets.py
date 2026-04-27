@@ -1962,41 +1962,10 @@ class FinalOverlayPanel(QWidget):
         if stride > 1:
             vol = vol[::stride, ::stride, ::stride]
 
-        from scipy.ndimage import rotate as nd_rotate
-
-        if abs(self._view_lao) > 0.1:
-            vol = nd_rotate(
-                vol,
-                -self._view_lao,
-                axes=(0, 1),
-                reshape=False,
-                order=0,
-                prefilter=False,
-                mode='constant',
-                cval=0.0,
-            )
-        if abs(self._view_cran) > 0.1:
-            vol = nd_rotate(
-                vol,
-                self._view_cran,
-                axes=(1, 2),
-                reshape=False,
-                order=0,
-                prefilter=False,
-                mode='constant',
-                cval=0.0,
-            )
-        if abs(self._view_table) > 0.1:
-            vol = nd_rotate(
-                vol,
-                self._view_table,
-                axes=(0, 2),
-                reshape=False,
-                order=0,
-                prefilter=False,
-                mode='constant',
-                cval=0.0,
-            )
+        # Important: do not reapply C-arm angles on the 3D mesh here.
+        # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
+        # Reapplying those angles in this step causes an apparent double obliquity
+        # in the final 3D registered overlay.
 
         if vol.sum() < 8:
             return None
@@ -2022,6 +1991,10 @@ class FinalOverlayPanel(QWidget):
         # Projection to DRR in-plane coordinates (same convention as project_mask_3d).
         x_plane = verts[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
         y_plane = verts[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
+
+        # Match DRR projection convention (cran UI offset includes +180 in PA mode):
+        # this corresponds to a superior/inferior flip in 2D image coordinates.
+        y_plane = (reg_size - 1.0) - y_plane
 
         fov_scale = self._fov_scale_for_mask(mask_3d)
         if abs(fov_scale - 1.0) > 0.02:
