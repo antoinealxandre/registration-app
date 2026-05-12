@@ -67,6 +67,7 @@ class WorkerThread(QThread):
                 'drr': self._drr,
                 'register': self._reg,
                 'yolo_detect': self._yolo_detect,
+                'detect_vertebrae_dual': self._detect_vertebrae_dual,
                 'auto_pipeline': self._auto_pipeline,
                 'auto_phase2': self._auto_phase2,
                 'totalseg': self._totalseg,
@@ -123,6 +124,38 @@ class WorkerThread(QThread):
         )
         self.progress.emit(100, f"{det['n_detections']} vertebre(s) - {kw['target']}")
         self.result.emit({'task': 'yolo_detect', 'target': kw['target'], **det})
+
+    def _detect_vertebrae_dual(self):
+        """Détection YOLO simultanée sur fluoro et DRR."""
+        kw = self.kw
+        yolo_kw = kw.get('yolo_kw', {})
+        
+        self.progress.emit(10, 'Détection YOLO sur fluoroscopie…')
+        det_fl = detect_vertebrae(
+            kw['fluoro_img'],
+            conf=yolo_kw.get('conf', 0.25),
+            iou=yolo_kw.get('iou', 0.45),
+            imgsz=yolo_kw.get('imgsz', 288),
+            preprocess=True,
+            preprocess_params=yolo_kw.get('pp', {}),
+        )
+        
+        self.progress.emit(55, 'Détection YOLO sur DRR…')
+        det_drr = detect_vertebrae(
+            kw['drr_img'],
+            conf=yolo_kw.get('conf', 0.25),
+            iou=yolo_kw.get('iou', 0.45),
+            imgsz=yolo_kw.get('imgsz', 288),
+            preprocess=False,
+            preprocess_params=yolo_kw.get('pp', {}),
+        )
+        
+        self.progress.emit(100, f'Détections complétées : Fluoro {det_fl["n_detections"]} | DRR {det_drr["n_detections"]}')
+        self.result.emit({
+            'task': 'detect_vertebrae_dual',
+            'det_fl': det_fl,
+            'det_drr': det_drr,
+        })
 
     def _drr(self):
         def pcb(pct, msg):

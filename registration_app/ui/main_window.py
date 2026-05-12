@@ -90,6 +90,7 @@ from ui.widgets.annotation_widgets import (
 from ui.dialogs import (
     YoloDetectionPanel,
     DualYoloSelectionDialog,
+    VertebralDetectionWindow,
     ComparisonDialog,
 )
 from utils.dicom_io import read_dicom_fluoro_series, read_metadata_csv
@@ -349,7 +350,7 @@ class MainWindow(QMainWindow):
         self.sp_fov = QDoubleSpinBox(); self.sp_fov.setRange(50, 500); self.sp_fov.setValue(DEFAULT_FOV_MM); self.sp_fov.setSingleStep(10)
         gdl.addWidget(self.sp_fov, 3, 1)
         gdl.addWidget(_lbl('Resolution (px)'), 4, 0)
-        self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(256); self.sp_size.setSingleStep(64)
+        self.sp_size = QSpinBox(); self.sp_size.setRange(128, 1024); self.sp_size.setValue(512); self.sp_size.setSingleStep(64)
         gdl.addWidget(self.sp_size, 4, 1)
         gdl.addWidget(_lbl('Preset rendu'), 5, 0)
         self.cb_drr_preset = QComboBox()
@@ -588,6 +589,16 @@ class MainWindow(QMainWindow):
             f'QPushButton:disabled{{background:{DARK_BG};border-color:{TEXT_DIM};color:{TEXT_DIM};}}')
         self.btn_auto.clicked.connect(self._run_auto_pipeline)
         sec_auto.addWidget(self.btn_auto)
+
+        self.btn_detect_vertebrae = QPushButton('DÉTECTER VERTÈBRES')
+        self.btn_detect_vertebrae.setObjectName('info')
+        self.btn_detect_vertebrae.setStyleSheet(
+            f'QPushButton{{background:#1a2a3a;border:2px solid {ACCENT};color:{ACCENT};'
+            f'font-weight:700;font-size:12px;min-height:36px;border-radius:6px;}}'
+            f'QPushButton:hover{{background:#2a3a4a;color:#fff;}}'
+            f'QPushButton:disabled{{background:{DARK_BG};border-color:{TEXT_DIM};color:{TEXT_DIM};}}')
+        self.btn_detect_vertebrae.clicked.connect(self._detect_vertebrae_manual)
+        sec_auto.addWidget(self.btn_detect_vertebrae)
 
         self.lbl_auto_status = QLabel('')
         self.lbl_auto_status.setObjectName('dim')
@@ -1929,6 +1940,86 @@ class MainWindow(QMainWindow):
             busy_title='Pipeline automatique',
             busy_message='Generation du DRR, detection et appariement des vertebres...',
         )
+
+    def _detect_vertebrae_manual(self):
+        """Lance la détection YOLO sur fluoro + DRR existants, puis ouvre la fenêtre de sélection."""
+        # Vérifications préalables
+        if self.drr_image is None:
+            self._err('Générez d\'abord un DRR (onglet DRR).'); return
+        if self.fluoro_image is None:
+            self._err('Chargez une fluoroscopie d\'abord.'); return
+        if not yolo_ready():
+            self._err('Chargez un modèle YOLO (.pt) d\'abord.'); return
+
+        self.btn_detect_vertebrae.setEnabled(False)
+        self.btn_auto.setEnabled(False)
+        self.lbl_auto_status.setText('Détection YOLO en cours…')
+
+        # Paramètres YOLO
+        yolo_kw = dict(
+            conf=self.sp_yolo_conf.value() / 100.0,
+            iou=self.sp_yolo_iou.value() / 100.0,
+            imgsz=self.sp_yolo_imgsz.value(),
+            pp={'gamma': self.sp_yolo_gamma.value(),
+                'contrast': self.sp_yolo_contrast.value(),
+                'invert': self.chk_yolo_invert.isChecked()},
+        )
+
+        # Préparer les images
+        fluoro_u8 = (np.clip(self.fluoro_image, 0, 1) * 255).astype(np.uint8)
+        drr_u8 = (np.clip(self.drr_image, 0, 1) * 255).astype(np.uint8)
+
+        kw = dict(
+            fluoro_img=fluoro_u8,
+            drr_img=drr_u8,
+            yolo_kw=yolo_kw,
+        )
+        self._start_worker(
+            'detect_vertebrae_dual',
+            kw,
+            self._on_detect_vertebrae_done,
+            self._on_auto_err,
+            busy_title='Détection vertèbres',
+            busy_message='Analyse YOLO de la fluoroscopie et du DRR…',
+        )
+
+    def _on_detect_vertebrae_done(self, res):
+        """Callback après détection YOLO dual."""
+        self._hide_busy_overlay()
+        self.btn_detect_vertebrae.setEnabled(True)
+        self.btn_auto.setEnabled(True)
+
+        det_fl = res.get('det_fl')
+        det_drr = res.get('det_drr')
+        if det_fl is None or det_drr is None:
+            self._err('Erreur lors de la détection YOLO.')
+            self.lbl_auto_status.setText('Erreur de détection.')
+            return
+
+        boxes_fl = det_fl.get('boxes', [])
+        boxes_drr = det_drr.get('boxes', [])
+        if not boxes_fl or not boxes_drr:
+            self._err(f'Aucune vertèbre détectée. Fluoro: {len(boxes_fl)}, DRR: {len(boxes_drr)}')
+            self.lbl_auto_status.setText('Aucune détection.')
+            return
+
+        # Ouvrir la fenêtre de sélection
+        dlg = VertebralDetectionWindow(
+            det_fl=det_fl,
+            det_drr=det_drr,
+            boxes_fl=boxes_fl,
+            boxes_drr=boxes_drr,
+            parent=self
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            self.lbl_auto_status.setText('Détection annulée.')
+            return
+
+        selected_fl, selected_drr = dlg.get_selected_detections()
+        n_fl = len(selected_fl)
+        n_drr = len(selected_drr)
+        self.lbl_auto_status.setText(f'✓ Détections validées : Fluoro {n_fl} | DRR {n_drr}')
+        self._status(f'Vertèbres détectées et validées : {n_fl} fluoro, {n_drr} DRR')
 
     def _auto_done(self, res):
         """Callback quand le pipeline auto émet un résultat (phase 1 ou final)."""

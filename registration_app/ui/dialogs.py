@@ -850,6 +850,164 @@ class DualYoloSelectionDialog(QDialog):
         self._render_side('drr')
 
 
+class VertebralDetectionWindow(QDialog):
+    """Fenêtre simplifiée : sélection des vertèbres par clic direct sur les images.
+    Fluoro (gauche) + DRR (droite), rectangles cliquables, juste les pourcentages."""
+    
+    def __init__(self, det_fl: dict, det_drr: dict,
+                 boxes_fl: list, boxes_drr: list,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Détection des vertèbres')
+        self.resize(1300, 650)
+        self.setStyleSheet(STYLE)
+
+        h_fl, w_fl = det_fl['infer_img'].shape[:2]
+        h_drr, w_drr = det_drr['infer_img'].shape[:2]
+        self._det_fl = det_fl
+        self._det_drr = det_drr
+        self._boxes_fl = sort_detections_vertical(normalize_detections(boxes_fl, w=w_fl, h=h_fl))
+        self._boxes_drr = sort_detections_vertical(normalize_detections(boxes_drr, w=w_drr, h=h_drr))
+        self._sel_fl = set(range(len(self._boxes_fl)))
+        self._sel_drr = set(range(len(self._boxes_drr)))
+        self._side_ui = {}
+        self._build_ui()
+        self._render_side('fl')
+        self._render_side('drr')
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+
+        title = QLabel('Cliquez sur les rectangles pour les activer/désactiver')
+        title.setStyleSheet(f'color:{ACCENT};font-size:13px;font-weight:700;background:transparent;padding:4px;')
+        outer.addWidget(title)
+
+        # Layout dual : Fluoro | DRR
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(self._build_side('fl', 'FLUORO', self._det_fl['infer_img']), 1)
+        row.addWidget(self._build_side('drr', 'DRR', self._det_drr['infer_img']), 1)
+        outer.addLayout(row, 1)
+
+        # Boutons d'action
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+        btn_ok = QPushButton('Valider')
+        btn_ok.setObjectName('success')
+        btn_ok.setFixedHeight(36)
+        btn_ok.setMinimumWidth(140)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton('Annuler')
+        btn_cancel.setFixedHeight(36)
+        btn_cancel.setMinimumWidth(120)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        outer.addLayout(btn_row)
+
+    def _build_side(self, side_key, title_text, base_img):
+        container = QWidget()
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
+
+        title = QLabel(title_text)
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f'color:{ACCENT};font-size:11px;font-weight:700;letter-spacing:2px;padding:4px;')
+        vl.addWidget(title)
+
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setMinimumSize(300, 300)
+        img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        img_label.setStyleSheet(f'background:{DARK_BG};border:1px solid {BORDER};border-radius:4px;')
+        img_label.setMouseTracking(True)
+        
+        def on_click(e, sk=side_key):
+            self._on_image_click(e, sk, img_label)
+        
+        img_label.mousePressEvent = on_click
+        vl.addWidget(img_label, 1)
+
+        summary = QLabel('')
+        summary.setObjectName('dim')
+        summary.setAlignment(Qt.AlignCenter)
+        vl.addWidget(summary)
+
+        self._side_ui[side_key] = {
+            'img': img_label,
+            'summary': summary,
+            'base_img': base_img,
+        }
+        return container
+
+    def _on_image_click(self, e, side_key, img_label):
+        """Détecte quel rectangle a été cliqué et bascule sa sélection."""
+        if not hasattr(self, '_side_ui') or side_key not in self._side_ui:
+            return
+        
+        boxes = self._boxes_fl if side_key == 'fl' else self._boxes_drr
+        base_img = self._side_ui[side_key]['base_img']
+        h, w = base_img.shape[:2]
+        
+        # Conversion coordonnées widget -> image
+        lw = img_label.width()
+        lh = img_label.height()
+        scale = min(lw / max(1, w), lh / max(1, h))
+        offset_x = (lw - w * scale) / 2.0
+        offset_y = (lh - h * scale) / 2.0
+        ix = int((e.x() - offset_x) / max(scale, 1e-6))
+        iy = int((e.y() - offset_y) / max(scale, 1e-6))
+        
+        # Test point dans polygone pour chaque rectangle
+        for i, box in enumerate(boxes):
+            pts = detection_points(box).astype(np.float32)
+            if cv2.pointPolygonTest(pts, (float(ix), float(iy)), False) >= 0:
+                sel_set = self._sel_fl if side_key == 'fl' else self._sel_drr
+                if i in sel_set:
+                    sel_set.discard(i)
+                else:
+                    sel_set.add(i)
+                self._render_side(side_key)
+                self._update_summary(side_key)
+                return
+
+    def _render_side(self, side_key):
+        """Affiche l'image avec les rectangles et pourcentages."""
+        ui = self._side_ui[side_key]
+        img = _img_to_rgb(ui['base_img'])
+        boxes = self._boxes_fl if side_key == 'fl' else self._boxes_drr
+        sel_set = self._sel_fl if side_key == 'fl' else self._sel_drr
+        
+        for i, box in enumerate(boxes):
+            color = _YOLO_BOX_PALETTE[i % len(_YOLO_BOX_PALETTE)]
+            conf_pct = int(float(box.get('conf', 0.0)) * 100)
+            label = f'{conf_pct}%'
+            img = _draw_detection(img, box, color, selected=(i in sel_set), label=label)
+        
+        _fit_rgb_to_label(img, ui['img'])
+
+    def _update_summary(self, side_key):
+        boxes = self._boxes_fl if side_key == 'fl' else self._boxes_drr
+        sel_set = self._sel_fl if side_key == 'fl' else self._sel_drr
+        self._side_ui[side_key]['summary'].setText(f'{len(sel_set)} selectionnée(s) / {len(boxes)}')
+
+    def get_selected_detections(self):
+        """Retourne les détections sélectionnées."""
+        selected_fl = [self._boxes_fl[i] for i in sorted(self._sel_fl) if 0 <= i < len(self._boxes_fl)]
+        selected_drr = [self._boxes_drr[i] for i in sorted(self._sel_drr) if 0 <= i < len(self._boxes_drr)]
+        return selected_fl, selected_drr
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render_side('fl')
+        self._render_side('drr')
+
+
 class SegOverlayWindow(QDialog):
     """Fenêtre optimisée : fluoroscopie recalée + segmentations, contrôles avancés."""
 
