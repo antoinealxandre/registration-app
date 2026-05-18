@@ -113,6 +113,10 @@ class MainWindow(QMainWindow):
         self.tseg_multilabel_path = None
         self.dicom_meta = {}
         self.fluoro_image = None; self.result = None
+        self._registered_incidences = []
+        self._current_incidence_index = 0
+        self._second_prompt_done = False
+        self._secondary_workflow_active = False
         self._drr_base_image = None
         self._loaded_images = []; self._pending_csv = None
         self._fixed_image_index = None
@@ -534,6 +538,10 @@ class MainWindow(QMainWindow):
         self.btn_reg = QPushButton('Lancer le recalage'); self.btn_reg.setObjectName('success')
         self.btn_reg.setEnabled(False); self.btn_reg.clicked.connect(self.run_registration)
         sec_reg.addWidget(self.btn_reg)
+        self.btn_second_incidence = QPushButton('Ajouter 2e incidence')
+        self.btn_second_incidence.setEnabled(False)
+        self.btn_second_incidence.clicked.connect(self._begin_second_incidence_workflow)
+        sec_reg.addWidget(self.btn_second_incidence)
         self.chk_elastic = QCheckBox('Recalage elastique (deformation libre)')
         self.chk_elastic.setToolTip(
             'Active une deformation libre (FFD 4x4) apres le recalage rigide.\n'
@@ -1208,6 +1216,10 @@ class MainWindow(QMainWindow):
     def _remove_all_images(self):
         if not self._loaded_images:
             return
+        self._registered_incidences = []
+        self._current_incidence_index = 0
+        self._second_prompt_done = False
+        self._secondary_workflow_active = False
         for entry in list(self._loaded_images):
             card = entry.get('card')
             if card:
@@ -1217,6 +1229,7 @@ class MainWindow(QMainWindow):
         self._clear_fixed_image('Toutes les images ont ete retirees.')
         self._clear_mobile_image('')
         self._sync_image_actions()
+        self._update_incidence_actions()
         self._status('Toutes les images ont ete retirees')
 
     def _assign_image(self, index, role):
@@ -1281,6 +1294,13 @@ class MainWindow(QMainWindow):
     def _invalidate_registration_state(self, reason=''):
         self.result = None
         self._yolo_det_fl = None
+        if self._current_incidence_index <= 0:
+            if self._registered_incidences:
+                self._registered_incidences = []
+            self._secondary_workflow_active = False
+            self._second_prompt_done = False
+        elif len(self._registered_incidences) > 1:
+            self._registered_incidences = self._registered_incidences[:1]
         self.lbl_iou.setText('--')
         self.lbl_iou.setStyleSheet('')
         self.lbl_dice.setText('--')
@@ -1292,6 +1312,7 @@ class MainWindow(QMainWindow):
         self.result_panel.clear_data()
         self.overlay_panel.clear_data()
         self.btn_reg.setEnabled(False)
+        self._update_incidence_actions()
         self.lbl_auto_status.setText('')
         if self._iterations:
             self._iterations = []
@@ -1365,6 +1386,200 @@ class MainWindow(QMainWindow):
         self._sync_fluoro_frame_controls(entry)
         if entry.get('role') == 'fixed':
             self._set_fixed_image(self._fixed_image_index, frame_changed=True)
+
+    def _copy_registration_result(self, res):
+        if not res:
+            return None
+        out = {}
+        for k, v in res.items():
+            if isinstance(v, np.ndarray):
+                out[k] = v.copy()
+            elif isinstance(v, (list, tuple)):
+                out[k] = type(v)(v)
+            else:
+                out[k] = v
+        return out
+
+    def _copy_proj_masks(self):
+        out = {}
+        for k, v in (self.proj_masks or {}).items():
+            if v is None:
+                continue
+            out[k] = v.copy() if isinstance(v, np.ndarray) else v
+        return out
+
+    def _current_fluoro_entry(self):
+        if self._fixed_image_index is None:
+            return None
+        if self._fixed_image_index < 0 or self._fixed_image_index >= len(self._loaded_images):
+            return None
+        return self._loaded_images[self._fixed_image_index]
+
+    def _incidence_meta_from_ui(self):
+        meta = dict(self.dicom_meta or {})
+        meta['lao'] = float(self.sp_lao.value())
+        meta['cran'] = float(self.sp_cran.value())
+        meta['table_angle'] = float(self.sp_table.value())
+        meta['fov_mm'] = float(self.sp_fov.value())
+        return meta
+
+    def _valid_registered_incidences(self):
+        return [inc for inc in self._registered_incidences if inc]
+
+    def _update_incidence_actions(self):
+        if not hasattr(self, 'btn_second_incidence'):
+            return
+        valid = self._valid_registered_incidences()
+        can_add_second = bool(valid) and len(valid) < 2
+        self.btn_second_incidence.setEnabled(can_add_second)
+        if len(valid) >= 2:
+            self.btn_second_incidence.setText('2 incidences actives')
+        else:
+            self.btn_second_incidence.setText('Ajouter 2e incidence')
+
+    def _capture_current_incidence(self, index=None, label=None):
+        if self.fluoro_image is None or self.result is None:
+            return None
+        if not self.proj_masks:
+            return None
+        idx = int(self._current_incidence_index if index is None else index)
+        entry = self._current_fluoro_entry()
+        name = entry.get('name') if entry else ''
+        meta = self._incidence_meta_from_ui()
+        fov_for_projection = (
+            AUTO_PIPELINE_FOV_MM
+            if self.result is not None and self.result.get('_auto')
+            else float(self.sp_fov.value())
+        )
+        meta['fov_mm'] = float(fov_for_projection)
+        inc = {
+            'label': label or f'Incidence {idx + 1}',
+            'name': name,
+            'fluoro': self.fluoro_image.copy(),
+            'proj_masks': self._copy_proj_masks(),
+            'result': self._copy_registration_result(self.result),
+            'reg_size': int(self.sp_size.value()),
+            'dicom_meta': meta,
+            'lao_deg': float(self.sp_lao.value()),
+            'cran_deg': float(self.sp_cran.value()),
+            'table_angle': float(self.sp_table.value()),
+            'fov_mm': float(fov_for_projection),
+        }
+        while len(self._registered_incidences) <= idx:
+            self._registered_incidences.append(None)
+        self._registered_incidences[idx] = inc
+        self._update_incidence_actions()
+        return inc
+
+    def _finalize_registration_workflow(self):
+        self._capture_current_incidence(
+            index=self._current_incidence_index,
+            label=f'Incidence {self._current_incidence_index + 1}',
+        )
+        self._update_overlay()
+        if self._current_incidence_index == 0 and not self._second_prompt_done:
+            self._second_prompt_done = True
+            answer = QMessageBox.question(
+                self,
+                'Deuxieme incidence',
+                'Voulez-vous ajouter une 2e incidence fluoroscopique ?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._begin_second_incidence_workflow()
+
+    def _choose_loaded_second_incidence(self):
+        candidates = []
+        for i, entry in enumerate(self._loaded_images):
+            if i == self._fixed_image_index:
+                continue
+            if not entry.get('dicom_meta'):
+                continue
+            meta = entry.get('dicom_meta') or {}
+            label = (
+                f'{entry.get("name", f"Image {i + 1}")} | '
+                f'LAO={float(meta.get("lao", 0.0) or 0.0):+.1f} deg  '
+                f'CRAN={float(meta.get("cran", 0.0) or 0.0):+.1f} deg  '
+                f'FOV={float(meta.get("fov_mm", DEFAULT_FOV_MM) or DEFAULT_FOV_MM):.1f} mm'
+            )
+            candidates.append((i, label))
+
+        if not candidates:
+            self._err(
+                'Chargez d abord la 2e incidence DICOM dans l onglet Images, '
+                'puis cliquez de nouveau sur "Ajouter 2e incidence".'
+            )
+            return None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Choisir la 2e incidence')
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        hint = QLabel('Selectionnez une incidence DICOM deja chargee :')
+        hint.setObjectName('dim')
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        combo = QComboBox()
+        for idx, label in candidates:
+            combo.addItem(label, idx)
+        lay.addWidget(combo)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_cancel = QPushButton('Annuler')
+        btn_ok = QPushButton('Utiliser cette incidence')
+        btn_ok.setObjectName('primary')
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok.clicked.connect(dlg.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        lay.addLayout(row)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return combo.currentData()
+
+    def _begin_second_incidence_workflow(self):
+        if self.result is not None and self._current_incidence_index == 0:
+            self._capture_current_incidence(index=0, label='Incidence 1')
+        if not self._valid_registered_incidences():
+            self._err('Validez d abord le recalage de la 1ere incidence.')
+            return
+
+        idx = self._choose_loaded_second_incidence()
+        if idx is None:
+            self._update_incidence_actions()
+            return
+
+        self._secondary_workflow_active = True
+        self._current_incidence_index = 1
+
+        if idx < 0 or idx >= len(self._loaded_images):
+            self._current_incidence_index = 0
+            self._update_incidence_actions()
+            return
+
+        if self._loaded_images[idx].get('role') == 'mobile':
+            self._clear_mobile_image('Image mobile remplacee par la 2e incidence.')
+
+        self._assign_image(idx, 'fixed')
+        if self._loaded_images[idx].get('card'):
+            self._loaded_images[idx]['card'].set_role_external('fixed')
+
+        self._clear_mobile_image('DRR a regenerer pour la 2e incidence.')
+        self.cv_fl.clear_all()
+        self.cv_drr.clear_all()
+        self.btn_second_incidence.setEnabled(False)
+        self.sec_drr.set_open(True)
+        self.tabs.setCurrentIndex(0)
+        self.lbl_auto_status.setText(
+            '2e incidence selectionnee. Ajustez le FOV si besoin, puis cliquez "Generer DRR".'
+        )
+        self._status('2e incidence selectionnee -- reglez le FOV puis generez le DRR.')
 
     def _apply_dicom_meta(self, meta, update_controls=True):
         """Remplit les spinboxes et labels UI depuis un dict de métadonnées."""
@@ -1781,8 +1996,8 @@ class MainWindow(QMainWindow):
         if 0 <= self._current_iter_idx < len(self._iterations):
             self._iterations[self._current_iter_idx]['result'] = res
             self._refresh_iter_list()
-        self._update_overlay()
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
+        self._finalize_registration_workflow()
 
     def _build_result(self,res):
         s=self.sp_size.value()
@@ -1879,6 +2094,7 @@ class MainWindow(QMainWindow):
             fov_for_projection = AUTO_PIPELINE_FOV_MM
         else:
             fov_for_projection = self.sp_fov.value()
+        incidences = self._valid_registered_incidences()
         self.overlay_panel.set_data(
             fluoro=self.fluoro_image,
             proj_masks=self.proj_masks,
@@ -1887,9 +2103,12 @@ class MainWindow(QMainWindow):
             seg_volumes=self._projection_seg_masks(),
             ct_affine=self.ct_aff,
             lao_deg=self.sp_lao.value(),
-            cran_deg=self.sp_cran.value() + 180.0,
+            cran_deg=self.sp_cran.value(),
             table_angle=self.sp_table.value(),
             fov_mm=fov_for_projection,
+            dicom_meta=self._incidence_meta_from_ui(),
+            incidence_label=f'Incidence {self._current_incidence_index + 1}',
+            incidences=incidences,
         )
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(4)
@@ -2116,9 +2335,6 @@ class MainWindow(QMainWindow):
         self._build_result(res)
         self.tabs.setCurrentIndex(3)
 
-        # Mettre à jour l'onglet overlay final
-        self._update_overlay()
-
         # Label résumé
         n_fl = res.get('n_fluoro_sel', '?')
         n_drr = res.get('n_drr_sel', '?')
@@ -2127,6 +2343,7 @@ class MainWindow(QMainWindow):
             f'Fluoro : {n_fl} vertèbre(s) | DRR : {n_drr} vertèbre(s)')
         self._status(
             f'Pipeline auto terminé — IoU={iou:.4f}  Dice={dice:.4f}')
+        self._finalize_registration_workflow()
 
     def _on_auto_err(self, msg):
         self._hide_busy_overlay()

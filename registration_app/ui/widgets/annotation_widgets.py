@@ -1479,6 +1479,151 @@ def _color_for_structure(name: str, index: int) -> tuple:
     return _SEG_PALETTE[index % len(_SEG_PALETTE)]
 
 
+def _unit_vec(vec, fallback):
+    arr = np.asarray(vec, dtype=np.float32).reshape(3)
+    n = float(np.linalg.norm(arr))
+    if n <= 1e-6 or not np.isfinite(n):
+        return np.asarray(fallback, dtype=np.float32)
+    return arr / n
+
+
+def _rot_x(deg: float) -> np.ndarray:
+    a = np.deg2rad(float(deg))
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1.0, 0.0, 0.0],
+                     [0.0, c, -s],
+                     [0.0, s, c]], dtype=np.float32)
+
+
+def _rot_y(deg: float) -> np.ndarray:
+    a = np.deg2rad(float(deg))
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0.0, s],
+                     [0.0, 1.0, 0.0],
+                     [-s, 0.0, c]], dtype=np.float32)
+
+
+def _rot_z(deg: float) -> np.ndarray:
+    a = np.deg2rad(float(deg))
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0],
+                     [s, c, 0.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float32)
+
+
+def _carm_rotation_from_meta(meta: dict) -> np.ndarray:
+    meta = meta or {}
+
+    def _angle(*keys):
+        for key in keys:
+            val = meta.get(key)
+            if val is None:
+                continue
+            try:
+                return float(val)
+            except Exception:
+                continue
+        return 0.0
+
+    # For 3D plane orientation, use the raw C-arm convention when available:
+    # Primary/P-arm = LAO/RAO around scene Y, Secondary/C-arm = CRAN/CAUD around X.
+    lao = _angle('arm_p', 'positioner_primary_angle', 'lao')
+    cran = _angle('arm_c', 'positioner_secondary_angle', 'cran')
+    table = float(meta.get('table_angle', 0.0) or 0.0)
+    # Convention locale: LAO autour de Y, CRAN autour de X, table autour de Z.
+    # Les signes restent isoles ici pour faciliter la correction des axes.
+    return (_rot_z(table) @ _rot_x(cran) @ _rot_y(lao)).astype(np.float32)
+
+
+def _orientation_from_iop(meta: dict):
+    vals = (meta or {}).get('image_orientation_patient')
+    if vals is None:
+        return None
+    try:
+        arr = np.asarray(vals, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size < 6:
+        return None
+    row = _unit_vec(arr[:3], (1.0, 0.0, 0.0))
+    col = _unit_vec(arr[3:6], (0.0, 1.0, 0.0))
+    normal = _unit_vec(np.cross(row, col), (0.0, 0.0, 1.0))
+    col = _unit_vec(np.cross(normal, row), col)
+    return row, col, normal
+
+
+def _plane_axes_from_dicom(meta: dict, reference_meta: dict = None):
+    """
+    Return row, column, normal vectors in the PyVista scene.
+
+    If ImageOrientationPatient is present for both incidences, use it as the
+    primary source and express the second plane in the first plane basis.
+    Otherwise fall back to C-arm angles extracted from the DICOM metadata.
+    """
+    default_row = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    default_col = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    default_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    cur_iop = _orientation_from_iop(meta)
+    ref_iop = _orientation_from_iop(reference_meta)
+    if cur_iop is not None and ref_iop is not None:
+        ref_basis = np.column_stack(ref_iop).astype(np.float32)
+        row = ref_basis.T @ cur_iop[0]
+        col = ref_basis.T @ cur_iop[1]
+        normal = ref_basis.T @ cur_iop[2]
+    else:
+        r_cur = _carm_rotation_from_meta(meta)
+        r_ref = _carm_rotation_from_meta(reference_meta)
+        r_rel = r_cur @ r_ref.T
+        row = r_rel @ default_row
+        col = r_rel @ default_col
+        normal = r_rel @ default_normal
+
+    row = _unit_vec(row, default_row)
+    normal = _unit_vec(normal, default_normal)
+    col = _unit_vec(np.cross(normal, row), col)
+    normal = _unit_vec(np.cross(row, col), normal)
+    return row.astype(np.float32), col.astype(np.float32), normal.astype(np.float32)
+
+
+def _square_rgb_from_fluoro(fluoro: np.ndarray) -> np.ndarray:
+    fl = np.clip(fluoro, 0, 1).astype(np.float32)
+    side = int(max(fl.shape[:2]))
+    u8 = (fl * 255).astype(np.uint8)
+    if u8.shape[:2] != (side, side):
+        sq = np.zeros((side, side), dtype=np.uint8)
+        sq[:u8.shape[0], :u8.shape[1]] = u8
+        u8 = sq
+    return cv2.cvtColor(u8, cv2.COLOR_GRAY2RGB)
+
+
+def _make_textured_plane(pv, center, row_axis, col_axis, size):
+    half = float(size) * 0.5
+    c = np.asarray(center, dtype=np.float32)
+    u = _unit_vec(row_axis, (1.0, 0.0, 0.0))
+    v = _unit_vec(col_axis, (0.0, 1.0, 0.0))
+    points = np.array([
+        c - u * half - v * half,
+        c + u * half - v * half,
+        c + u * half + v * half,
+        c - u * half + v * half,
+    ], dtype=np.float32)
+    faces = np.array([4, 0, 1, 2, 3], dtype=np.int64)
+    plane = pv.PolyData(points, faces)
+    tcoords = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+    ], dtype=np.float32)
+    plane.point_data['Texture Coordinates'] = tcoords
+    try:
+        plane.point_data.active_texture_coordinates_name = 'Texture Coordinates'
+    except Exception:
+        pass
+    return plane
+
+
 class FinalOverlayPanel(QWidget):
     """
     Onglet intégré : vue fluoroscopie 2D avec segmentations 3D
@@ -1498,6 +1643,8 @@ class FinalOverlayPanel(QWidget):
         self._view_table = 0.0
         self._view_fov_mm = None
         self._result = None
+        self._dicom_meta = {}
+        self._incidences = []
         self._reg_size = 512
         self._mode = 0
         self._alpha = 0.35
@@ -1643,7 +1790,10 @@ class FinalOverlayPanel(QWidget):
                  lao_deg: float = 0.0,
                  cran_deg: float = 0.0,
                  table_angle: float = 0.0,
-                 fov_mm: float = None):
+                 fov_mm: float = None,
+                 dicom_meta: dict = None,
+                 incidence_label: str = 'Incidence 1',
+                 incidences: list = None):
         """
         fluoro     : float32 [0,1] image fluoroscopie (résolution native)
         proj_masks : {nom_structure: masque 2D float32 à reg_size}
@@ -1659,7 +1809,23 @@ class FinalOverlayPanel(QWidget):
         self._view_table = float(table_angle)
         self._view_fov_mm = fov_mm
         self._result = result
+        self._dicom_meta = dict(dicom_meta or {})
         self._reg_size = reg_size
+        if incidences:
+            self._incidences = [dict(inc) for inc in incidences]
+        else:
+            self._incidences = [{
+                'label': incidence_label or 'Incidence 1',
+                'fluoro': self._fluoro,
+                'proj_masks': self._proj_masks,
+                'result': self._result,
+                'reg_size': self._reg_size,
+                'dicom_meta': self._dicom_meta,
+                'lao_deg': self._view_lao,
+                'cran_deg': self._view_cran,
+                'table_angle': self._view_table,
+                'fov_mm': self._view_fov_mm,
+            }]
         self._colors = {}
         self._vis = {}
         for i, name in enumerate(self._proj_masks):
@@ -1676,6 +1842,8 @@ class FinalOverlayPanel(QWidget):
         self._seg_volumes = {}
         self._ct_affine = None
         self._result = None
+        self._dicom_meta = {}
+        self._incidences = []
         self._full_image = None
         self._vis = {}
         self._colors = {}
@@ -1711,7 +1879,9 @@ class FinalOverlayPanel(QWidget):
             self._inner_l.addWidget(row)
         self._inner_l.addStretch()
         n = len(self._proj_masks)
-        self._lbl_info.setText(f'{n} structure(s) projetée(s)')
+        n_inc = len(getattr(self, '_incidences', []) or [])
+        inc_txt = f' | {n_inc} incidence(s) 3D' if n_inc > 1 else ''
+        self._lbl_info.setText(f'{n} structure(s) projetée(s){inc_txt}')
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _toggle(self, name):
@@ -1861,17 +2031,20 @@ class FinalOverlayPanel(QWidget):
         cv2.imwrite(p, bgr)
         QMessageBox.information(self, 'Export', f'Sauvegardé :\n{p}')
 
-    def _apply_registration_to_points(self, pts_xy: np.ndarray) -> np.ndarray:
+    def _apply_registration_to_points(self, pts_xy: np.ndarray,
+                                      result: dict = None,
+                                      reg_size: int = None) -> np.ndarray:
         """Apply rigid + elastic registration to 2D points in reg_size coordinates."""
-        if pts_xy.size == 0 or self._result is None:
+        reg = result if result is not None else self._result
+        size = int(reg_size or self._reg_size)
+        if pts_xy.size == 0 or reg is None:
             return pts_xy
 
-        reg = self._result
         tx = float(reg.get('tx', 0.0))
         ty = float(reg.get('ty', 0.0))
         angle = float(reg.get('angle', 0.0))
         scale = float(reg.get('scale', 1.0))
-        center = reg.get('center', (self._reg_size * 0.5, self._reg_size * 0.5))
+        center = reg.get('center', (size * 0.5, size * 0.5))
         cx, cy = float(center[0]), float(center[1])
 
         mat = cv2.getRotationMatrix2D((cx, cy), angle, scale)
@@ -1887,9 +2060,9 @@ class FinalOverlayPanel(QWidget):
         if reg.get('elastic') and ('disp_x' in reg) and ('disp_y' in reg):
             dx = reg['disp_x'].astype(np.float32)
             dy = reg['disp_y'].astype(np.float32)
-            if dx.shape != (self._reg_size, self._reg_size):
-                dx = cv2.resize(dx, (self._reg_size, self._reg_size), interpolation=cv2.INTER_LINEAR)
-                dy = cv2.resize(dy, (self._reg_size, self._reg_size), interpolation=cv2.INTER_LINEAR)
+            if dx.shape != (size, size):
+                dx = cv2.resize(dx, (size, size), interpolation=cv2.INTER_LINEAR)
+                dy = cv2.resize(dy, (size, size), interpolation=cv2.INTER_LINEAR)
 
             def _sample_bilinear(field: np.ndarray, xq: np.ndarray, yq: np.ndarray) -> np.ndarray:
                 """Bilinear sampling with constant-zero border for arbitrary point count."""
@@ -1930,9 +2103,9 @@ class FinalOverlayPanel(QWidget):
 
         return out
 
-    def _fov_scale_for_mask(self, mask_3d: np.ndarray) -> float:
+    def _fov_scale_for_mask(self, mask_3d: np.ndarray, fov_mm: float = None) -> float:
         """Return the same in-plane scale correction used by project_mask_3d."""
-        fov = self._view_fov_mm
+        fov = self._view_fov_mm if fov_mm is None else fov_mm
         if fov is None or float(fov) <= 0 or self._ct_affine is None:
             return 1.0
         try:
@@ -1946,7 +2119,10 @@ class FinalOverlayPanel(QWidget):
             return 1.0
 
     def _volume_to_registered_mesh(self, pv, mask_name: str,
-                                   mask_3d: np.ndarray, side: int):
+                                   mask_3d: np.ndarray, side: int,
+                                   result: dict = None,
+                                   reg_size: int = None,
+                                   fov_mm: float = None):
         """Build an anatomical 3D mesh from NIfTI segmentation and register its projection."""
         if mask_3d is None:
             return None
@@ -1986,7 +2162,8 @@ class FinalOverlayPanel(QWidget):
             return None
 
         nx, ny, nz = vol.shape
-        reg_size = float(self._reg_size)
+        reg_size_int = int(reg_size or self._reg_size)
+        reg_size = float(reg_size_int)
 
         # Projection to DRR in-plane coordinates (same convention as project_mask_3d).
         x_plane = verts[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
@@ -1996,18 +2173,22 @@ class FinalOverlayPanel(QWidget):
         # this corresponds to a superior/inferior flip in 2D image coordinates.
         y_plane = (reg_size - 1.0) - y_plane
 
-        fov_scale = self._fov_scale_for_mask(mask_3d)
+        fov_scale = self._fov_scale_for_mask(mask_3d, fov_mm=fov_mm)
         if abs(fov_scale - 1.0) > 0.02:
             c = reg_size * 0.5
             x_plane = c + (x_plane - c) * fov_scale
             y_plane = c + (y_plane - c) * fov_scale
 
         pts_plane = np.column_stack([x_plane, y_plane]).astype(np.float32)
-        pts_plane = self._apply_registration_to_points(pts_plane)
+        pts_plane = self._apply_registration_to_points(
+            pts_plane,
+            result=result,
+            reg_size=reg_size_int,
+        )
 
         # Overlay panel displays on fluoroscopy native size.
-        if side != self._reg_size:
-            sf = float(side) / float(self._reg_size)
+        if side != reg_size_int:
+            sf = float(side) / float(reg_size_int)
             pts_plane *= sf
 
         # Use AP axis (axis 1) as real depth axis.
@@ -2074,31 +2255,33 @@ class FinalOverlayPanel(QWidget):
             )
             return
 
-        fluoro = np.clip(self._fluoro, 0, 1).astype(np.float32)
-        side = int(max(fluoro.shape[:2]))
-        fluoro_u8 = (fluoro * 255).astype(np.uint8)
-        if fluoro_u8.shape[:2] != (side, side):
-            fluoro_u8 = cv2.resize(fluoro_u8, (side, side), interpolation=cv2.INTER_LINEAR)
-        fluoro_rgb = cv2.cvtColor(fluoro_u8, cv2.COLOR_GRAY2RGB)
+        incidences = [dict(inc) for inc in (self._incidences or []) if inc.get('fluoro') is not None]
+        if not incidences:
+            incidences = [{
+                'label': 'Incidence 1',
+                'fluoro': self._fluoro,
+                'proj_masks': self._proj_masks,
+                'result': self._result,
+                'reg_size': self._reg_size,
+                'dicom_meta': self._dicom_meta,
+                'fov_mm': self._view_fov_mm,
+            }]
 
-        texture = pv.numpy_to_texture(np.ascontiguousarray(fluoro_rgb))
+        base_inc = incidences[0]
+        base_fluoro = np.clip(base_inc.get('fluoro', self._fluoro), 0, 1).astype(np.float32)
+        side = int(max(base_fluoro.shape[:2]))
+        base_result = base_inc.get('result') or self._result
+        base_reg_size = int(base_inc.get('reg_size') or self._reg_size)
+        base_fov_mm = base_inc.get('fov_mm', self._view_fov_mm)
+        base_proj_masks = base_inc.get('proj_masks') or self._proj_masks
+
         plotter = pv.Plotter(window_size=(1280, 900))
         plotter.set_background("#12151f")
 
-        plane = pv.Plane(
-            center=(side * 0.5, side * 0.5, 0.0),
-            direction=(0.0, 0.0, 1.0),
-            i_size=float(side),
-            j_size=float(side),
-            i_resolution=1,
-            j_resolution=1,
-        )
-        plane.texture_map_to_plane(inplace=True)
-        plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
-
         added_meshes = 0
+        mesh_bounds = []
 
-        for idx, (name, _) in enumerate(self._proj_masks.items()):
+        for idx, (name, _) in enumerate(base_proj_masks.items()):
             if not self._vis.get(name, True):
                 continue
 
@@ -2106,10 +2289,21 @@ class FinalOverlayPanel(QWidget):
             if vol is None:
                 continue
 
-            mesh = self._volume_to_registered_mesh(pv, name, vol, side)
+            mesh = self._volume_to_registered_mesh(
+                pv,
+                name,
+                vol,
+                side,
+                result=base_result,
+                reg_size=base_reg_size,
+                fov_mm=base_fov_mm,
+            )
             if mesh is None or mesh.n_points < 3:
                 continue
 
+            if name not in self._colors:
+                self._colors[name] = _color_for_structure(name, idx)
+                self._vis.setdefault(name, True)
             color = tuple(c / 255.0 for c in self._colors.get(name, (200, 200, 200)))
 
             plotter.add_mesh(
@@ -2137,6 +2331,10 @@ class FinalOverlayPanel(QWidget):
                 pass
 
             added_meshes += 1
+            try:
+                mesh_bounds.append(mesh.bounds)
+            except Exception:
+                pass
 
         if added_meshes == 0:
             plotter.close()
@@ -2148,12 +2346,93 @@ class FinalOverlayPanel(QWidget):
             )
             return
 
+        if mesh_bounds:
+            z_min = min(float(b[4]) for b in mesh_bounds)
+            z_max = max(float(b[5]) for b in mesh_bounds)
+            z_center = (z_min + z_max) * 0.5
+        else:
+            z_center = 10.0
+        isocenter = np.array([side * 0.5, side * 0.5, z_center], dtype=np.float32)
+
+        ref_meta = base_inc.get('dicom_meta') or {}
+        ref_fov = float(base_inc.get('fov_mm') or self._view_fov_mm or 0.0)
+        plane_entries = []
+        for idx, inc in enumerate(incidences):
+            fluoro_rgb = _square_rgb_from_fluoro(inc.get('fluoro'))
+            texture = pv.numpy_to_texture(np.ascontiguousarray(fluoro_rgb))
+            meta = inc.get('dicom_meta') or {}
+            row_axis, col_axis, normal = _plane_axes_from_dicom(meta, ref_meta)
+
+            fov = float(inc.get('fov_mm') or ref_fov or 0.0)
+            if ref_fov > 1e-6 and fov > 1e-6:
+                plane_size = float(side) * float(np.clip(fov / ref_fov, 0.35, 2.8))
+            else:
+                plane_size = float(side)
+
+            plane = _make_textured_plane(
+                pv,
+                isocenter,
+                row_axis,
+                col_axis,
+                plane_size,
+            )
+            actor = plotter.add_mesh(
+                plane,
+                texture=texture,
+                name=f'fluoro_plane_{idx + 1}',
+                lighting=False,
+                opacity=1.0,
+            )
+            label = str(inc.get('label') or f'Incidence {idx + 1}')
+            try:
+                plotter.add_point_labels(
+                    np.array([isocenter + normal * (plane_size * 0.53)], dtype=np.float32),
+                    [label],
+                    font_size=10,
+                    text_color='white',
+                    point_size=0,
+                    shape_opacity=0.25,
+                )
+            except Exception:
+                pass
+            plane_entries.append((actor, normal))
+
+        if len(plane_entries) == 1:
+            actor, normal = plane_entries[0]
+
+            def _set_depth(value):
+                offset = normal * float(value)
+                try:
+                    actor.SetPosition(float(offset[0]), float(offset[1]), float(offset[2]))
+                except Exception:
+                    try:
+                        actor.position = (float(offset[0]), float(offset[1]), float(offset[2]))
+                    except Exception:
+                        return
+                try:
+                    plotter.render()
+                except Exception:
+                    pass
+
+            plotter.add_slider_widget(
+                _set_depth,
+                rng=(-side * 0.75, side * 0.75),
+                value=0.0,
+                title='Profondeur',
+                pointa=(0.93, 0.16),
+                pointb=(0.93, 0.84),
+                style='modern',
+            )
+
         plotter.enable_parallel_projection()
-        plotter.add_text('Maillages anatomiques 3D recales sur fluoroscopie', font_size=10)
+        if len(incidences) > 1:
+            plotter.add_text('Maillages fixes + deux incidences fluoroscopiques', font_size=10)
+        else:
+            plotter.add_text('Maillages anatomiques 3D recales sur fluoroscopie', font_size=10)
         plotter.add_axes(line_width=2)
         plotter.camera_position = [
-            (side * 0.5, side * 0.5, side * 1.7),
-            (side * 0.5, side * 0.5, 0.0),
+            (side * 0.5, side * 0.5, z_center + side * 1.7),
+            (side * 0.5, side * 0.5, z_center),
             (0.0, -1.0, 0.0),
         ]
         plotter.show(title='Vue 3D - Overlay recale', auto_close=True)

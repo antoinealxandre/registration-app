@@ -111,7 +111,12 @@ def read_dicom_fluoro_series(path: str):
         if val is None:
             return None
         try:
-            return [float(v) for v in str(val).split('\\')]
+            if isinstance(val, (list, tuple)) or (
+                hasattr(val, '__iter__') and not isinstance(val, (str, bytes))
+            ):
+                return [float(v) for v in val]
+            text = str(val).strip().strip('[]').replace(',', '\\')
+            return [float(v.strip()) for v in text.split('\\') if v.strip()]
         except Exception:
             return None
 
@@ -176,6 +181,9 @@ def read_dicom_fluoro_series(path: str):
     fov_origin_raw = _get_multi('FieldOfViewOrigin')
     fov_origin = tuple(int(v) for v in fov_origin_raw) if fov_origin_raw else None
 
+    image_orientation_patient = _get_multi('ImageOrientationPatient')
+    image_position_patient = _get_multi('ImagePositionPatient')
+
     table_angle = _get_float('TableAngle', 0.0)
 
     arm_l = _get_private(0x0019, 0x1001, None)
@@ -226,6 +234,10 @@ def read_dicom_fluoro_series(path: str):
         fov_shape=fov_shape,
         fov_origin=fov_origin,
         table_angle=table_angle,
+        positioner_primary_angle=primary,
+        positioner_secondary_angle=secondary,
+        image_orientation_patient=image_orientation_patient,
+        image_position_patient=image_position_patient,
         arm_l=arm_l,
         arm_p=arm_p,
         arm_c=arm_c,
@@ -334,6 +346,9 @@ def read_metadata_csv(path: str):
     if not np.isfinite(fov_mm) or fov_mm <= 0:
         fov_mm = DEFAULT_FOV_MM
 
+    image_orientation_patient = _flist('ImageOrientationPatient')
+    image_position_patient = _flist('ImagePositionPatient')
+
     table_angle = _f('TableAngle', 0.0)
     arm_l = _f('AngleValueLArm', None) if 'AngleValueLArm' in lookup else None
     arm_p = _f('AngleValuePArm', None) if 'AngleValuePArm' in lookup else None
@@ -376,6 +391,10 @@ def read_metadata_csv(path: str):
         fov_shape=fov_shape,
         fov_origin=fov_origin,
         table_angle=table_angle,
+        positioner_primary_angle=primary,
+        positioner_secondary_angle=secondary,
+        image_orientation_patient=image_orientation_patient,
+        image_position_patient=image_position_patient,
         arm_l=arm_l,
         arm_p=arm_p,
         arm_c=arm_c,
