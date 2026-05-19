@@ -1,5 +1,6 @@
 ﻿"""Reusable annotation widgets and visualization panels."""
 
+import math
 import numpy as np
 import cv2
 
@@ -490,6 +491,8 @@ class BusyOverlay(QWidget):
 class AnnotationCanvas(QLabel):
     mask_updated = pyqtSignal()
     wheel_scrolled = pyqtSignal(int)
+    stent_pose_changed = pyqtSignal(float, float, float)
+    point_picked = pyqtSignal(str, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -515,8 +518,25 @@ class AnnotationCanvas(QLabel):
         self._rect_cur   = None
         self._cursor_pos = None
         self._alpha      = 0.40
+        self._overlay_mask = None
+        self._overlay_color = (255, 200, 80)
+        self._overlay_alpha = 0.35
+        self._overlay_lw = 2
+        self._stent_mode_active = False
+        self._stent_center = None
+        self._stent_axis_deg = 0.0
+        self._stent_axis_len = None
+        self._stent_drag_mode = None
+        self._stent_drag_offset = None
+        self._stent_handle_radius = 12
+        self._tool_before_stent = None
+        self._pick_mode = None              # nom du point en attente de capture
+        self._point_markers = {}            # name -> {'xy', 'color', 'label'}
 
     # ── API ───────────────────────────────────────────────────────────────────
+
+    def image_size(self) -> int:
+        return int(self._size)
 
     def set_image(self, img: np.ndarray, preserve_masks: bool = False):
         if img is None:
@@ -565,6 +585,79 @@ class AnnotationCanvas(QLabel):
                 self._history[k] = []
         self._raw_pts=[]; self._poly_pts=[]
         self._refresh()
+
+    def set_overlay(self, mask: np.ndarray, color=(255, 200, 80), alpha: float = 0.35, line_width: int = 2):
+        if mask is None:
+            self._overlay_mask = None
+        else:
+            self._overlay_mask = mask.astype(np.float32)
+        self._overlay_color = tuple(int(v) for v in color)
+        self._overlay_alpha = float(alpha)
+        self._overlay_lw = int(max(1, line_width))
+        self._refresh()
+
+    def clear_overlay(self):
+        self._overlay_mask = None
+        self._refresh()
+
+    def set_stent_mode(self, active: bool):
+        if self._stent_mode_active == active:
+            return
+        self._stent_mode_active = active
+        if active:
+            self._tool_before_stent = self._tool
+            self.setCursor(QCursor(Qt.OpenHandCursor))
+        else:
+            if self._tool_before_stent:
+                self.set_tool(self._tool_before_stent)
+                self._tool_before_stent = None
+            else:
+                self.setCursor(QCursor(Qt.CrossCursor))
+        self._refresh()
+
+    def set_stent_pose(self, center_px=None, axis_deg=None):
+        if center_px is not None:
+            self._stent_center = (float(center_px[0]), float(center_px[1]))
+        if axis_deg is not None:
+            self._stent_axis_deg = float(axis_deg)
+        self._refresh()
+
+    def set_stent_axis_length_px(self, length_px):
+        self._stent_axis_len = None if length_px is None else float(length_px)
+        self._refresh()
+
+    def stent_pose(self):
+        return self._stent_center, float(self._stent_axis_deg)
+
+    def arm_pick(self, name: str):
+        """Arme la capture du prochain clic gauche pour le point ``name``."""
+        self._pick_mode = name
+        self.setCursor(QCursor(Qt.CrossCursor))
+
+    def disarm_pick(self):
+        self._pick_mode = None
+        if not self._stent_mode_active:
+            self.setCursor(QCursor(Qt.BlankCursor if self._tool == 'eraser' else Qt.CrossCursor))
+
+    def set_point_marker(self, name: str, xy, color=(80, 200, 255), label=None):
+        """Affiche/efface un marqueur ponctuel (ex: cusp NCC) sur l'image."""
+        if xy is None:
+            self._point_markers.pop(name, None)
+        else:
+            self._point_markers[name] = {
+                'xy': (float(xy[0]), float(xy[1])),
+                'color': tuple(int(c) for c in color),
+                'label': str(label or name),
+            }
+        self._refresh()
+
+    def clear_point_markers(self):
+        self._point_markers = {}
+        self._refresh()
+
+    def get_point_marker(self, name: str):
+        m = self._point_markers.get(name)
+        return None if m is None else m['xy']
 
     def set_tool(self, t):
         self._tool=t; self._raw_pts=[]; self._poly_pts=[]
@@ -634,6 +727,24 @@ class AnnotationCanvas(QLabel):
             h=self._history[self._active]; h.append(m.copy())
             if len(h)>30: h.pop(0)
 
+    def _emit_stent_pose(self):
+        if self._stent_center is None:
+            return
+        self.stent_pose_changed.emit(
+            float(self._stent_center[0]),
+            float(self._stent_center[1]),
+            float(self._stent_axis_deg),
+        )
+
+    def _update_stent_axis_from_point(self, ix: int, iy: int) -> None:
+        if self._stent_center is None:
+            return
+        dx = ix - self._stent_center[0]
+        dy = iy - self._stent_center[1]
+        if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+            return
+        self._stent_axis_deg = math.degrees(math.atan2(-dy, dx))
+
     def _m(self): return self._masks[self._active]
 
     # ── Dessin ────────────────────────────────────────────────────────────────
@@ -697,6 +808,46 @@ class AnnotationCanvas(QLabel):
         base=np.clip(base,0,255).astype(np.uint8)
         r,g,b=STRUCT[self._active]['rgb']
 
+        if self._overlay_mask is not None and self._overlay_mask.sum() > 0:
+            om = self._overlay_mask
+            if om.shape != (self._size, self._size):
+                om = cv2.resize(om.astype(np.float32), (self._size, self._size), interpolation=cv2.INTER_NEAREST)
+            binary = (om > 0.5).astype(np.uint8)
+            if binary.sum() > 0:
+                or_, og, ob = self._overlay_color
+                ov = base.copy()
+                ov[binary > 0] = [or_, og, ob]
+                base = cv2.addWeighted(base, 1 - self._overlay_alpha, ov, self._overlay_alpha, 0)
+                cnts, _ = cv2.findContours(binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                cv2.drawContours(base, cnts, -1, (or_, og, ob), self._overlay_lw, lineType=cv2.LINE_AA)
+
+        if self._stent_center is not None:
+            cx = int(round(self._stent_center[0]))
+            cy = int(round(self._stent_center[1]))
+            axis_len = self._stent_axis_len
+            if axis_len is None:
+                axis_len = max(60, int(self._size * 0.2))
+            half = int(round(axis_len * 0.5))
+            ang = math.radians(self._stent_axis_deg)
+            dx = int(round(math.cos(ang) * half))
+            dy = int(round(-math.sin(ang) * half))
+            p1 = (cx - dx, cy - dy)
+            p2 = (cx + dx, cy + dy)
+            cv2.line(base, p1, p2, (80, 200, 255), 2, lineType=cv2.LINE_AA)
+            cv2.circle(base, (cx, cy), 6, (80, 200, 255), -1, lineType=cv2.LINE_AA)
+            cv2.circle(base, (cx, cy), self._stent_handle_radius, (80, 200, 255), 1, lineType=cv2.LINE_AA)
+
+        # ── Marqueurs ponctuels (cusp NCC, etc.) ────────────────────────────
+        for nm, info in self._point_markers.items():
+            x, y = int(round(info['xy'][0])), int(round(info['xy'][1]))
+            col = info['color']
+            cv2.drawMarker(base, (x, y), col, cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+            cv2.circle(base, (x, y), 7, col, 2, cv2.LINE_AA)
+            lbl = info['label']
+            if lbl:
+                cv2.putText(base, lbl, (x + 10, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+
         # ── Preview crayon : tracé lissé en temps réel ────────────────────────
         if self._tool=='pencil' and len(self._raw_pts)>=2:
             smooth=catmull_rom_chain(self._raw_pts,n_interp=6)
@@ -755,6 +906,32 @@ class AnnotationCanvas(QLabel):
     def mousePressEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y())
+        if self._pick_mode and e.button() == Qt.LeftButton:
+            name = self._pick_mode
+            self._pick_mode = None
+            self.point_picked.emit(name, float(ix), float(iy))
+            self._refresh()
+            return
+        if self._stent_mode_active:
+            if e.button() != Qt.LeftButton:
+                return
+            if self._stent_center is None:
+                self._stent_center = (ix, iy)
+                self._stent_drag_mode = 'axis'
+                self._update_stent_axis_from_point(ix, iy)
+            else:
+                dx = ix - self._stent_center[0]
+                dy = iy - self._stent_center[1]
+                if math.hypot(dx, dy) <= self._stent_handle_radius:
+                    self._stent_drag_mode = 'center'
+                    self._stent_drag_offset = (self._stent_center[0] - ix, self._stent_center[1] - iy)
+                else:
+                    self._stent_drag_mode = 'axis'
+                    self._update_stent_axis_from_point(ix, iy)
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            self._emit_stent_pose()
+            self._refresh()
+            return
         if self._tool=='pencil':
             if e.button() != Qt.LeftButton:
                 return
@@ -786,6 +963,17 @@ class AnnotationCanvas(QLabel):
     def mouseMoveEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y()); self._cursor_pos=(ix,iy)
+        if self._stent_mode_active:
+            if self._stent_drag_mode == 'center':
+                off = self._stent_drag_offset or (0.0, 0.0)
+                self._stent_center = (ix + off[0], iy + off[1])
+                self._emit_stent_pose()
+                self._refresh()
+            elif self._stent_drag_mode == 'axis':
+                self._update_stent_axis_from_point(ix, iy)
+                self._emit_stent_pose()
+                self._refresh()
+            return
         if self._tool=='pencil' and self._drawing:
             if not self._raw_pts or abs(ix-self._raw_pts[-1][0])>1 or abs(iy-self._raw_pts[-1][1])>1:
                 self._raw_pts.append((ix,iy))
@@ -800,6 +988,13 @@ class AnnotationCanvas(QLabel):
     def mouseReleaseEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y())
+        if self._stent_mode_active:
+            if self._stent_drag_mode is not None:
+                self._stent_drag_mode = None
+                self._stent_drag_offset = None
+                self.setCursor(QCursor(Qt.OpenHandCursor))
+                self._refresh()
+            return
         if self._tool=='pencil' and self._drawing:
             self._drawing=False
             if (ix,iy) not in self._raw_pts: self._raw_pts.append((ix,iy))
@@ -825,6 +1020,7 @@ class SegmentationReviewPanel(QWidget):
     """Segmentation panel: axial/coronal/sagittal + external 3D window."""
 
     request_3d_view = pyqtSignal()
+    view_clicked = pyqtSignal(str, float, float, int)   # plane, col, row, slice_idx
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -838,6 +1034,9 @@ class SegmentationReviewPanel(QWidget):
         self._hi = 1000.0
         self._struct_checks = {}
         self._struct_order = {}
+        self._click_mode = None             # nom du point à capturer (ou None)
+        self._markers = {}                  # name -> {'voxel': (x,y,z), 'color': rgb, 'label': str}
+        self._view_fit = {}                 # plane -> {'x0','y0','nw','nh','ow','oh'}
         self._build_ui()
 
     def _build_ui(self):
@@ -1175,14 +1374,41 @@ class SegmentationReviewPanel(QWidget):
             cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             cv2.drawContours(rgb, cnts, -1, color, 1, lineType=cv2.LINE_AA)
 
+        self._draw_markers_on(rgb, plane, idx)
         return np.ascontiguousarray(rgb)
+
+    def _draw_markers_on(self, rgb, plane, slice_idx):
+        """Dessine les marqueurs (hinges, MS) sur la coupe rendue."""
+        if not self._markers or self._ct_vol is None:
+            return
+        from core.measurements import view_pixel_from_voxel
+        vol_shape = self._ct_vol.shape
+        for name, m in self._markers.items():
+            col, row, native_idx = view_pixel_from_voxel(plane, m['voxel'], vol_shape)
+            # rendu : rotated view shape correspond à l'image courante (rgb avant resize)
+            r_h, r_w = rgb.shape[:2]
+            cx, cy = int(round(col)), int(round(row))
+            if cx < 0 or cy < 0 or cx >= r_w or cy >= r_h:
+                continue
+            color = tuple(int(c) for c in m['color'])
+            on_slice = abs(native_idx - slice_idx) <= 1
+            if on_slice:
+                cv2.drawMarker(rgb, (cx, cy), color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+                cv2.circle(rgb, (cx, cy), 6, color, 2, cv2.LINE_AA)
+                cv2.putText(rgb, m['label'], (cx + 8, cy - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            else:
+                # Marqueur "hors-coupe" : petit point translucide
+                overlay = rgb.copy()
+                cv2.circle(overlay, (cx, cy), 4, color, -1, cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.5, rgb, 0.5, 0, dst=rgb)
 
     def _fit_to_label(self, rgb, lbl):
         lh = max(96, lbl.height())
         lw = max(96, lbl.width())
         h, w = rgb.shape[:2]
         if h <= 0 or w <= 0:
-            return np.zeros((lh, lw, 3), dtype=np.uint8)
+            return np.zeros((lh, lw, 3), dtype=np.uint8), None
         s = min(lw / float(w), lh / float(h))
         nw = max(1, int(round(w * s)))
         nh = max(1, int(round(h * s)))
@@ -1191,10 +1417,13 @@ class SegmentationReviewPanel(QWidget):
         y0 = (lh - nh) // 2
         x0 = (lw - nw) // 2
         canvas[y0:y0 + nh, x0:x0 + nw] = resized
-        return canvas
+        fit = {'x0': x0, 'y0': y0, 'nw': nw, 'nh': nh, 'ow': w, 'oh': h}
+        return canvas, fit
 
-    def _set_lbl_img(self, lbl, rgb):
-        img = self._fit_to_label(rgb, lbl)
+    def _set_lbl_img(self, lbl, rgb, plane=None):
+        img, fit = self._fit_to_label(rgb, lbl)
+        if plane is not None and fit is not None:
+            self._view_fit[plane] = fit
         img = np.ascontiguousarray(img)
         h, w = img.shape[:2]
         qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
@@ -1207,9 +1436,9 @@ class SegmentationReviewPanel(QWidget):
             self._sa_view['label'].clear()
             return
 
-        self._set_lbl_img(self._ax_view['label'], self._render_plane('axial'))
-        self._set_lbl_img(self._co_view['label'], self._render_plane('coronal'))
-        self._set_lbl_img(self._sa_view['label'], self._render_plane('sagittal'))
+        self._set_lbl_img(self._ax_view['label'], self._render_plane('axial'), 'axial')
+        self._set_lbl_img(self._co_view['label'], self._render_plane('coronal'), 'coronal')
+        self._set_lbl_img(self._sa_view['label'], self._render_plane('sagittal'), 'sagittal')
 
     def _step_slider(self, slider, steps):
         new_val = max(slider.minimum(), min(slider.maximum(), slider.value() + int(steps)))
@@ -1235,7 +1464,50 @@ class SegmentationReviewPanel(QWidget):
                 self._step_slider(self._sl_sa, steps)
                 return True
 
+        if (event.type() == QEvent.MouseButtonPress
+                and self._click_mode is not None
+                and event.button() == Qt.LeftButton
+                and self._ct_vol is not None):
+            plane = obj.property('plane')
+            if plane in ('axial', 'coronal', 'sagittal'):
+                fit = self._view_fit.get(plane)
+                if fit is None:
+                    return True
+                px = event.pos().x() - fit['x0']
+                py = event.pos().y() - fit['y0']
+                if 0 <= px < fit['nw'] and 0 <= py < fit['nh'] and fit['nw'] > 0 and fit['nh'] > 0:
+                    col = px * fit['ow'] / fit['nw']
+                    row = py * fit['oh'] / fit['nh']
+                    slice_idx = {'axial': self._ax_idx,
+                                 'coronal': self._co_idx,
+                                 'sagittal': self._sa_idx}[plane]
+                    self.view_clicked.emit(plane, float(col), float(row), int(slice_idx))
+                return True
+
         return super().eventFilter(obj, event)
+
+    # ── API marqueurs ─────────────────────────────────────────────────────────
+    def set_click_mode(self, mode):
+        """Active la capture du prochain clic gauche pour ce mode (ou None pour arrêter)."""
+        self._click_mode = mode
+        cursor = Qt.CrossCursor if mode else Qt.ArrowCursor
+        for v in (self._ax_view, self._co_view, self._sa_view):
+            v['label'].setCursor(QCursor(cursor))
+
+    def set_marker(self, name: str, voxel_xyz, color=(80, 200, 255), label=None):
+        if voxel_xyz is None:
+            self._markers.pop(name, None)
+        else:
+            self._markers[name] = {
+                'voxel': tuple(int(round(v)) for v in voxel_xyz),
+                'color': tuple(int(c) for c in color),
+                'label': str(label or name),
+            }
+        self._render_all()
+
+    def clear_markers(self):
+        self._markers = {}
+        self._render_all()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)

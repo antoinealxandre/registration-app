@@ -1,6 +1,7 @@
 ﻿"""Main window orchestration for the registration application."""
 
 import json
+import math
 import os
 from datetime import datetime
 
@@ -49,7 +50,21 @@ from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont
 
 from core.drr_generator import load_ct, DRR_POSTPROCESS_PRESETS, enhance_drr_image
+from core.measurements import (
+    ms_length_from_hinges,
+    risk_assessment,
+    view_pixel_from_voxel,
+    voxel_from_view_pixel,
+    voxel_from_world,
+    world_from_voxel,
+)
 from core.registration import apply_full_transform
+from core.stent_placement import (
+    generate_stent_mesh,
+    project_stent_mask,
+    mask_center,
+    transform_mask,
+)
 from core.totalseg_runner import export_multilabel_segmentation
 from core.yolo_pipeline import (
     load_yolo_model as yolo_load,
@@ -119,6 +134,15 @@ class MainWindow(QMainWindow):
         self._mobile_image_index = None
         self._iterations = []
         self._current_iter_idx = -1
+        self.stent_mesh = None
+        self._stent_base_mask = None
+        self._stent_base_center = None
+        self._stent_proj_params = None
+        self._stent_center_px = None
+        self._stent_axis_deg = 0.0
+        self._stent_mode_active = False
+        self._ms_world = {}              # {'hinge1','hinge2','ms'} -> np.array world mm
+        self._ms_click_target = None     # nom du prochain point à capturer
         self._build_ui()
         self._on_drr_preset_changed(self.cb_drr_preset.currentIndex())
         self._load_yolo_default()  # Charger modèle auto au démarrage
@@ -398,6 +422,10 @@ class MainWindow(QMainWindow):
         self.btn_drr = QPushButton('Generer DRR'); self.btn_drr.setObjectName('primary')
         self.btn_drr.clicked.connect(self.generate_drr); self.btn_drr.setEnabled(False)
         sec_drr.addWidget(self.btn_drr)
+        self.sp_lao.valueChanged.connect(self._update_stent_overlay)
+        self.sp_cran.valueChanged.connect(self._update_stent_overlay)
+        self.sp_fov.valueChanged.connect(self._update_stent_overlay)
+        self.sp_fov.valueChanged.connect(lambda _v: self._ms_recompute())
         ll.addWidget(sec_drr)
 
         # ── ANNOTATION ────────────────────────────────────────────────────────
@@ -477,6 +505,95 @@ class MainWindow(QMainWindow):
         act.addWidget(b_undo, 1); act.addWidget(b_all, 1)
         sec_ann.addLayout(act)
         ll.addWidget(sec_ann)
+
+        # ── STENT ──────────────────────────────────────────────────────────
+        sec_stent = CollapsibleSection('STENT', starts_open=False)
+        stent_info = QLabel(
+            'Generer un stent (diametre + longueur) puis placer le centre et l axe sur la fluoroscopie.')
+        stent_info.setObjectName('dim'); stent_info.setWordWrap(True)
+        sec_stent.addWidget(stent_info)
+
+        stent_params = QHBoxLayout(); stent_params.setSpacing(6)
+        stent_params.addWidget(_lbl('Diam (mm)'), 0)
+        self.sp_stent_D = QDoubleSpinBox(); self.sp_stent_D.setRange(3, 40)
+        self.sp_stent_D.setValue(20); self.sp_stent_D.setSingleStep(0.5)
+        stent_params.addWidget(self.sp_stent_D, 0)
+        stent_params.addWidget(_lbl('Long (mm)'), 0)
+        self.sp_stent_L = QDoubleSpinBox(); self.sp_stent_L.setRange(5, 60)
+        self.sp_stent_L.setValue(15); self.sp_stent_L.setSingleStep(1)
+        self.sp_stent_L.valueChanged.connect(lambda _v: self._ms_recompute())
+        stent_params.addWidget(self.sp_stent_L, 0)
+        stent_params.addStretch()
+        sec_stent.addLayout(stent_params)
+
+        stent_btns = QHBoxLayout(); stent_btns.setSpacing(6)
+        self.btn_stent_gen = QPushButton('Generer stent')
+        self.btn_stent_gen.setObjectName('primary')
+        self.btn_stent_gen.clicked.connect(self._stent_generate)
+        self.btn_stent_place = QPushButton('Placer sur fluoro')
+        self.btn_stent_place.setCheckable(True)
+        self.btn_stent_place.setEnabled(False)
+        self.btn_stent_place.toggled.connect(self._toggle_stent_mode)
+        stent_btns.addWidget(self.btn_stent_gen, 1)
+        stent_btns.addWidget(self.btn_stent_place, 1)
+        sec_stent.addLayout(stent_btns)
+
+        stent_row = QHBoxLayout(); stent_row.setSpacing(6)
+        self.chk_stent_show = QCheckBox('Afficher')
+        self.chk_stent_show.setChecked(True)
+        self.chk_stent_show.toggled.connect(self._update_stent_overlay)
+        stent_row.addWidget(self.chk_stent_show)
+        stent_row.addStretch()
+        sec_stent.addLayout(stent_row)
+
+        self.lbl_stent_status = QLabel('--')
+        self.lbl_stent_status.setObjectName('dim')
+        self.lbl_stent_status.setWordWrap(True)
+        sec_stent.addWidget(self.lbl_stent_status)
+
+        ll.addWidget(sec_stent)
+
+        # ── TAVI RISK (MS length + ΔMSID + risque PM-dependency) ─────────────
+        sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
+        tavi_info = QLabel(
+            'MS length : ouvrir l onglet Seg CT et marquer 3 points sur la coupe coronale.\n'
+            'ID : poser le stent + marquer le cusp NCC sur la fluoroscopie.')
+        tavi_info.setObjectName('dim'); tavi_info.setWordWrap(True)
+        sec_tavi.addWidget(tavi_info)
+
+        self.btn_ms_h1 = QPushButton('1. Hinge L (cusp gauche)'); self.btn_ms_h1.setCheckable(True)
+        self.btn_ms_h2 = QPushButton('2. Hinge R (cusp droit)'); self.btn_ms_h2.setCheckable(True)
+        self.btn_ms_apex = QPushButton('3. MS apex (septum)'); self.btn_ms_apex.setCheckable(True)
+        for btn, key in ((self.btn_ms_h1, 'hinge1'),
+                          (self.btn_ms_h2, 'hinge2'),
+                          (self.btn_ms_apex, 'ms')):
+            btn.toggled.connect(lambda c, k=key: self._ms_arm(k if c else None))
+            sec_tavi.addWidget(btn)
+
+        self.btn_ms_reset = QPushButton('Reinitialiser les points')
+        self.btn_ms_reset.setObjectName('warn')
+        self.btn_ms_reset.clicked.connect(self._ms_reset)
+        sec_tavi.addWidget(self.btn_ms_reset)
+
+        self.lbl_ms_value = QLabel('MS length : --')
+        self.lbl_ms_value.setObjectName('metric')
+        self.lbl_ms_value.setAlignment(Qt.AlignCenter)
+        sec_tavi.addWidget(self.lbl_ms_value)
+
+        self.btn_ncc = QPushButton('Marquer cusp NCC sur fluoro')
+        self.btn_ncc.setCheckable(True)
+        self.btn_ncc.toggled.connect(self._ncc_toggle)
+        sec_tavi.addWidget(self.btn_ncc)
+
+        self.lbl_id = QLabel('ID : --'); self.lbl_id.setObjectName('dim')
+        self.lbl_delta = QLabel('DeltaMSID : --'); self.lbl_delta.setObjectName('dim')
+        self.lbl_risk = QLabel('Risque PM : --')
+        self.lbl_risk.setWordWrap(True)
+        sec_tavi.addWidget(self.lbl_id)
+        sec_tavi.addWidget(self.lbl_delta)
+        sec_tavi.addWidget(self.lbl_risk)
+
+        ll.addWidget(sec_tavi)
 
         # ── DETECTION YOLO ────────────────────────────────────────────────────
         sec_yolo = CollapsibleSection('DETECTION YOLO', starts_open=True)
@@ -653,9 +770,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget(); self.tabs.setDocumentMode(True)
         self.cv_fl = AnnotationCanvas(); self.cv_fl.mask_updated.connect(self._on_mask_upd)
         self.cv_fl.wheel_scrolled.connect(self._step_fluoro_frame)
+        self.cv_fl.stent_pose_changed.connect(self._on_stent_pose_changed)
+        self.cv_fl.point_picked.connect(self._on_point_picked)
         self.cv_drr = AnnotationCanvas(); self.cv_drr.mask_updated.connect(self._on_mask_upd)
         self.result_panel = ResultPanel()
         self.seg_review_panel = SegmentationReviewPanel()
+        self.seg_review_panel.view_clicked.connect(self._on_seg_view_clicked)
 
         for cv, hint, label in [
             (self.cv_fl, 'Image fixe -- dessiner les structures a recaler', 'Fixe'),
@@ -718,6 +838,8 @@ class MainWindow(QMainWindow):
     # ── Slots UI ──────────────────────────────────────────────────────────────
 
     def _set_tool(self, tool):
+        if self._stent_mode_active:
+            self._set_stent_mode(False, update_button=True)
         for btn, t in [
             (self.btn_pencil, 'pencil'),
             (self.btn_rect, 'rectangle'),
@@ -847,6 +969,268 @@ class MainWindow(QMainWindow):
         has_fl = mask_fl is not None and mask_fl.sum() > 0
         has_drr = mask_drr is not None and mask_drr.sum() > 0
         self.btn_reg.setEnabled(bool(has_fl and has_drr))
+
+    # ── Stent placement ─────────────────────────────────────────────────────
+
+    def _set_stent_mode(self, active: bool, update_button: bool = True):
+        self._stent_mode_active = active
+        self.cv_fl.set_stent_mode(active)
+        if update_button and hasattr(self, 'btn_stent_place'):
+            self.btn_stent_place.blockSignals(True)
+            self.btn_stent_place.setChecked(active)
+            self.btn_stent_place.blockSignals(False)
+
+    def _toggle_stent_mode(self, checked: bool):
+        self._set_stent_mode(checked, update_button=False)
+        if checked:
+            self._status('Mode stent: clic centre, glisser pour definir l axe')
+
+    def _stent_generate(self):
+        if self.fluoro_image is None:
+            self._err('Chargez une fluoroscopie d abord.')
+            return
+        try:
+            self.stent_mesh = generate_stent_mesh(
+                diameter_mm=self.sp_stent_D.value(),
+                length_mm=self.sp_stent_L.value(),
+            )
+        except Exception as ex:
+            self._err(str(ex))
+            return
+
+        size = self.cv_fl.image_size()
+        center = (float(size) * 0.5, float(size) * 0.5)
+        self._stent_center_px = center
+        self._stent_axis_deg = 0.0
+        self._stent_base_mask = None
+        self._stent_base_center = None
+        self._stent_proj_params = None
+
+        self.cv_fl.set_stent_pose(center, self._stent_axis_deg)
+        self._update_stent_axis_length()
+        self.btn_stent_place.setEnabled(True)
+        self._set_stent_mode(True, update_button=True)
+        self._update_stent_overlay()
+        self.lbl_stent_status.setText('Stent genere — placez le centre et l axe sur la fluoroscopie')
+        self._status('Stent genere. Placez le centre et l axe sur la fluoro.')
+
+    def _on_stent_pose_changed(self, cx: float, cy: float, axis_deg: float):
+        self._stent_center_px = (cx, cy)
+        self._stent_axis_deg = float(axis_deg)
+        self._update_stent_overlay()
+        self._ms_recompute()
+
+    def _update_stent_axis_length(self):
+        if self.stent_mesh is None:
+            self.cv_fl.set_stent_axis_length_px(None)
+            return
+        size = max(1, self.cv_fl.image_size())
+        pix_mm = float(self.sp_fov.value()) / float(size)
+        if pix_mm <= 0:
+            pix_mm = 1.0
+        length_px = float(self.sp_stent_L.value()) / pix_mm
+        length_px = max(60.0, min(length_px, float(size) * 0.8))
+        self.cv_fl.set_stent_axis_length_px(length_px)
+
+    def _update_stent_overlay(self):
+        if self.stent_mesh is None or not hasattr(self, 'chk_stent_show'):
+            return
+        if not self.chk_stent_show.isChecked():
+            self.cv_fl.clear_overlay()
+            return
+        size = self.cv_fl.image_size()
+        if size <= 0:
+            return
+        self._update_stent_axis_length()
+        lao = float(self.sp_lao.value())
+        cran = float(self.sp_cran.value()) + 180.0
+        sid = float(self.dicom_meta.get('sid_mm', 1020.0))
+        sod = float(self.dicom_meta.get('sod_mm', 510.0))
+        fov = float(self.sp_fov.value())
+        params = (size, lao, cran, sid, sod, fov)
+
+        if self._stent_base_mask is None or self._stent_proj_params != params:
+            try:
+                base = project_stent_mask(
+                    self.stent_mesh,
+                    lao_deg=lao,
+                    cran_deg=cran,
+                    size=size,
+                    sid_mm=sid,
+                    sod_mm=sod,
+                    fov_mm=fov,
+                )
+            except Exception as ex:
+                self._err(f'Erreur projection stent: {ex}')
+                return
+            self._stent_base_mask = base
+            self._stent_base_center = mask_center(base)
+            self._stent_proj_params = params
+
+        center = self._stent_center_px or self._stent_base_center
+        if center is None:
+            center = (float(size) * 0.5, float(size) * 0.5)
+        mask = transform_mask(
+            self._stent_base_mask,
+            center_xy=center,
+            angle_deg=self._stent_axis_deg,
+            base_center=self._stent_base_center,
+        )
+        if mask is not None:
+            self.cv_fl.set_overlay(mask, color=(255, 200, 80), alpha=0.35, line_width=2)
+
+    def _clear_stent_state(self, message: str = ''):
+        self.stent_mesh = None
+        self._stent_base_mask = None
+        self._stent_base_center = None
+        self._stent_proj_params = None
+        self._stent_center_px = None
+        self._stent_axis_deg = 0.0
+        if hasattr(self, 'btn_stent_place'):
+            self.btn_stent_place.setEnabled(False)
+            self._set_stent_mode(False, update_button=True)
+        if hasattr(self, 'chk_stent_show'):
+            self.cv_fl.clear_overlay()
+        if hasattr(self, 'lbl_stent_status') and message:
+            self.lbl_stent_status.setText(message)
+        # ID dépend du stent : invalider et rafraîchir le panneau TAVI
+        if hasattr(self, 'lbl_ms_value'):
+            self._ms_recompute()
+
+    # ── TAVI risk (MS length + ΔMSID + risque PM-dependency) ────────────────
+
+    _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex')
+    _MS_ORDER = ('hinge1', 'hinge2', 'ms')
+    _MS_HINT = {
+        'hinge1': 'Cliquez sur le hinge L (cusp gauche) sur la coupe coronale.',
+        'hinge2': 'Cliquez sur le hinge R (cusp droit) sur la coupe coronale.',
+        'ms':     'Cliquez sur l apex du septum membraneux (debut du septum musculaire).',
+    }
+    _MS_MARKER = {
+        'hinge1': ((100, 200, 255), 'Hinge L'),
+        'hinge2': ((255, 200, 100), 'Hinge R'),
+        'ms':     ((255, 100, 100), 'MS'),
+    }
+
+    def _ms_arm(self, key):
+        """Arme le prochain clic sur la coupe pour ``key`` (hinge1/hinge2/ms) ou désarme si None."""
+        for name, k in zip(self._MS_BUTTONS, self._MS_ORDER):
+            btn = getattr(self, name)
+            btn.blockSignals(True)
+            btn.setChecked(k == key)
+            btn.blockSignals(False)
+        self._ms_click_target = key
+        if hasattr(self, 'seg_review_panel'):
+            self.seg_review_panel.set_click_mode(key)
+        if key:
+            self.tabs.setCurrentWidget(self.seg_review_panel)
+            self._status(self._MS_HINT[key])
+
+    def _ms_reset(self):
+        self._ms_world = {}
+        if hasattr(self, 'seg_review_panel'):
+            self.seg_review_panel.clear_markers()
+        self.cv_fl.set_point_marker('ncc', None)
+        if hasattr(self, 'btn_ncc'):
+            self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
+        self.cv_fl.disarm_pick()
+        self._ms_arm(None)
+        self._ms_update_labels(None, None)
+        self._status('Mesures TAVI reinitialisees.')
+
+    def _on_seg_view_clicked(self, plane, col, row, slice_idx):
+        if not self._ms_click_target or self.ct_vol is None:
+            return
+        voxel = voxel_from_view_pixel(plane, col, row, self.ct_vol.shape, slice_idx)
+        world = world_from_voxel(voxel, self.ct_aff)
+        key = self._ms_click_target
+        self._ms_world[key] = np.asarray(world, dtype=np.float64)
+        color, label = self._MS_MARKER[key]
+        self.seg_review_panel.set_marker(key, voxel, color, label)
+        # Auto-advance vers le prochain point manquant
+        next_key = None
+        for k in self._MS_ORDER:
+            if k not in self._ms_world:
+                next_key = k; break
+        self._ms_arm(next_key)
+        self._ms_recompute()
+
+    def _ncc_toggle(self, checked):
+        if checked:
+            if self.fluoro_image is None:
+                self._err('Chargez une fluoroscopie d abord.')
+                self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
+                return
+            self.cv_fl.arm_pick('ncc')
+            self.tabs.setCurrentIndex(0)
+            self._status('Cliquez sur le cusp non-coronaire (NCC) sur la fluoroscopie.')
+        else:
+            self.cv_fl.disarm_pick()
+
+    def _on_point_picked(self, name, x, y):
+        if name == 'ncc':
+            self.cv_fl.set_point_marker('ncc', (x, y), color=(80, 200, 255), label='NCC')
+            if hasattr(self, 'btn_ncc'):
+                self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
+            self._ms_recompute()
+            self._status('Cusp NCC marque. ID auto-calcule a partir de la pose du stent.')
+
+    def _compute_id_mm(self):
+        """ID = distance mm entre le bas du stent et le cusp NCC sur la fluoroscopie."""
+        if (self._stent_center_px is None or self.stent_mesh is None
+                or not hasattr(self, 'cv_fl')):
+            return None
+        ncc = self.cv_fl.get_point_marker('ncc')
+        if ncc is None:
+            return None
+        size = max(1, self.cv_fl.image_size())
+        pix_mm = float(self.sp_fov.value()) / float(size)
+        if pix_mm <= 0:
+            return None
+        cx, cy = self._stent_center_px
+        nx, ny = ncc
+        ang = math.radians(self._stent_axis_deg)
+        half = float(self.sp_stent_L.value()) * 0.5 / pix_mm
+        # AnnotationCanvas convention : (cos(ang), -sin(ang)) = direction +X
+        end1 = (cx + math.cos(ang) * half, cy - math.sin(ang) * half)
+        end2 = (cx - math.cos(ang) * half, cy + math.sin(ang) * half)
+        # Bas du stent = extrémité la plus proche du NCC (clinique : NCC sous le stent)
+        bot = end1 if math.hypot(end1[0] - nx, end1[1] - ny) < math.hypot(end2[0] - nx, end2[1] - ny) else end2
+        return math.hypot(bot[0] - nx, bot[1] - ny) * pix_mm
+
+    def _ms_recompute(self):
+        if not hasattr(self, 'lbl_ms_value'):
+            return
+        ms_mm = None
+        if all(k in self._ms_world for k in self._MS_ORDER):
+            ms_mm = ms_length_from_hinges(
+                self._ms_world['hinge1'],
+                self._ms_world['hinge2'],
+                self._ms_world['ms'])
+        id_mm = self._compute_id_mm()
+        self._ms_update_labels(ms_mm, id_mm)
+
+    def _ms_update_labels(self, ms_mm, id_mm):
+        self.lbl_ms_value.setText('MS length : --' if ms_mm is None else f'MS length : {ms_mm:.2f} mm')
+        self.lbl_id.setText('ID : --' if id_mm is None else f'ID : {id_mm:.2f} mm')
+        if ms_mm is None:
+            self.lbl_delta.setText('DeltaMSID : --')
+            self.lbl_risk.setText('Risque PM : --')
+            return
+        r = risk_assessment(ms_mm, id_mm)
+        d = r.get('delta_msid_mm')
+        self.lbl_delta.setText('DeltaMSID : --' if d is None else f'DeltaMSID : {d:+.2f} mm')
+        level = r.get('risk_level')
+        if level == 'HIGH':
+            self.lbl_risk.setText(
+                f"<span style='color:{ERR};font-weight:700'>Risque PM : HAUT "
+                f"(~{r['pm_dependency_rate']:.0%})</span>")
+        elif level == 'LOW':
+            self.lbl_risk.setText(
+                f"<span style='color:{ACCENT2};font-weight:700'>Risque PM : BAS "
+                f"(~{r['pm_dependency_rate']:.1%})</span>")
+        else:
+            self.lbl_risk.setText('Risque PM : --')
 
     # ── Drag & Drop / Gestion images ─────────────────────────────────────────
 
@@ -1158,6 +1542,7 @@ class MainWindow(QMainWindow):
         self._fixed_image_index = None
         self.fluoro_image = None
         self.cv_fl.set_image(None)
+        self._clear_stent_state('')
         self.dicom_meta = {}
         self.lbl_fluoro_meta.setText('Fluoro : --')
         self._sync_fluoro_frame_controls(None)
@@ -1239,6 +1624,8 @@ class MainWindow(QMainWindow):
         self._fixed_image_index = index
         self.fluoro_image = entry['array']
         self.cv_fl.set_image(self.fluoro_image)
+        if not frame_changed:
+            self._clear_stent_state('')
         self.tabs.setCurrentIndex(0)
         self._invalidate_registration_state(
             'Frame fluoroscopique changee.'
@@ -1645,8 +2032,48 @@ class MainWindow(QMainWindow):
             self._err('Aucun maillage 3D n\'a pu etre reconstruit.')
             return
 
+        # ── Marqueurs TAVI (hinges, MS) + ligne annulaire + segment MS ─────
+        sx, sy, sz = spacing
+        ms_added = 0
+        for name, info in (('hinge1', ((100/255, 200/255, 255/255), 'Hinge L')),
+                           ('hinge2', ((255/255, 200/255, 100/255), 'Hinge R')),
+                           ('ms',     ((255/255, 100/255, 100/255), 'MS apex'))):
+            world = self._ms_world.get(name)
+            if world is None:
+                continue
+            vox = voxel_from_world(world, self.ct_aff if self.ct_aff is not None else None)
+            pt = np.array([vox[0] * sx, vox[1] * sy, vox[2] * sz], dtype=np.float32)
+            color, label = info
+            plotter.add_mesh(pv.Sphere(radius=2.5, center=pt), color=color, name=f'{name}_marker')
+            plotter.add_point_labels(np.array([pt]), [label], font_size=12,
+                                      point_color=color, text_color='white',
+                                      shape_opacity=0.0, always_visible=True,
+                                      name=f'{name}_label')
+            ms_added += 1
+
+        h1 = self._ms_world.get('hinge1'); h2 = self._ms_world.get('hinge2')
+        if h1 is not None and h2 is not None:
+            v1 = voxel_from_world(h1, self.ct_aff if self.ct_aff is not None else None)
+            v2 = voxel_from_world(h2, self.ct_aff if self.ct_aff is not None else None)
+            p1 = np.array([v1[0] * sx, v1[1] * sy, v1[2] * sz], dtype=np.float32)
+            p2 = np.array([v2[0] * sx, v2[1] * sy, v2[2] * sz], dtype=np.float32)
+            plotter.add_mesh(pv.Line(p1, p2), color='cyan', line_width=3, name='annulus_line')
+
+            ms_w = self._ms_world.get('ms')
+            if ms_w is not None:
+                vm = voxel_from_world(ms_w, self.ct_aff if self.ct_aff is not None else None)
+                pm = np.array([vm[0] * sx, vm[1] * sy, vm[2] * sz], dtype=np.float32)
+                axis = p2 - p1; n = np.linalg.norm(axis)
+                if n > 1e-6:
+                    u = axis / n
+                    proj = p1 + np.dot(pm - p1, u) * u
+                    plotter.add_mesh(pv.Line(proj, pm), color='red', line_width=3, name='ms_segment')
+
         plotter.add_axes(line_width=2)
-        plotter.add_text(f'Segmentations 3D ({added})', font_size=10)
+        title = f'Segmentations 3D ({added})'
+        if ms_added:
+            title += f' + TAVI ({ms_added} pts)'
+        plotter.add_text(title, font_size=10)
         plotter.show()
 
     def _projection_seg_masks(self):
