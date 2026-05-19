@@ -52,13 +52,17 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 from core.drr_generator import load_ct, DRR_POSTPROCESS_PRESETS, enhance_drr_image
 from core.measurements import (
     ms_length_from_hinges,
+    project_world_to_fluoro_pixel,
     risk_assessment,
+    stent_3d_pose_from_fluoro,
+    stent_endpoints_world,
     view_pixel_from_voxel,
     voxel_from_view_pixel,
     voxel_from_world,
     world_from_voxel,
 )
 from core.registration import apply_full_transform
+from core.stent_model import braided_stent_world
 from core.stent_placement import (
     generate_stent_mesh,
     project_stent_mask,
@@ -556,17 +560,20 @@ class MainWindow(QMainWindow):
         # ── TAVI RISK (MS length + ΔMSID + risque PM-dependency) ─────────────
         sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
         tavi_info = QLabel(
-            'MS length : ouvrir l onglet Seg CT et marquer 3 points sur la coupe coronale.\n'
-            'ID : poser le stent + marquer le cusp NCC sur la fluoroscopie.')
+            'Marquer manuellement les 4 reperes anatomiques sur le CT\n'
+            '(coupes Seg CT ou directement sur la vue 3D, touche P).\n'
+            'ID auto-calcule depuis la pose 3D du stent recale dans le CT.')
         tavi_info.setObjectName('dim'); tavi_info.setWordWrap(True)
         sec_tavi.addWidget(tavi_info)
 
         self.btn_ms_h1 = QPushButton('1. Hinge L (cusp gauche)'); self.btn_ms_h1.setCheckable(True)
         self.btn_ms_h2 = QPushButton('2. Hinge R (cusp droit)'); self.btn_ms_h2.setCheckable(True)
         self.btn_ms_apex = QPushButton('3. MS apex (septum)'); self.btn_ms_apex.setCheckable(True)
+        self.btn_ncc = QPushButton('4. NCC (cusp non-coronaire)'); self.btn_ncc.setCheckable(True)
         for btn, key in ((self.btn_ms_h1, 'hinge1'),
                           (self.btn_ms_h2, 'hinge2'),
-                          (self.btn_ms_apex, 'ms')):
+                          (self.btn_ms_apex, 'ms'),
+                          (self.btn_ncc, 'ncc')):
             btn.toggled.connect(lambda c, k=key: self._ms_arm(k if c else None))
             sec_tavi.addWidget(btn)
 
@@ -579,11 +586,6 @@ class MainWindow(QMainWindow):
         self.lbl_ms_value.setObjectName('metric')
         self.lbl_ms_value.setAlignment(Qt.AlignCenter)
         sec_tavi.addWidget(self.lbl_ms_value)
-
-        self.btn_ncc = QPushButton('Marquer cusp NCC sur fluoro')
-        self.btn_ncc.setCheckable(True)
-        self.btn_ncc.toggled.connect(self._ncc_toggle)
-        sec_tavi.addWidget(self.btn_ncc)
 
         self.lbl_id = QLabel('ID : --'); self.lbl_id.setObjectName('dim')
         self.lbl_delta = QLabel('DeltaMSID : --'); self.lbl_delta.setObjectName('dim')
@@ -1099,21 +1101,23 @@ class MainWindow(QMainWindow):
 
     # ── TAVI risk (MS length + ΔMSID + risque PM-dependency) ────────────────
 
-    _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex')
-    _MS_ORDER = ('hinge1', 'hinge2', 'ms')
+    _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex', 'btn_ncc')
+    _MS_ORDER = ('hinge1', 'hinge2', 'ms', 'ncc')
     _MS_HINT = {
-        'hinge1': 'Cliquez sur le hinge L (cusp gauche) sur la coupe coronale.',
-        'hinge2': 'Cliquez sur le hinge R (cusp droit) sur la coupe coronale.',
-        'ms':     'Cliquez sur l apex du septum membraneux (debut du septum musculaire).',
+        'hinge1': 'Cliquez le hinge L (cusp gauche) sur une coupe coronale.',
+        'hinge2': 'Cliquez le hinge R (cusp droit) sur la coupe coronale.',
+        'ms':     'Cliquez l apex du septum membraneux (debut du septum musculaire).',
+        'ncc':    'Cliquez le bas du cusp non-coronaire (reference pour ID).',
     }
     _MS_MARKER = {
         'hinge1': ((100, 200, 255), 'Hinge L'),
         'hinge2': ((255, 200, 100), 'Hinge R'),
         'ms':     ((255, 100, 100), 'MS'),
+        'ncc':    ((180, 120, 255), 'NCC'),
     }
 
     def _ms_arm(self, key):
-        """Arme le prochain clic sur la coupe pour ``key`` (hinge1/hinge2/ms) ou désarme si None."""
+        """Arme le prochain clic sur la coupe pour ``key`` (hinge1/hinge2/ms/ncc)."""
         for name, k in zip(self._MS_BUTTONS, self._MS_ORDER):
             btn = getattr(self, name)
             btn.blockSignals(True)
@@ -1130,10 +1134,6 @@ class MainWindow(QMainWindow):
         self._ms_world = {}
         if hasattr(self, 'seg_review_panel'):
             self.seg_review_panel.clear_markers()
-        self.cv_fl.set_point_marker('ncc', None)
-        if hasattr(self, 'btn_ncc'):
-            self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
-        self.cv_fl.disarm_pick()
         self._ms_arm(None)
         self._ms_update_labels(None, None)
         self._status('Mesures TAVI reinitialisees.')
@@ -1143,72 +1143,172 @@ class MainWindow(QMainWindow):
             return
         voxel = voxel_from_view_pixel(plane, col, row, self.ct_vol.shape, slice_idx)
         world = world_from_voxel(voxel, self.ct_aff)
-        key = self._ms_click_target
-        self._ms_world[key] = np.asarray(world, dtype=np.float64)
-        color, label = self._MS_MARKER[key]
-        self.seg_review_panel.set_marker(key, voxel, color, label)
+        self._set_ms_point(self._ms_click_target, np.asarray(world, dtype=np.float64))
         # Auto-advance vers le prochain point manquant
-        next_key = None
-        for k in self._MS_ORDER:
-            if k not in self._ms_world:
-                next_key = k; break
+        next_key = next((k for k in self._MS_ORDER if k not in self._ms_world), None)
         self._ms_arm(next_key)
+
+    def _set_ms_point(self, key, world_mm):
+        """Stocke un point MS/NCC en coords monde et met à jour le marker 3D."""
+        if key not in self._MS_MARKER:
+            return
+        self._ms_world[key] = np.asarray(world_mm, dtype=np.float64)
+        color, label = self._MS_MARKER[key]
+        if self.ct_aff is not None:
+            voxel = voxel_from_world(world_mm, self.ct_aff)
+            self.seg_review_panel.set_marker(key, voxel, color, label, world_mm=world_mm)
         self._ms_recompute()
 
-    def _ncc_toggle(self, checked):
-        if checked:
-            if self.fluoro_image is None:
-                self._err('Chargez une fluoroscopie d abord.')
-                self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
-                return
-            self.cv_fl.arm_pick('ncc')
-            self.tabs.setCurrentIndex(0)
-            self._status('Cliquez sur le cusp non-coronaire (NCC) sur la fluoroscopie.')
-        else:
-            self.cv_fl.disarm_pick()
-
     def _on_point_picked(self, name, x, y):
-        if name == 'ncc':
-            self.cv_fl.set_point_marker('ncc', (x, y), color=(80, 200, 255), label='NCC')
-            if hasattr(self, 'btn_ncc'):
-                self.btn_ncc.blockSignals(True); self.btn_ncc.setChecked(False); self.btn_ncc.blockSignals(False)
-            self._ms_recompute()
-            self._status('Cusp NCC marque. ID auto-calcule a partir de la pose du stent.')
+        # Le clic sur fluoro ne sert plus aux points TAVI ; conservé si un autre
+        # mode pick s'ajoute plus tard.
+        pass
 
-    def _compute_id_mm(self):
-        """ID = distance mm entre le bas du stent et le cusp NCC sur la fluoroscopie."""
-        if (self._stent_center_px is None or self.stent_mesh is None
-                or not hasattr(self, 'cv_fl')):
+    def _ct_center_world(self):
+        if self.ct_vol is None or self.ct_aff is None:
             return None
-        ncc = self.cv_fl.get_point_marker('ncc')
-        if ncc is None:
+        sx, sy, sz = (int(v) for v in self.ct_vol.shape)
+        return world_from_voxel(((sx - 1) * 0.5, (sy - 1) * 0.5, (sz - 1) * 0.5), self.ct_aff)
+
+    def _aortic_anchor_world(self):
+        """Centre 3D-monde de la region aortique pour ancrer la profondeur du stent.
+
+        Priorite : leaflets (cusp/valve/L1-L3/aortic_root) -> aorte (tiers caudal)
+        -> centre du volume CT (fallback ultime).
+        """
+        if self.seg_masks and self.ct_aff is not None:
+            import re
+            kw_strict = ('leaflet', 'cusp', 'valve', 'aortic_root')
+            l_token = re.compile(r'(?:^|[^a-z0-9])l[123](?:$|[^a-z0-9])')
+            combined = None
+            for name, m in self.seg_masks.items():
+                n = str(name).lower()
+                hit = any(k in n for k in kw_strict) or bool(l_token.search(n))
+                if hit and getattr(m, 'ndim', 0) == 3 and (m > 0).any():
+                    combined = (m > 0) if combined is None else (combined | (m > 0))
+            if combined is None:
+                # Repli : tiers caudal de l'aorte (≈ racine aortique)
+                for name, m in self.seg_masks.items():
+                    n = str(name).lower()
+                    if ('aorta' in n and 'pulmonary' not in n
+                            and getattr(m, 'ndim', 0) == 3 and (m > 0).any()):
+                        arr = (m > 0).astype(bool)
+                        idx = np.argwhere(arr)
+                        if idx.size:
+                            z_min = int(idx[:, 2].min()); z_max = int(idx[:, 2].max())
+                            z_cut = z_min + (z_max - z_min) // 3
+                            sub = np.zeros_like(arr)
+                            sub[:, :, z_min:z_cut + 1] = arr[:, :, z_min:z_cut + 1]
+                            combined = sub if combined is None else (combined | sub)
+            if combined is not None and combined.any():
+                centroid = np.argwhere(combined).mean(axis=0)
+                return world_from_voxel(centroid, self.ct_aff)
+        return self._ct_center_world()
+
+    def _stent_3d_pose_world(self):
+        """Pose 3D du stent dans le repere CT-monde (center, axis_unit).
+
+        Le stent est rigidement attache a la fluoro. On reconstruit sa position 3D
+        en ancrant la profondeur sur le centroide de la racine aortique
+        (issu de la segmentation CT). Sans seg, on prend le centre du volume CT.
+        """
+        if self._stent_center_px is None or self.stent_mesh is None:
+            return None
+        ct_c = self._ct_center_world()
+        anchor = self._aortic_anchor_world()
+        if ct_c is None or anchor is None:
+            return None
+        reg = self.result if (isinstance(getattr(self, 'result', None), dict)
+                              and 'tx' in self.result) else None
+        size = max(1, self.cv_fl.image_size())
+        return stent_3d_pose_from_fluoro(
+            stent_center_px_fluoro=self._stent_center_px,
+            stent_axis_deg_fluoro=self._stent_axis_deg,
+            stent_length_mm=float(self.sp_stent_L.value()),
+            image_size=size,
+            lao_deg=float(self.sp_lao.value()),
+            cran_deg=float(self.sp_cran.value()) + 180.0,
+            sid_mm=float(self.dicom_meta.get('sid_mm', 1020.0)),
+            sod_mm=float(self.dicom_meta.get('sod_mm', 510.0)),
+            fov_mm=float(self.sp_fov.value()),
+            ct_center_world=ct_c,
+            anchor_world=anchor,
+            registration_result=reg,
+        )
+
+    def _stent_endpoints_fluoro(self):
+        """Retourne (top_px, bot_px) extremites du stent en pixels fluoro (canvas)."""
+        if self._stent_center_px is None or self.stent_mesh is None:
             return None
         size = max(1, self.cv_fl.image_size())
-        pix_mm = float(self.sp_fov.value()) / float(size)
-        if pix_mm <= 0:
+        pix_mm_iso = float(self.sp_fov.value()) / float(size)
+        if pix_mm_iso <= 0:
             return None
         cx, cy = self._stent_center_px
-        nx, ny = ncc
         ang = math.radians(self._stent_axis_deg)
-        half = float(self.sp_stent_L.value()) * 0.5 / pix_mm
-        # AnnotationCanvas convention : (cos(ang), -sin(ang)) = direction +X
-        end1 = (cx + math.cos(ang) * half, cy - math.sin(ang) * half)
-        end2 = (cx - math.cos(ang) * half, cy + math.sin(ang) * half)
-        # Bas du stent = extrémité la plus proche du NCC (clinique : NCC sous le stent)
-        bot = end1 if math.hypot(end1[0] - nx, end1[1] - ny) < math.hypot(end2[0] - nx, end2[1] - ny) else end2
-        return math.hypot(bot[0] - nx, bot[1] - ny) * pix_mm
+        half_px = float(self.sp_stent_L.value()) * 0.5 / pix_mm_iso
+        # AnnotationCanvas convention : direction = (cos, -sin) en pixels
+        end1 = (cx + math.cos(ang) * half_px, cy - math.sin(ang) * half_px)
+        end2 = (cx - math.cos(ang) * half_px, cy + math.sin(ang) * half_px)
+        return end1, end2
+
+    def _project_world_to_fluoro(self, world_pt):
+        """Projette un point CT 3D-monde vers le pixel fluoro via cone-beam DRR + recalage."""
+        if self.ct_vol is None or self.ct_aff is None:
+            return None
+        ct_c = self._ct_center_world()
+        if ct_c is None:
+            return None
+        size = max(1, self.cv_fl.image_size())
+        reg = self.result if (isinstance(getattr(self, 'result', None), dict)
+                              and 'tx' in self.result) else None
+        return project_world_to_fluoro_pixel(
+            world_pt, ct_c, size,
+            lao_deg=float(self.sp_lao.value()),
+            cran_deg=float(self.sp_cran.value()) + 180.0,
+            sid_mm=float(self.dicom_meta.get('sid_mm', 1020.0)),
+            sod_mm=float(self.dicom_meta.get('sod_mm', 510.0)),
+            fov_mm=float(self.sp_fov.value()),
+            registration_result=reg,
+        )
+
+    def _compute_id_mm(self):
+        """ID = distance 2D fluoroscopie (mm) entre bas du stent et NCC projete depuis CT.
+
+        Convention clinique de l'article (Nai Fovino 2021) : mesure 2D sur
+        l'angiogramme. NCC marque sur le CT puis projete sur la fluoro via la
+        camera DRR + le recalage 2D/3D.
+        """
+        if 'ncc' not in self._ms_world:
+            return None
+        ends = self._stent_endpoints_fluoro()
+        if ends is None:
+            return None
+        ncc_fl = self._project_world_to_fluoro(self._ms_world['ncc'])
+        if ncc_fl is None:
+            return None
+        size = max(1, self.cv_fl.image_size())
+        pix_mm_iso = float(self.sp_fov.value()) / float(size)
+        e1, e2 = ends
+        d1 = math.hypot(e1[0] - ncc_fl[0], e1[1] - ncc_fl[1])
+        d2 = math.hypot(e2[0] - ncc_fl[0], e2[1] - ncc_fl[1])
+        bot = e1 if d1 < d2 else e2
+        return math.hypot(bot[0] - ncc_fl[0], bot[1] - ncc_fl[1]) * pix_mm_iso
 
     def _ms_recompute(self):
         if not hasattr(self, 'lbl_ms_value'):
             return
         ms_mm = None
-        if all(k in self._ms_world for k in self._MS_ORDER):
+        # ΔMSID requiert seulement hinge1, hinge2, ms (pas NCC) :
+        if all(k in self._ms_world for k in ('hinge1', 'hinge2', 'ms')):
             ms_mm = ms_length_from_hinges(
                 self._ms_world['hinge1'],
                 self._ms_world['hinge2'],
                 self._ms_world['ms'])
         id_mm = self._compute_id_mm()
         self._ms_update_labels(ms_mm, id_mm)
+        if hasattr(self, 'overlay_panel'):
+            self._push_tavi_to_overlay()
 
     def _ms_update_labels(self, ms_mm, id_mm):
         self.lbl_ms_value.setText('MS length : --' if ms_mm is None else f'MS length : {ms_mm:.2f} mm')
@@ -2032,48 +2132,147 @@ class MainWindow(QMainWindow):
             self._err('Aucun maillage 3D n\'a pu etre reconstruit.')
             return
 
-        # ── Marqueurs TAVI (hinges, MS) + ligne annulaire + segment MS ─────
+        # ── Conversion voxel -> coords 3D du plotter (les meshes seg sont dejà
+        #    en coords voxel * spacing, donc les markers TAVI doivent suivre).
         sx, sy, sz = spacing
-        ms_added = 0
-        for name, info in (('hinge1', ((100/255, 200/255, 255/255), 'Hinge L')),
-                           ('hinge2', ((255/255, 200/255, 100/255), 'Hinge R')),
-                           ('ms',     ((255/255, 100/255, 100/255), 'MS apex'))):
-            world = self._ms_world.get(name)
-            if world is None:
-                continue
-            vox = voxel_from_world(world, self.ct_aff if self.ct_aff is not None else None)
-            pt = np.array([vox[0] * sx, vox[1] * sy, vox[2] * sz], dtype=np.float32)
-            color, label = info
-            plotter.add_mesh(pv.Sphere(radius=2.5, center=pt), color=color, name=f'{name}_marker')
-            plotter.add_point_labels(np.array([pt]), [label], font_size=12,
-                                      point_color=color, text_color='white',
-                                      shape_opacity=0.0, always_visible=True,
-                                      name=f'{name}_label')
-            ms_added += 1
 
-        h1 = self._ms_world.get('hinge1'); h2 = self._ms_world.get('hinge2')
-        if h1 is not None and h2 is not None:
-            v1 = voxel_from_world(h1, self.ct_aff if self.ct_aff is not None else None)
-            v2 = voxel_from_world(h2, self.ct_aff if self.ct_aff is not None else None)
-            p1 = np.array([v1[0] * sx, v1[1] * sy, v1[2] * sz], dtype=np.float32)
-            p2 = np.array([v2[0] * sx, v2[1] * sy, v2[2] * sz], dtype=np.float32)
-            plotter.add_mesh(pv.Line(p1, p2), color='cyan', line_width=3, name='annulus_line')
+        def vox_to_plot(voxel):
+            return np.array([voxel[0] * sx, voxel[1] * sy, voxel[2] * sz], dtype=np.float64)
 
-            ms_w = self._ms_world.get('ms')
-            if ms_w is not None:
-                vm = voxel_from_world(ms_w, self.ct_aff if self.ct_aff is not None else None)
-                pm = np.array([vm[0] * sx, vm[1] * sy, vm[2] * sz], dtype=np.float32)
-                axis = p2 - p1; n = np.linalg.norm(axis)
-                if n > 1e-6:
-                    u = axis / n
-                    proj = p1 + np.dot(pm - p1, u) * u
-                    plotter.add_mesh(pv.Line(proj, pm), color='red', line_width=3, name='ms_segment')
+        def world_to_plot(world_mm):
+            if self.ct_aff is None:
+                return np.asarray(world_mm, dtype=np.float64)
+            v = voxel_from_world(world_mm, self.ct_aff)
+            return vox_to_plot(v)
+
+        # ── Stent recale dans le CT (fils tresses, ancre sur la racine aortique) ─
+        stent_pose = self._stent_3d_pose_world()
+        if stent_pose is not None:
+            center_w, axis_w = stent_pose
+            length_mm = float(self.sp_stent_L.value())
+            diameter_mm = float(self.sp_stent_D.value())
+            try:
+                verts_w, faces = braided_stent_world(
+                    diameter_mm=diameter_mm, length_mm=length_mm,
+                    center_world=center_w, axis_world=axis_w,
+                    n_wires=24, braid_angle_deg=45.0,
+                    wire_radius_mm=0.18, n_pts=110, tube_sides=5,
+                )
+                offset = self.ct_aff[:3, 3] if self.ct_aff is not None else np.zeros(3)
+                verts_plot = (verts_w - offset).astype(np.float32)
+                faces_pv = np.hstack([
+                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                    faces.astype(np.int64),
+                ]).ravel()
+                stent_pv = pv.PolyData(verts_plot, faces_pv)
+                plotter.add_mesh(stent_pv, color=(0.98, 0.85, 0.25), opacity=0.92,
+                                  smooth_shading=True, name='stent_mesh')
+                # Sphere bas du stent (cote NCC, repere visuel pour ID)
+                e1_w, e2_w = stent_endpoints_world(center_w, axis_w, length_mm)
+                ncc_w = self._ms_world.get('ncc')
+                if ncc_w is not None:
+                    bot_w = e1_w if np.linalg.norm(e1_w - ncc_w) < np.linalg.norm(e2_w - ncc_w) else e2_w
+                    plotter.add_mesh(
+                        pv.Sphere(radius=2.0, center=world_to_plot(bot_w)),
+                        color=(1.0, 0.55, 0.2), name='stent_bot_sphere')
+            except Exception as ex:
+                self._status(f'Rendu stent 3D CT echoue : {ex}')
+
+        # ── Rendu/mise a jour des marqueurs + segments + labels (in-place) ──
+        def refresh_tavi():
+            """Redessine markers, ligne annulaire, segments MS/ID et labels dans le plotter ouvert."""
+            present = set()
+            marker_pts = {}
+            for name in ('hinge1', 'hinge2', 'ms', 'ncc'):
+                world = self._ms_world.get(name)
+                if world is None:
+                    continue
+                pt = world_to_plot(world)
+                marker_pts[name] = pt
+                color = tuple(c / 255.0 for c in self._MS_MARKER[name][0])
+                label = self._MS_MARKER[name][1]
+                plotter.add_mesh(pv.Sphere(radius=2.6, center=pt), color=color,
+                                  name=f'{name}_marker', render=False)
+                plotter.add_point_labels(np.array([pt]), [label], font_size=12,
+                                          point_color=color, text_color='white',
+                                          shape_opacity=0.0, always_visible=True,
+                                          name=f'{name}_label', render=False)
+                present.add(f'{name}_marker'); present.add(f'{name}_label')
+
+            h1 = marker_pts.get('hinge1'); h2 = marker_pts.get('hinge2'); ms_pt = marker_pts.get('ms')
+            if h1 is not None and h2 is not None:
+                plotter.add_mesh(pv.Line(h1, h2), color='cyan', line_width=3,
+                                  name='annulus_line', render=False)
+                present.add('annulus_line')
+                if ms_pt is not None:
+                    axis = h2 - h1
+                    n = float(np.linalg.norm(axis))
+                    if n > 1e-6:
+                        u = axis / n
+                        proj = h1 + np.dot(ms_pt - h1, u) * u
+                        plotter.add_mesh(pv.Line(proj, ms_pt), color='red', line_width=4,
+                                          name='ms_segment', render=False)
+                        ms_mm = float(np.linalg.norm(ms_pt - proj))
+                        mid = 0.5 * (proj + ms_pt)
+                        plotter.add_point_labels(
+                            np.array([mid]), [f'MS = {ms_mm:.2f} mm'],
+                            font_size=14, point_color='red', text_color='white',
+                            shape='rounded_rect', shape_color='black', shape_opacity=0.55,
+                            always_visible=True, name='ms_label', render=False)
+                        present.add('ms_segment'); present.add('ms_label')
+
+            # ID n'est pas affiche ici : c'est une mesure 2D sur la fluoroscopie.
+            # Voir l'onglet Overlay -> Vue 3D pour la visualisation du stent + ID.
+
+            # Retirer les acteurs orphelins (point supprime via reset)
+            for nm in ('hinge1', 'hinge2', 'ms', 'ncc'):
+                for suf in ('_marker', '_label'):
+                    actor = f'{nm}{suf}'
+                    if actor not in present:
+                        try: plotter.remove_actor(actor, render=False)
+                        except Exception: pass
+            for actor in ('annulus_line', 'ms_segment', 'ms_label'):
+                if actor not in present:
+                    try: plotter.remove_actor(actor, render=False)
+                    except Exception: pass
+            plotter.render()
+            return len(present), marker_pts
+
+        ms_added, _ = refresh_tavi()
+
+        # ── Picker 3D : alimente _ms_world + rafraichit la vue immediatement ──
+        def _on_pick(point, picker=None):
+            if not self._ms_click_target:
+                return
+            try:
+                voxel = (float(point[0]) / sx, float(point[1]) / sy, float(point[2]) / sz)
+                world = world_from_voxel(voxel, self.ct_aff) if self.ct_aff is not None else np.asarray(point)
+                key = self._ms_click_target
+                self._set_ms_point(key, world)
+                next_key = next((k for k in self._MS_ORDER if k not in self._ms_world), None)
+                self._ms_arm(next_key)
+                refresh_tavi()
+                msg = f'{key} place en 3D ({point[0]:.0f}, {point[1]:.0f}, {point[2]:.0f}).'
+                if next_key:
+                    msg += f' Prochain : {next_key}.'
+                self._status(msg)
+            except Exception as ex:
+                self._status(f'Pick 3D echoue : {ex}')
+
+        try:
+            plotter.enable_point_picking(callback=_on_pick, show_message=False,
+                                          show_point=True, point_size=12,
+                                          left_clicking=False, color='yellow',
+                                          tolerance=0.02)
+        except Exception:
+            pass
 
         plotter.add_axes(line_width=2)
         title = f'Segmentations 3D ({added})'
         if ms_added:
-            title += f' + TAVI ({ms_added} pts)'
-        plotter.add_text(title, font_size=10)
+            title += f' + reperes TAVI ({ms_added} acteurs)'
+        title += '  --  P + clic = placer le repere arme dans le sidebar.'
+        plotter.add_text(title, font_size=10, name='title')
         plotter.show()
 
     def _projection_seg_masks(self):
@@ -2209,6 +2408,9 @@ class MainWindow(QMainWindow):
             self._iterations[self._current_iter_idx]['result'] = res
             self._refresh_iter_list()
         self._update_overlay()
+        # Recalage fini -> rafraichir immediatement la projection du stent sur les coupes
+        self._push_stent_3d_to_seg_panel()
+        self._ms_recompute()
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
 
     def _build_result(self,res):
@@ -2318,8 +2520,88 @@ class MainWindow(QMainWindow):
             table_angle=self.sp_table.value(),
             fov_mm=fov_for_projection,
         )
+        self._push_tavi_to_overlay()
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(4)
+
+    def _push_stent_3d_to_seg_panel(self):
+        """Propage la pose 3D du stent au panneau Seg CT pour affichage sur les coupes.
+
+        Cette projection n'a de sens qu'APRES recalage (le lien fluoro<->DRR est
+        donne par le recalage). Sans recalage on n'affiche rien sur les coupes.
+        """
+        if not hasattr(self, 'seg_review_panel'):
+            return
+        has_reg = isinstance(getattr(self, 'result', None), dict) and 'tx' in self.result
+        if not has_reg:
+            self.seg_review_panel.clear_stent_3d()
+            return
+        pose = self._stent_3d_pose_world()
+        if pose is None or self.ct_aff is None:
+            self.seg_review_panel.clear_stent_3d()
+            return
+        center_w, axis_w = pose
+        length_mm = float(self.sp_stent_L.value())
+        e1_w, e2_w = stent_endpoints_world(center_w, axis_w, length_mm)
+        p1_vox = voxel_from_world(e1_w, self.ct_aff)
+        p2_vox = voxel_from_world(e2_w, self.ct_aff)
+        diam_mm = float(self.sp_stent_D.value())
+        spacing = np.abs(np.array([self.ct_aff[0, 0], self.ct_aff[1, 1], self.ct_aff[2, 2]],
+                                   dtype=np.float64))
+        spacing = np.where(spacing > 1e-6, spacing, 1.0)
+        diam_vox = tuple(diam_mm / spacing)
+        self.seg_review_panel.set_stent_3d(p1_vox, p2_vox, diam_vox)
+
+    def _schedule_seg_panel_stent_update(self, delay_ms: int = 220):
+        """Debounce de la propagation du stent vers le panneau Seg CT.
+
+        Le re-render des 3 coupes est couteux (segs multiples). On retarde donc
+        la mise a jour pour eviter le lag pendant le glissement du stent.
+        """
+        from PyQt5.QtCore import QTimer
+        timer = getattr(self, '_seg_panel_stent_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._push_stent_3d_to_seg_panel)
+            self._seg_panel_stent_timer = timer
+        timer.start(int(delay_ms))
+
+    def _push_tavi_to_overlay(self):
+        """Communique au panneau overlay la pose 2D du stent + reperes projetes + valeurs."""
+        # Panneau Seg CT : update differee (couteuse) pour eviter le lag pendant le drag
+        self._schedule_seg_panel_stent_update()
+        if not hasattr(self, 'overlay_panel'):
+            return
+        stent_fluoro = None
+        if self._stent_center_px is not None and self.stent_mesh is not None and hasattr(self, 'cv_fl'):
+            size = max(1, self.cv_fl.image_size())
+            pix_mm = float(self.sp_fov.value()) / float(size)
+            stent_fluoro = {
+                'center_px': (float(self._stent_center_px[0]), float(self._stent_center_px[1])),
+                'axis_deg': float(self._stent_axis_deg),
+                'length_mm': float(self.sp_stent_L.value()),
+                'diameter_mm': float(self.sp_stent_D.value()),
+                'pix_mm': pix_mm,
+            }
+        ms_mm = None
+        if all(k in self._ms_world for k in ('hinge1', 'hinge2', 'ms')):
+            ms_mm = ms_length_from_hinges(
+                self._ms_world['hinge1'], self._ms_world['hinge2'], self._ms_world['ms'])
+        id_mm = self._compute_id_mm()
+        # Projeter chaque repere CT-monde dans le plan fluoro pour affichage 2D dans l'overlay 3D
+        ref_proj = {}
+        for k, world in self._ms_world.items():
+            p = self._project_world_to_fluoro(world)
+            if p is not None:
+                ref_proj[k] = (float(p[0]), float(p[1]))
+        self.overlay_panel.set_tavi_overlay(
+            stent_fluoro=stent_fluoro,
+            ms_world=dict(self._ms_world),
+            ref_fluoro_px=ref_proj,
+            id_mm=id_mm,
+            ms_length_mm=ms_mm,
+        )
 
     # ── Pipeline automatique complet ──────────────────────────────────────────
 

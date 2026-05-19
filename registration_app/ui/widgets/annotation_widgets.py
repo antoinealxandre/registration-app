@@ -1037,6 +1037,9 @@ class SegmentationReviewPanel(QWidget):
         self._click_mode = None             # nom du point à capturer (ou None)
         self._markers = {}                  # name -> {'voxel': (x,y,z), 'color': rgb, 'label': str}
         self._view_fit = {}                 # plane -> {'x0','y0','nw','nh','ow','oh'}
+        self._zoom = 1.0                    # facteur de zoom (CTRL+molette dans les vues)
+        # Projection du stent 3D sur les coupes (depuis le recalage CT-monde)
+        self._stent_3d = None               # dict {'p1':(x,y,z), 'p2':(x,y,z), 'diam_vox':(dx,dy,dz)}
         self._build_ui()
 
     def _build_ui(self):
@@ -1375,30 +1378,124 @@ class SegmentationReviewPanel(QWidget):
             cv2.drawContours(rgb, cnts, -1, color, 1, lineType=cv2.LINE_AA)
 
         self._draw_markers_on(rgb, plane, idx)
+        self._draw_stent_3d_on(rgb, plane, idx)
         return np.ascontiguousarray(rgb)
 
+    def _draw_stent_3d_on(self, rgb, plane, slice_idx):
+        """Projette le stent 3D (cylindre) sur la coupe par intersection geometrique.
+
+        Echantillonne le centerline ; tout point dont la profondeur est proche du
+        plan de coupe (tolerance 1 voxel) est dessine comme un cercle de rayon =
+        rayon stent. L'union des cercles donne :
+         - cercle plein pour un stent perpendiculaire au plan (cross-section),
+         - capsule pour un stent parallele au plan (vue long-axe),
+         - intermediaire (ellipse approximee) pour les obliques.
+        """
+        s3 = self._stent_3d
+        if not s3 or self._ct_vol is None:
+            return
+        from core.measurements import view_pixel_from_voxel
+        vol_shape = self._ct_vol.shape
+        p1 = np.asarray(s3['p1'], dtype=np.float64)
+        p2 = np.asarray(s3['p2'], dtype=np.float64)
+        if plane == 'axial':    depth_axis = 2
+        elif plane == 'coronal': depth_axis = 1
+        else:                    depth_axis = 0
+        # Echantillonnage du centerline
+        n = 80
+        t = np.linspace(0.0, 1.0, n)
+        pts = p1[None, :] + t[:, None] * (p2 - p1)[None, :]
+        depths = pts[:, depth_axis]
+        in_slice = np.abs(depths - float(slice_idx)) <= 0.6
+        if not in_slice.any():
+            return  # le stent ne traverse pas cette coupe
+        diam_vox = s3['diam_vox']
+        # Rayon en voxels sur le plan de coupe (moyenne des 2 axes du plan)
+        if plane == 'axial':    r_in_plane = 0.25 * (diam_vox[0] + diam_vox[1])
+        elif plane == 'coronal': r_in_plane = 0.25 * (diam_vox[0] + diam_vox[2])
+        else:                    r_in_plane = 0.25 * (diam_vox[1] + diam_vox[2])
+        radius_px = max(2, int(round(r_in_plane)))
+        color_fill = (60, 210, 250)   # cyan stent
+        color_edge = (5, 35, 50)
+        h_img, w_img = rgb.shape[:2]
+        pix_pts = []
+        for pt in pts[in_slice]:
+            col, row, _ = view_pixel_from_voxel(plane, pt, vol_shape)
+            ci = int(round(col)); ri = int(round(row))
+            if 0 <= ci < w_img and 0 <= ri < h_img:
+                pix_pts.append((ci, ri))
+        if not pix_pts:
+            return
+        overlay = rgb.copy()
+        for pp in pix_pts:
+            cv2.circle(overlay, pp, radius_px, color_fill, -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.5, rgb, 0.5, 0, dst=rgb)
+        # Contour : ligne entre points + cercles outline aux extremites
+        for i in range(len(pix_pts) - 1):
+            cv2.line(rgb, pix_pts[i], pix_pts[i + 1], color_edge, 1, cv2.LINE_AA)
+        cv2.circle(rgb, pix_pts[0], radius_px, color_edge, 1, cv2.LINE_AA)
+        cv2.circle(rgb, pix_pts[-1], radius_px, color_edge, 1, cv2.LINE_AA)
+
     def _draw_markers_on(self, rgb, plane, slice_idx):
-        """Dessine les marqueurs (hinges, MS) sur la coupe rendue."""
+        """Dessine les marqueurs + segments TAVI (ligne annulaire, MS, ID) sur la coupe."""
         if not self._markers or self._ct_vol is None:
             return
         from core.measurements import view_pixel_from_voxel
         vol_shape = self._ct_vol.shape
+        r_h, r_w = rgb.shape[:2]
+
+        # Projeter chaque marqueur en pixel coords de la vue rendue (avant resize)
+        pix = {}
         for name, m in self._markers.items():
             col, row, native_idx = view_pixel_from_voxel(plane, m['voxel'], vol_shape)
-            # rendu : rotated view shape correspond à l'image courante (rgb avant resize)
-            r_h, r_w = rgb.shape[:2]
             cx, cy = int(round(col)), int(round(row))
-            if cx < 0 or cy < 0 or cx >= r_w or cy >= r_h:
+            if not (0 <= cx < r_w and 0 <= cy < r_h):
                 continue
-            color = tuple(int(c) for c in m['color'])
-            on_slice = abs(native_idx - slice_idx) <= 1
+            pix[name] = {'xy': (cx, cy), 'native': native_idx,
+                         'color': tuple(int(c) for c in m['color']),
+                         'label': m['label']}
+
+        # ── Ligne annulaire (cyan) + segment MS perpendiculaire (rouge, avec mm) ─
+        if 'hinge1' in pix and 'hinge2' in pix:
+            p1 = pix['hinge1']['xy']; p2 = pix['hinge2']['xy']
+            cv2.line(rgb, p1, p2, (90, 220, 240), 1, cv2.LINE_AA)
+            if 'ms' in pix:
+                pm = pix['ms']['xy']
+                p1v = np.asarray(p1, dtype=np.float64); p2v = np.asarray(p2, dtype=np.float64)
+                pmv = np.asarray(pm, dtype=np.float64)
+                axis = p2v - p1v
+                n = float(np.linalg.norm(axis))
+                if n > 1e-6:
+                    u = axis / n
+                    proj = p1v + np.dot(pmv - p1v, u) * u
+                    proj_xy = (int(round(proj[0])), int(round(proj[1])))
+                    cv2.arrowedLine(rgb, proj_xy, pm, (90, 90, 255), 2, cv2.LINE_AA, tipLength=0.18)
+                    # Valeur en mm : calculer via les coords monde (déjà stockées)
+                    h1w = self._markers['hinge1'].get('world_mm')
+                    h2w = self._markers['hinge2'].get('world_mm')
+                    msw = self._markers['ms'].get('world_mm')
+                    if h1w is not None and h2w is not None and msw is not None:
+                        from core.measurements import ms_length_from_hinges
+                        mm = ms_length_from_hinges(h1w, h2w, msw)
+                        mid = ((proj_xy[0] + pm[0]) // 2 + 6, (proj_xy[1] + pm[1]) // 2)
+                        cv2.putText(rgb, f'MS={mm:.2f}mm', mid,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2, cv2.LINE_AA)
+                        cv2.putText(rgb, f'MS={mm:.2f}mm', mid,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 255), 1, cv2.LINE_AA)
+
+        # ── Marqueurs (avec halo et label) ───────────────────────────────────
+        for name, info in pix.items():
+            cx, cy = info['xy']; color = info['color']
+            on_slice = abs(info['native'] - slice_idx) <= 1
             if on_slice:
+                cv2.circle(rgb, (cx, cy), 7, (0, 0, 0), 2, cv2.LINE_AA)
                 cv2.drawMarker(rgb, (cx, cy), color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
                 cv2.circle(rgb, (cx, cy), 6, color, 2, cv2.LINE_AA)
-                cv2.putText(rgb, m['label'], (cx + 8, cy - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+                cv2.putText(rgb, info['label'], (cx + 8, cy - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(rgb, info['label'], (cx + 8, cy - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
             else:
-                # Marqueur "hors-coupe" : petit point translucide
                 overlay = rgb.copy()
                 cv2.circle(overlay, (cx, cy), 4, color, -1, cv2.LINE_AA)
                 cv2.addWeighted(overlay, 0.5, rgb, 0.5, 0, dst=rgb)
@@ -1409,14 +1506,24 @@ class SegmentationReviewPanel(QWidget):
         h, w = rgb.shape[:2]
         if h <= 0 or w <= 0:
             return np.zeros((lh, lw, 3), dtype=np.uint8), None
-        s = min(lw / float(w), lh / float(h))
+        s = min(lw / float(w), lh / float(h)) * float(self._zoom)
         nw = max(1, int(round(w * s)))
         nh = max(1, int(round(h * s)))
         resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
         canvas = np.full((lh, lw, 3), 16, dtype=np.uint8)
         y0 = (lh - nh) // 2
         x0 = (lw - nw) // 2
-        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        # Letterbox si zoom < seuil ; recadrage centre si l'image depasse le label
+        src_x0 = max(0, -x0); src_y0 = max(0, -y0)
+        src_x1 = min(nw, lw - x0); src_y1 = min(nh, lh - y0)
+        dst_x0 = max(0, x0); dst_y0 = max(0, y0)
+        if src_x1 > src_x0 and src_y1 > src_y0:
+            canvas[dst_y0:dst_y0 + (src_y1 - src_y0),
+                   dst_x0:dst_x0 + (src_x1 - src_x0)] = resized[src_y0:src_y1, src_x0:src_x1]
+        # Indicateur de zoom (coin sup. gauche) si zoom != 1
+        if abs(self._zoom - 1.0) > 0.05:
+            cv2.putText(canvas, f'{self._zoom:.1f}x', (8, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
         fit = {'x0': x0, 'y0': y0, 'nw': nw, 'nh': nh, 'ow': w, 'oh': h}
         return canvas, fit
 
@@ -1449,6 +1556,12 @@ class SegmentationReviewPanel(QWidget):
         if event.type() == QEvent.Wheel and self._ct_vol is not None:
             delta = event.angleDelta().y()
             if delta == 0:
+                return True
+            # CTRL + molette = zoom sur la coupe (toutes vues partagent le facteur)
+            if event.modifiers() & Qt.ControlModifier:
+                factor = 1.18 if delta > 0 else 1.0 / 1.18
+                self._zoom = max(0.5, min(8.0, self._zoom * factor))
+                self._render_all()
                 return True
             steps = int(delta / 120)
             if steps == 0:
@@ -1494,7 +1607,7 @@ class SegmentationReviewPanel(QWidget):
         for v in (self._ax_view, self._co_view, self._sa_view):
             v['label'].setCursor(QCursor(cursor))
 
-    def set_marker(self, name: str, voxel_xyz, color=(80, 200, 255), label=None):
+    def set_marker(self, name: str, voxel_xyz, color=(80, 200, 255), label=None, world_mm=None):
         if voxel_xyz is None:
             self._markers.pop(name, None)
         else:
@@ -1502,11 +1615,31 @@ class SegmentationReviewPanel(QWidget):
                 'voxel': tuple(int(round(v)) for v in voxel_xyz),
                 'color': tuple(int(c) for c in color),
                 'label': str(label or name),
+                'world_mm': None if world_mm is None else np.asarray(world_mm, dtype=np.float64),
             }
         self._render_all()
 
     def clear_markers(self):
         self._markers = {}
+        self._render_all()
+
+    def set_stent_3d(self, p1_voxel, p2_voxel, diameter_voxels=None):
+        """Definit la projection du stent 3D sur les coupes.
+
+        p1/p2 en coords voxel (x,y,z). diameter_voxels = (dx, dy, dz) en voxels par axe.
+        """
+        if p1_voxel is None or p2_voxel is None:
+            self._stent_3d = None
+        else:
+            self._stent_3d = {
+                'p1': tuple(float(v) for v in p1_voxel),
+                'p2': tuple(float(v) for v in p2_voxel),
+                'diam_vox': tuple(float(v) for v in (diameter_voxels or (4.0, 4.0, 4.0))),
+            }
+        self._render_all()
+
+    def clear_stent_3d(self):
+        self._stent_3d = None
         self._render_all()
 
     def resizeEvent(self, e):
@@ -1783,6 +1916,12 @@ class FinalOverlayPanel(QWidget):
         self._pan_x = self._pan_y = 0
         self._pan_active = False
         self._pan_start = None
+        # Données TAVI optionnelles affichées dans la vue 3D post-recalage
+        self._tavi_stent_pose = None        # dict {center_px, axis_deg, length_mm, diameter_mm, pix_mm}
+        self._tavi_ms_world = {}
+        self._tavi_ref_fluoro_px = {}       # {'hinge1','hinge2','ms','ncc'} -> (px, py) projete sur fluoro
+        self._tavi_id_mm = None
+        self._tavi_ms_length = None
         self._build_ui()
 
     # ── Construction UI ───────────────────────────────────────────────────────
@@ -1952,9 +2091,31 @@ class FinalOverlayPanel(QWidget):
         self._vis = {}
         self._colors = {}
         self._chks = {}
+        self._tavi_stent_pose = None
+        self._tavi_ms_world = {}
+        self._tavi_ref_fluoro_px = {}
+        self._tavi_id_mm = None
+        self._tavi_ms_length = None
         self._rebuild_list()
         self._lbl_img.clear()
         self._lbl_info.setText('En attente de données…')
+
+    def set_tavi_overlay(self, stent_fluoro=None, ms_world=None, ref_fluoro_px=None,
+                          id_mm=None, ms_length_mm=None):
+        """Injecte les donnees TAVI a afficher dans la vue 3D recalee.
+
+        stent_fluoro   : dict {center_px, axis_deg, length_mm, diameter_mm, pix_mm} pose 2D fluoro.
+        ms_world       : reperes CT-monde (informatif, non rendu en 2D ici).
+        ref_fluoro_px  : reperes (hinge1/hinge2/ms/ncc) projetes en pixels fluoro pour
+                         affichage dans le plan d'overlay 3D.
+        id_mm          : valeur affichee si NCC + stent valides.
+        ms_length_mm   : valeur affichee si 3 reperes annulaires valides.
+        """
+        self._tavi_stent_pose = stent_fluoro
+        self._tavi_ms_world = dict(ms_world or {})
+        self._tavi_ref_fluoro_px = dict(ref_fluoro_px or {})
+        self._tavi_id_mm = id_mm
+        self._tavi_ms_length = ms_length_mm
 
     def has_data(self):
         return self._fluoro is not None and self._result is not None and bool(self._proj_masks)
@@ -2420,8 +2581,113 @@ class FinalOverlayPanel(QWidget):
             )
             return
 
+        # ── Stent recale (fils tresses 3D dans le plan fluoroscopie) ────────
+        # center_px et pix_mm sont DEJA en coords canvas fluoro (= ``side``).
+        # Ne pas appliquer de facteur side/reg_size : ce facteur n'est valable
+        # que pour les maillages anatomiques projetes initialement au reg_size.
+        stent_added = False
+        sp = self._tavi_stent_pose
+        if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
+            import math as _math
+            try:
+                from core.stent_model import braided_stent_world
+                cx, cy = sp['center_px']
+                pix_mm = float(sp['pix_mm'])
+                length_px = float(sp['length_mm']) / pix_mm
+                diameter_px = float(sp['diameter_mm']) / pix_mm
+                ang = _math.radians(float(sp['axis_deg']))
+                # Y est inverse (cranien en haut) ; Z = profondeur fictive du plan
+                axis_world = np.array([_math.cos(ang), _math.sin(ang), 0.0], dtype=np.float64)
+                center_world = np.array([float(cx), float((side - 1.0) - cy), 8.0], dtype=np.float64)
+                verts_w, faces = braided_stent_world(
+                    diameter_mm=float(diameter_px),
+                    length_mm=float(length_px),
+                    center_world=center_world,
+                    axis_world=axis_world,
+                    n_wires=24, braid_angle_deg=45.0,
+                    wire_radius_mm=max(0.5, 0.18 / max(pix_mm, 1e-6)),
+                    n_pts=110, tube_sides=5,
+                )
+                faces_pv = np.hstack([
+                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                    faces.astype(np.int64),
+                ]).ravel()
+                stent_pv = pv.PolyData(verts_w.astype(np.float32), faces_pv)
+                plotter.add_mesh(stent_pv, color=(0.98, 0.85, 0.25), opacity=0.92,
+                                  smooth_shading=True, name='stent_recale')
+                stent_added = True
+
+                anno_pts = []; anno_txt = []
+                if self._tavi_ms_length is not None:
+                    anno_pts.append((cx - 30, (side - 1.0) - cy - 30, 12.0))
+                    anno_txt.append(f'MS = {self._tavi_ms_length:.2f} mm')
+                if self._tavi_id_mm is not None:
+                    anno_pts.append((cx + 30, (side - 1.0) - cy + 30, 12.0))
+                    anno_txt.append(f'ID = {self._tavi_id_mm:.2f} mm')
+                if anno_pts:
+                    plotter.add_point_labels(
+                        np.array(anno_pts, dtype=np.float32), anno_txt,
+                        font_size=14, text_color='white',
+                        shape='rounded_rect', shape_color='black', shape_opacity=0.55,
+                        always_visible=True, name='tavi_labels')
+            except Exception:
+                pass
+
+        # ── Reperes CT-monde projetes dans le plan fluoro (vue 3D recalee) ──
+        # Les coords ref_fluoro_px sont DEJA en pixels canvas (= ``side``).
+        ref_added = 0
+        if self._tavi_ref_fluoro_px:
+            ref_palette = {
+                'hinge1': (100/255, 200/255, 255/255),
+                'hinge2': (255/255, 200/255, 100/255),
+                'ms':     (255/255, 100/255, 100/255),
+                'ncc':    (180/255, 120/255, 255/255),
+            }
+            ref_labels = {'hinge1': 'Hinge L', 'hinge2': 'Hinge R',
+                          'ms': 'MS', 'ncc': 'NCC'}
+            ref_3d = {}
+            for k, (px, py) in self._tavi_ref_fluoro_px.items():
+                pt = (float(px), float((side - 1.0) - py), 10.0)
+                color = ref_palette.get(k, (1.0, 1.0, 1.0))
+                plotter.add_mesh(pv.Sphere(radius=max(3.0, side * 0.005), center=pt),
+                                  color=color, name=f'ref_{k}')
+                plotter.add_point_labels(
+                    np.array([pt], dtype=np.float32), [ref_labels.get(k, k)],
+                    font_size=12, point_color=color, text_color='white',
+                    shape_opacity=0.0, always_visible=True, name=f'ref_label_{k}',
+                )
+                ref_3d[k] = np.asarray(pt, dtype=np.float64)
+                ref_added += 1
+
+            # Segment ID stent_bottom -> NCC projete
+            sp_d = self._tavi_stent_pose
+            if 'ncc' in ref_3d and sp_d and self._tavi_id_mm is not None:
+                import math as _math2
+                cx, cy = sp_d['center_px']
+                pix_mm = float(sp_d['pix_mm'])
+                half = float(sp_d['length_mm']) * 0.5 / pix_mm
+                ang = _math2.radians(float(sp_d['axis_deg']))
+                e1 = (cx + _math2.cos(ang) * half, cy - _math2.sin(ang) * half)
+                e2 = (cx - _math2.cos(ang) * half, cy + _math2.sin(ang) * half)
+                e1p = np.array([e1[0], (side - 1.0) - e1[1], 10.0], dtype=np.float64)
+                e2p = np.array([e2[0], (side - 1.0) - e2[1], 10.0], dtype=np.float64)
+                ncc_p = ref_3d['ncc']
+                bot = e1p if np.linalg.norm(e1p - ncc_p) < np.linalg.norm(e2p - ncc_p) else e2p
+                plotter.add_mesh(pv.Line(bot, ncc_p), color='orange', line_width=4, name='id_segment')
+                mid = 0.5 * (bot + ncc_p) + np.array([0, 0, 4.0])
+                plotter.add_point_labels(
+                    np.array([mid], dtype=np.float32), [f'ID = {self._tavi_id_mm:.2f} mm'],
+                    font_size=14, point_color='orange', text_color='white',
+                    shape='rounded_rect', shape_color='black', shape_opacity=0.55,
+                    always_visible=True, name='id_label')
+
         plotter.enable_parallel_projection()
-        plotter.add_text('Maillages anatomiques 3D recales sur fluoroscopie', font_size=10)
+        title = 'Maillages anatomiques 3D recales sur fluoroscopie'
+        if stent_added:
+            title += ' + Stent (fils tresses)'
+        if ref_added:
+            title += f' + {ref_added} repere(s) TAVI'
+        plotter.add_text(title, font_size=10)
         plotter.add_axes(line_width=2)
         plotter.camera_position = [
             (side * 0.5, side * 0.5, side * 1.7),

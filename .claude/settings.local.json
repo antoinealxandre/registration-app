@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast,sys; [ast.parse\\(open\\(p,encoding='utf-8'\\).read\\(\\), p\\) for p in ['registration_app/core/measurements.py','registration_app/ui/widgets/annotation_widgets.py','registration_app/ui/main_window.py']]; print\\('OK syntax'\\)\")"
+    ]
+  }
+}
