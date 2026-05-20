@@ -181,8 +181,6 @@ def register(
         (max(0.1, 1.0 - search_scale_range), 1.0 + search_scale_range),
     ]
 
-    cv2.setNumThreads(2)  # Avoid OpenCV/joblib contention with workers=4
-
     for res, maxiter, popsize in pyramid:
         # Resize masks to current resolution
         scale_factor = res / 512.0
@@ -237,11 +235,13 @@ def register(
             return -score
 
         # Differential Evolution at this resolution
+        # Note: workers=1 on Windows (nested objective_r not picklable for multiprocessing)
+        # Pyramid cascade alone provides 3-5x speedup without multiprocessing overhead
         res_de = differential_evolution(
             objective_r, bounds=bounds_r,
             maxiter=maxiter, popsize=popsize, seed=42,
             tol=1e-5, mutation=(0.5, 1.0), recombination=0.7,
-            workers=4, disp=False,
+            workers=1, disp=False,
         )
 
         # Extract best solution and rescale back to 512px coordinates
