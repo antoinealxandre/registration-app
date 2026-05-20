@@ -3,7 +3,6 @@
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
-from skimage.exposure import match_histograms
 
 from core.drr_generator import generate_drr, project_mask_3d
 from core.registration import register, register_elastic
@@ -252,10 +251,6 @@ class WorkerThread(QThread):
             postprocess_kw=kw.get('postprocess_kw'),
             **geom_kw,
         )
-
-        # P7: Histogram matching for appearance consistency (DRR → fluoroscopy)
-        self.progress.emit(23, 'Correspondance d\'apparence DRR-Fluoroscopie...')
-        drr_image = match_histograms(drr_image, fluoro, channel_axis=None)
 
         all_proj_masks = {}
         seg_masks = kw.get('seg_masks', {})

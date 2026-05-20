@@ -4,7 +4,6 @@ import re as _re
 
 import numpy as np
 import pandas as pd
-import cv2
 
 try:
     import pydicom
@@ -55,18 +54,6 @@ def _normalize_dicom_frame(frame: np.ndarray, photometric: str = 'MONOCHROME2') 
     return np.clip(gray * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def _select_best_frame_sharpness(frames_u8: np.ndarray) -> int:
-    """Select sharpest frame (end-diastole) by Laplacian variance (minimal cardiac motion)."""
-    if frames_u8.shape[0] <= 1:
-        return 0
-    scores = []
-    for frame in frames_u8:
-        laplacian = cv2.Laplacian(frame, cv2.CV_64F)
-        sharpness = float(laplacian.var())
-        scores.append(sharpness)
-    return int(np.argmax(scores))
-
-
 def read_dicom_fluoro_series(path: str):
     """
     Read a fluoroscopy DICOM series and return normalized uint8 frames + metadata.
@@ -102,8 +89,8 @@ def read_dicom_fluoro_series(path: str):
     )
 
     n_frames = int(frames_u8.shape[0])
-    # Select sharpest frame (end-diastole, minimal cardiac motion) via Laplacian variance
-    frame_idx = _select_best_frame_sharpness(frames_u8)
+    rep = int(getattr(ds, 'RepresentativeFrameNumber', (n_frames + 1) // 2))
+    frame_idx = max(0, min(rep - 1, n_frames - 1))
     img_uint8 = frames_u8[frame_idx]
 
     def _get(tag, default):
@@ -147,24 +134,15 @@ def read_dicom_fluoro_series(path: str):
     arm_p = _get_private(0x0019, 0x1002, None)
     arm_c = _get_private(0x0019, 0x1003, None)
 
-    # Standard Primary/Secondary angles (DICOM standard convention)
-    # Primary = LAO/RAO (left/right anterior oblique)
-    # Secondary = CRA/CAUD (cranial/caudal)
+    # Standard Primary/Secondary angles
+    # For GE, typically PositionerPrimaryAngle is LAO/RAO and PositionerSecondaryAngle is CRA/CAUD.
     primary = _get_float('PositionerPrimaryAngle', 0.0)
     secondary = _get_float('PositionerSecondaryAngle', 0.0)
-
-    # Determine manufacturer to apply correct angle convention
-    manufacturer = _get_str('Manufacturer', '').upper()
-    use_ge_convention = 'GE' in manufacturer and (arm_c is not None or arm_p is not None)
-
-    if use_ge_convention:
-        # GE C-arms: convention swap (GE private tags encode angles differently)
-        lao = arm_c if arm_c is not None else secondary
-        cran = arm_p if arm_p is not None else primary
-    else:
-        # Standard DICOM convention (Siemens, Philips, Canon, etc.)
-        lao = primary
-        cran = secondary
+    
+    # Requested convention swap: LAO/RAO comes from Secondary (or C-arm private),
+    # CRA/CAUD comes from Primary (or P-arm private).
+    lao = secondary if arm_c is None else arm_c
+    cran = primary if arm_p is None else arm_p
 
     sid = _get_float('DistanceSourceToDetector', 1020.0)
     sod = _get_float('DistanceSourceToPatient', 510.0)
@@ -331,20 +309,9 @@ def read_metadata_csv(path: str):
 
     primary = _f('PositionerPrimaryAngle', 0.0)
     secondary = _f('PositionerSecondaryAngle', 0.0)
-
-    # Determine manufacturer to apply correct angle convention
-    # CSV may not have GE private tags, so we rely on Manufacturer field only
-    manufacturer = str(lookup.get('Manufacturer', '')).upper()
-    use_ge_convention = 'GE' in manufacturer
-
-    if use_ge_convention:
-        # GE convention: Primary = CRA/CAUD, Secondary = LAO/RAO (reversed from standard)
-        lao = secondary
-        cran = primary
-    else:
-        # Standard DICOM convention: Primary = LAO/RAO, Secondary = CRA/CAUD
-        lao = primary
-        cran = secondary
+    # Requested convention swap: Secondary -> LAO/RAO, Primary -> CRA/CAUD.
+    lao = secondary
+    cran = primary
     sid = _f('DistanceSourceToDetector', 1020.0)
     sod = _f('DistanceSourceToPatient', 510.0)
     mag = _f('EstimatedRadiographicMagnificationFactor', sid / sod if sod > 0 else 1.0)
