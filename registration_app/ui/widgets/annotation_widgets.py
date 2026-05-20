@@ -2532,7 +2532,7 @@ class FinalOverlayPanel(QWidget):
             j_resolution=1,
         )
         plane.texture_map_to_plane(inplace=True)
-        plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
+        fluoro_actor = plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
 
         added_meshes = 0
 
@@ -2657,6 +2657,20 @@ class FinalOverlayPanel(QWidget):
 
         # ── Mesures TAVI visuelles (accolades + fleches + callout risque) ──
         self._draw_tavi_measurements(plotter, pv, ref_3d, side)
+
+        # Slider profondeur fluoroscopie
+        def _set_fluoro_depth(value):
+            fluoro_actor.SetPosition(0, 0, float(value))
+
+        plotter.add_slider_widget(
+            _set_fluoro_depth,
+            rng=[-side * 0.4, side * 0.4],
+            value=0.0,
+            title='Profondeur fluoro',
+            pointa=(0.02, 0.06), pointb=(0.28, 0.06),
+            color='#8fa5cc',
+            style='modern',
+        )
 
         plotter.enable_parallel_projection()
         title = 'Maillages anatomiques 3D recales sur fluoroscopie'
