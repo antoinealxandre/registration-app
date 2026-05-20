@@ -54,15 +54,12 @@ from core.measurements import (
     ms_length_from_hinges,
     project_world_to_fluoro_pixel,
     risk_assessment,
-    stent_3d_pose_from_fluoro,
-    stent_endpoints_world,
     view_pixel_from_voxel,
     voxel_from_view_pixel,
     voxel_from_world,
     world_from_voxel,
 )
 from core.registration import apply_full_transform
-from core.stent_model import braided_stent_world
 from core.stent_placement import (
     generate_stent_mesh,
     project_stent_mask,
@@ -1104,10 +1101,10 @@ class MainWindow(QMainWindow):
     _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex', 'btn_ncc')
     _MS_ORDER = ('hinge1', 'hinge2', 'ms', 'ncc')
     _MS_HINT = {
-        'hinge1': 'Cliquez le hinge L (cusp gauche) sur une coupe coronale.',
-        'hinge2': 'Cliquez le hinge R (cusp droit) sur la coupe coronale.',
-        'ms':     'Cliquez l apex du septum membraneux (debut du septum musculaire).',
-        'ncc':    'Cliquez le bas du cusp non-coronaire (reference pour ID).',
+        'hinge1': 'Hinge L (cusp gauche) — base de la valve aortique côté gauche. Repérez sur coupe coronale (axe vertical) : c\'est la jonction valve-paroi ventriculaire. Cliquez pour marquer.',
+        'hinge2': 'Hinge R (cusp droit) — base de la valve aortique côté droit. Même coupe coronale que Hinge L. Complète la ligne annulaire qui servira de référence pour MS.',
+        'ms':     'MS (Membranous Septum) — apex/pointe du septum membraneux à la base du cusp non-coronaire. C\'est le début du septum musculaire. Marque le haut du risque de conduction cardiaque.',
+        'ncc':    'NCC (Non-Coronary Cusp) — base/jonction inférieure du cusp non-coronaire. Référence pour mesurer l\'implantation profonde (ID = distance stent-NCC). Repérez sous la ligne hinge-hinge.',
     }
     _MS_MARKER = {
         'hinge1': ((100, 200, 255), 'Hinge L'),
@@ -1205,48 +1202,38 @@ class MainWindow(QMainWindow):
                 return world_from_voxel(centroid, self.ct_aff)
         return self._ct_center_world()
 
-    def _stent_3d_pose_world(self):
-        """Pose 3D du stent dans le repere CT-monde (center, axis_unit).
+    def _stent_pix_mm(self):
+        """Retourne le mm/pixel calibre sur le stent affiche (source de verite metrique).
 
-        Le stent est rigidement attache a la fluoro. On reconstruit sa position 3D
-        en ancrant la profondeur sur le centroide de la racine aortique
-        (issu de la segmentation CT). Sans seg, on prend le centre du volume CT.
+        Le stent rendu sur le canvas fluoro a une longueur en pixels potentiellement
+        ecretee par le canvas (cap min/max). On utilise cette longueur affichee
+        comme calibre car c'est CE stent que l'utilisateur positionne sur le
+        stent reel visible. Fallback sur fov_mm/size si pas de stent.
+        """
+        size = max(1, self.cv_fl.image_size())
+        len_mm = float(self.sp_stent_L.value())
+        len_px = getattr(self.cv_fl, '_stent_axis_len', None)
+        if len_px and len_px > 0 and len_mm > 0:
+            return len_mm / float(len_px)
+        # Fallback : pix_mm theorique a partir du FOV DICOM
+        fov = float(self.sp_fov.value())
+        return (fov / float(size)) if fov > 0 else 1.0
+
+    def _stent_endpoints_fluoro(self):
+        """Retourne (top_px, bot_px) extremites du stent en pixels fluoro (canvas).
+
+        On lit la longueur en pixels REELLEMENT affichee sur le canvas (qui peut
+        avoir ete ecretee). C'est cette geometrie visible qui sert de reference
+        pour toutes les mesures 2D.
         """
         if self._stent_center_px is None or self.stent_mesh is None:
             return None
-        ct_c = self._ct_center_world()
-        anchor = self._aortic_anchor_world()
-        if ct_c is None or anchor is None:
-            return None
-        reg = self.result if (isinstance(getattr(self, 'result', None), dict)
-                              and 'tx' in self.result) else None
-        size = max(1, self.cv_fl.image_size())
-        return stent_3d_pose_from_fluoro(
-            stent_center_px_fluoro=self._stent_center_px,
-            stent_axis_deg_fluoro=self._stent_axis_deg,
-            stent_length_mm=float(self.sp_stent_L.value()),
-            image_size=size,
-            lao_deg=float(self.sp_lao.value()),
-            cran_deg=float(self.sp_cran.value()) + 180.0,
-            sid_mm=float(self.dicom_meta.get('sid_mm', 1020.0)),
-            sod_mm=float(self.dicom_meta.get('sod_mm', 510.0)),
-            fov_mm=float(self.sp_fov.value()),
-            ct_center_world=ct_c,
-            anchor_world=anchor,
-            registration_result=reg,
-        )
-
-    def _stent_endpoints_fluoro(self):
-        """Retourne (top_px, bot_px) extremites du stent en pixels fluoro (canvas)."""
-        if self._stent_center_px is None or self.stent_mesh is None:
-            return None
-        size = max(1, self.cv_fl.image_size())
-        pix_mm_iso = float(self.sp_fov.value()) / float(size)
-        if pix_mm_iso <= 0:
+        len_px = getattr(self.cv_fl, '_stent_axis_len', None)
+        if not len_px or len_px <= 0:
             return None
         cx, cy = self._stent_center_px
         ang = math.radians(self._stent_axis_deg)
-        half_px = float(self.sp_stent_L.value()) * 0.5 / pix_mm_iso
+        half_px = float(len_px) * 0.5
         # AnnotationCanvas convention : direction = (cos, -sin) en pixels
         end1 = (cx + math.cos(ang) * half_px, cy - math.sin(ang) * half_px)
         end2 = (cx - math.cos(ang) * half_px, cy + math.sin(ang) * half_px)
@@ -1287,13 +1274,12 @@ class MainWindow(QMainWindow):
         ncc_fl = self._project_world_to_fluoro(self._ms_world['ncc'])
         if ncc_fl is None:
             return None
-        size = max(1, self.cv_fl.image_size())
-        pix_mm_iso = float(self.sp_fov.value()) / float(size)
+        pix_mm = self._stent_pix_mm()
         e1, e2 = ends
         d1 = math.hypot(e1[0] - ncc_fl[0], e1[1] - ncc_fl[1])
         d2 = math.hypot(e2[0] - ncc_fl[0], e2[1] - ncc_fl[1])
         bot = e1 if d1 < d2 else e2
-        return math.hypot(bot[0] - ncc_fl[0], bot[1] - ncc_fl[1]) * pix_mm_iso
+        return math.hypot(bot[0] - ncc_fl[0], bot[1] - ncc_fl[1]) * pix_mm
 
     def _ms_recompute(self):
         if not hasattr(self, 'lbl_ms_value'):
@@ -2145,38 +2131,8 @@ class MainWindow(QMainWindow):
             v = voxel_from_world(world_mm, self.ct_aff)
             return vox_to_plot(v)
 
-        # ── Stent recale dans le CT (fils tresses, ancre sur la racine aortique) ─
-        stent_pose = self._stent_3d_pose_world()
-        if stent_pose is not None:
-            center_w, axis_w = stent_pose
-            length_mm = float(self.sp_stent_L.value())
-            diameter_mm = float(self.sp_stent_D.value())
-            try:
-                verts_w, faces = braided_stent_world(
-                    diameter_mm=diameter_mm, length_mm=length_mm,
-                    center_world=center_w, axis_world=axis_w,
-                    n_wires=24, braid_angle_deg=45.0,
-                    wire_radius_mm=0.18, n_pts=110, tube_sides=5,
-                )
-                offset = self.ct_aff[:3, 3] if self.ct_aff is not None else np.zeros(3)
-                verts_plot = (verts_w - offset).astype(np.float32)
-                faces_pv = np.hstack([
-                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
-                    faces.astype(np.int64),
-                ]).ravel()
-                stent_pv = pv.PolyData(verts_plot, faces_pv)
-                plotter.add_mesh(stent_pv, color=(0.98, 0.85, 0.25), opacity=0.92,
-                                  smooth_shading=True, name='stent_mesh')
-                # Sphere bas du stent (cote NCC, repere visuel pour ID)
-                e1_w, e2_w = stent_endpoints_world(center_w, axis_w, length_mm)
-                ncc_w = self._ms_world.get('ncc')
-                if ncc_w is not None:
-                    bot_w = e1_w if np.linalg.norm(e1_w - ncc_w) < np.linalg.norm(e2_w - ncc_w) else e2_w
-                    plotter.add_mesh(
-                        pv.Sphere(radius=2.0, center=world_to_plot(bot_w)),
-                        color=(1.0, 0.55, 0.2), name='stent_bot_sphere')
-            except Exception as ex:
-                self._status(f'Rendu stent 3D CT echoue : {ex}')
+        # NB : pas de rendu du stent ici. Le stent (et le calcul du risque TAVI
+        # complet) n'apparaissent qu'apres recalage, dans l'onglet Overlay 3D.
 
         # ── Rendu/mise a jour des marqueurs + segments + labels (in-place) ──
         def refresh_tavi():
@@ -2408,8 +2364,6 @@ class MainWindow(QMainWindow):
             self._iterations[self._current_iter_idx]['result'] = res
             self._refresh_iter_list()
         self._update_overlay()
-        # Recalage fini -> rafraichir immediatement la projection du stent sur les coupes
-        self._push_stent_3d_to_seg_panel()
         self._ms_recompute()
         self._status(f'Recalage termine -- IoU={iou:.3f}  Dice={dice:.3f}')
 
@@ -2524,59 +2478,15 @@ class MainWindow(QMainWindow):
         # Basculer automatiquement sur l'onglet Overlay
         self.tabs.setCurrentIndex(4)
 
-    def _push_stent_3d_to_seg_panel(self):
-        """Propage la pose 3D du stent au panneau Seg CT pour affichage sur les coupes.
-
-        Cette projection n'a de sens qu'APRES recalage (le lien fluoro<->DRR est
-        donne par le recalage). Sans recalage on n'affiche rien sur les coupes.
-        """
-        if not hasattr(self, 'seg_review_panel'):
-            return
-        has_reg = isinstance(getattr(self, 'result', None), dict) and 'tx' in self.result
-        if not has_reg:
-            self.seg_review_panel.clear_stent_3d()
-            return
-        pose = self._stent_3d_pose_world()
-        if pose is None or self.ct_aff is None:
-            self.seg_review_panel.clear_stent_3d()
-            return
-        center_w, axis_w = pose
-        length_mm = float(self.sp_stent_L.value())
-        e1_w, e2_w = stent_endpoints_world(center_w, axis_w, length_mm)
-        p1_vox = voxel_from_world(e1_w, self.ct_aff)
-        p2_vox = voxel_from_world(e2_w, self.ct_aff)
-        diam_mm = float(self.sp_stent_D.value())
-        spacing = np.abs(np.array([self.ct_aff[0, 0], self.ct_aff[1, 1], self.ct_aff[2, 2]],
-                                   dtype=np.float64))
-        spacing = np.where(spacing > 1e-6, spacing, 1.0)
-        diam_vox = tuple(diam_mm / spacing)
-        self.seg_review_panel.set_stent_3d(p1_vox, p2_vox, diam_vox)
-
-    def _schedule_seg_panel_stent_update(self, delay_ms: int = 220):
-        """Debounce de la propagation du stent vers le panneau Seg CT.
-
-        Le re-render des 3 coupes est couteux (segs multiples). On retarde donc
-        la mise a jour pour eviter le lag pendant le glissement du stent.
-        """
-        from PyQt5.QtCore import QTimer
-        timer = getattr(self, '_seg_panel_stent_timer', None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._push_stent_3d_to_seg_panel)
-            self._seg_panel_stent_timer = timer
-        timer.start(int(delay_ms))
-
     def _push_tavi_to_overlay(self):
         """Communique au panneau overlay la pose 2D du stent + reperes projetes + valeurs."""
-        # Panneau Seg CT : update differee (couteuse) pour eviter le lag pendant le drag
-        self._schedule_seg_panel_stent_update()
         if not hasattr(self, 'overlay_panel'):
             return
         stent_fluoro = None
         if self._stent_center_px is not None and self.stent_mesh is not None and hasattr(self, 'cv_fl'):
-            size = max(1, self.cv_fl.image_size())
-            pix_mm = float(self.sp_fov.value()) / float(size)
+            # pix_mm calibre sur la longueur du stent affiche sur le canvas
+            # (source de verite metrique 2D, cf. _stent_pix_mm).
+            pix_mm = self._stent_pix_mm()
             stent_fluoro = {
                 'center_px': (float(self._stent_center_px[0]), float(self._stent_center_px[1])),
                 'axis_deg': float(self._stent_axis_deg),
@@ -2589,16 +2499,20 @@ class MainWindow(QMainWindow):
             ms_mm = ms_length_from_hinges(
                 self._ms_world['hinge1'], self._ms_world['hinge2'], self._ms_world['ms'])
         id_mm = self._compute_id_mm()
-        # Projeter chaque repere CT-monde dans le plan fluoro pour affichage 2D dans l'overlay 3D
-        ref_proj = {}
-        for k, world in self._ms_world.items():
-            p = self._project_world_to_fluoro(world)
-            if p is not None:
-                ref_proj[k] = (float(p[0]), float(p[1]))
+        # Convertir chaque repere CT-monde en coords voxel CT. La projection
+        # vers le plan d'overlay sera faite par le panneau via le MEME pipeline
+        # que les meshes de segmentation, ce qui garantit l'alignement.
+        ref_voxel = {}
+        if self.ct_aff is not None:
+            for k, world in self._ms_world.items():
+                v = voxel_from_world(world, self.ct_aff)
+                ref_voxel[k] = (float(v[0]), float(v[1]), float(v[2]))
+        ct_shape = self.ct_vol.shape if self.ct_vol is not None else None
         self.overlay_panel.set_tavi_overlay(
             stent_fluoro=stent_fluoro,
             ms_world=dict(self._ms_world),
-            ref_fluoro_px=ref_proj,
+            ref_voxel=ref_voxel,
+            ct_shape=ct_shape,
             id_mm=id_mm,
             ms_length_mm=ms_mm,
         )
@@ -3005,7 +2919,7 @@ class MainWindow(QMainWindow):
 
     def _load_yolo_default(self):
         """Charge automatiquement le modèle YOLO par défaut s'il existe."""
-        default_path = 'data/model/best (3).pt'
+        default_path = 'data/model/best (2).pt'
         if os.path.exists(default_path):
             try:
                 yolo_load(default_path)

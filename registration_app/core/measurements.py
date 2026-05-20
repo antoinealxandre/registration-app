@@ -5,6 +5,53 @@ Dependency After TAVR", Circ Arrhythm Electrophysiol. 2021;14:e009028.
 
 Le risque dépend principalement de ΔMSID = ID − MS_length (cut-off 3 mm,
 OR 7.58, sensibilité 84 %, spécificité 69 %).
+
+REPÈRES ANATOMIQUES (Landmarks) :
+═════════════════════════════════════════════════════════════════════════════
+
+1. HINGE1 (Hinge gauche / Left hinge)
+   - Localisation : Base de la valve aortique côté gauche
+   - Anatomie : Jonction cusp-paroi ventriculaire du côté gauche
+   - Vue idéale : Coupe coronale (projection AP avec angulation craniale)
+   - Objectif : Marquer le pôle gauche de la ligne annulaire
+   - Risque associé : Proximité au système de conduction auriculo-ventriculaire
+
+2. HINGE2 (Hinge droit / Right hinge)
+   - Localisation : Base de la valve aortique côté droit
+   - Anatomie : Jonction cusp-paroi ventriculaire du côté droit
+   - Vue idéale : Même coupe que HINGE1 pour délimiter l'anneau valve
+   - Objectif : Complète HINGE1 pour tracer la ligne annulaire
+   - Distance HINGE1-HINGE2 : Longueur de l'anneau valvulaire (~15-25 mm)
+
+3. MS (Membranous Septum point)
+   - Localisation : Apex du septum membraneux / début du septum musculaire
+   - Anatomie : Point critique juste au-dessus du septum musculaire
+   - Vue idéale : Coupe coronale ou petit-axe (perpendiculaire à annulus)
+   - Objectif : Référence supérieure pour le système de conduction
+   - Rôle clinique : Sommet du risque PM (pacemaker) / MS_length = distance annulus→MS
+
+4. NCC (Non-Coronary Cusp base)
+   - Localisation : Base/jonction inférieure du cusp non-coronaire
+   - Anatomie : Pointe inférieure du cusp non-coronaire (le 3e cusp aortique)
+   - Vue idéale : Coupe petit-axe ou coronale où le cusp est maximal
+   - Objectif : Référence pour profondeur d'implantation (ID = distance stent→NCC)
+   - Relation : NCC est généralement 2-5 mm sous la ligne hinge-hinge
+
+INTERPRÉTATION DU RISQUE PM :
+═════════════════════════════════════════════════════════════════════════════
+- MS_length : Distance annulaire → apex septum membraneux (5-12 mm, normal)
+- ID : Distance distal stent → NCC (implantation profonde, 0-8 mm)
+- ΔMSID = MS_length − ID (cut-off 3 mm)
+  • ΔMSID < 3 mm : Risque ÉLEVÉ (70% PM dépendance à 6 mois)
+  • ΔMSID ≥ 3 mm : Risque BAS (2.7% PM dépendance à 6 mois)
+
+CONSEILS DE PLACEMENT :
+═════════════════════════════════════════════════════════════════════════════
+- Commencez par HINGE1 et HINGE2 sur coupe coronale pour anchorer l'anneau
+- Localisez MS perpendiculairement au milieu de la ligne hinge-hinge
+- Finalisez avec NCC (le point de repère le plus difficile, à chercher sous l'anneau)
+- Utilisez le zoom et pan de la vue CT pour améliorer la précision
+- Chaque point est projeté sur les coupes après recalage pour vérification visuelle
 """
 
 import math
