@@ -4,6 +4,7 @@ import re as _re
 
 import numpy as np
 import pandas as pd
+import cv2
 
 try:
     import pydicom
@@ -54,6 +55,18 @@ def _normalize_dicom_frame(frame: np.ndarray, photometric: str = 'MONOCHROME2') 
     return np.clip(gray * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def _select_best_frame_sharpness(frames_u8: np.ndarray) -> int:
+    """Select sharpest frame (end-diastole) by Laplacian variance (minimal cardiac motion)."""
+    if frames_u8.shape[0] <= 1:
+        return 0
+    scores = []
+    for frame in frames_u8:
+        laplacian = cv2.Laplacian(frame, cv2.CV_64F)
+        sharpness = float(laplacian.var())
+        scores.append(sharpness)
+    return int(np.argmax(scores))
+
+
 def read_dicom_fluoro_series(path: str):
     """
     Read a fluoroscopy DICOM series and return normalized uint8 frames + metadata.
@@ -89,8 +102,8 @@ def read_dicom_fluoro_series(path: str):
     )
 
     n_frames = int(frames_u8.shape[0])
-    rep = int(getattr(ds, 'RepresentativeFrameNumber', (n_frames + 1) // 2))
-    frame_idx = max(0, min(rep - 1, n_frames - 1))
+    # Select sharpest frame (end-diastole, minimal cardiac motion) via Laplacian variance
+    frame_idx = _select_best_frame_sharpness(frames_u8)
     img_uint8 = frames_u8[frame_idx]
 
     def _get(tag, default):

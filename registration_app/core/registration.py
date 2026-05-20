@@ -43,6 +43,31 @@ def dice_score(a: np.ndarray, b: np.ndarray) -> float:
     return 2.0 * inter / (float(a.sum()) + float(b.sum()) + 1e-8)
 
 
+def ncc_score(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalized Cross-Correlation on float images [0,1]."""
+    a_norm = a.astype(np.float32)
+    b_norm = b.astype(np.float32)
+    a_mean = a_norm.mean()
+    b_mean = b_norm.mean()
+    a_c = a_norm - a_mean
+    b_c = b_norm - b_mean
+    denom = (np.std(a_c) * np.std(b_c) * float(a_norm.size)) + 1e-8
+    return float(np.sum(a_c * b_c) / denom)
+
+
+def gradient_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Gradient correlation - robust to cross-modality intensity differences."""
+    a_u8 = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+    b_u8 = (np.clip(b, 0, 1) * 255).astype(np.uint8)
+    ga_x = cv2.Sobel(a_u8, cv2.CV_64F, 1, 0)
+    ga_y = cv2.Sobel(a_u8, cv2.CV_64F, 0, 1)
+    gb_x = cv2.Sobel(b_u8, cv2.CV_64F, 1, 0)
+    gb_y = cv2.Sobel(b_u8, cv2.CV_64F, 0, 1)
+    ga = ga_x + ga_y
+    gb = gb_x + gb_y
+    return ncc_score(ga, gb)
+
+
 def centroid(mask: np.ndarray):
     """Retourne (cx, cy) du masque binaire."""
     ys, xs = np.where(mask > 0)
@@ -50,6 +75,24 @@ def centroid(mask: np.ndarray):
         h, w = mask.shape
         return w / 2.0, h / 2.0
     return float(xs.mean()), float(ys.mean())
+
+
+def _tight_bounds(x_best: np.ndarray, tx0: float, ty0: float, factor: float = 0.25):
+    """Tighten search bounds around current best solution for next pyramid level."""
+    tx_b, ty_b = x_best[0], x_best[1]
+    angle_b, scale_b = x_best[2], x_best[3]
+
+    delta_tx = abs(tx_b - tx0) + 1.0
+    delta_ty = abs(ty_b - ty0) + 1.0
+    delta_angle = 3.0
+    delta_scale = 0.05
+
+    return [
+        (tx_b - delta_tx * factor, tx_b + delta_tx * factor),
+        (ty_b - delta_ty * factor, ty_b + delta_ty * factor),
+        (angle_b - delta_angle, angle_b + delta_angle),
+        (max(0.1, scale_b - delta_scale), scale_b + delta_scale),
+    ]
 
 
 def register(
@@ -60,10 +103,18 @@ def register(
     search_rot_deg: float = 30.0,
     search_scale_range: float = 0.4,
     progress_cb: Optional[Callable[[float, float], None]] = None,
+    drr_float: Optional[np.ndarray] = None,
+    fluoro_float: Optional[np.ndarray] = None,
+    metric: str = 'iou',
 ) -> dict:
     """
-    Recale mask_moving sur mask_fixed par maximisation IoU.
+    Recale mask_moving sur mask_fixed par maximisation métrique.
     Les bornes de recherche sont calculées automatiquement si None.
+
+    Args:
+        drr_float: Optional DRR image [0,1] for intensity-based metrics
+        fluoro_float: Optional fluoroscopy image [0,1] for intensity-based metrics
+        metric: 'iou' | 'combined' (60% IoU + 30% NCC + 10% gradient correlation)
 
     Returns:
         dict avec clés : tx, ty, angle, scale, iou, dice,
@@ -93,32 +144,124 @@ def register(
     def objective(params):
         tx, ty, angle, scale = params
         moved = apply_transform(mask_moving, tx, ty, angle, (cx_mov, cy_mov), scale)
-        score = iou_score(moved, mask_fixed)
-        iou_history.append(score)
+        iou = iou_score(moved, mask_fixed)
+
+        if metric == 'combined' and drr_float is not None and fluoro_float is not None:
+            # Apply same transform to DRR for intensity-based metrics
+            h, w = drr_float.shape[:2]
+            M = cv2.getRotationMatrix2D((cx_mov, cy_mov), angle, scale)
+            M[0, 2] += tx
+            M[1, 2] += ty
+            drr_warped = cv2.warpAffine(
+                drr_float.astype(np.float32), M, (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0
+            )
+            ncc = ncc_score(drr_warped, fluoro_float)
+            grad_corr = gradient_correlation(drr_warped, fluoro_float)
+            score = 0.6 * iou + 0.3 * ncc + 0.1 * grad_corr
+        else:
+            score = iou
+
+        iou_history.append(iou)
         call_count[0] += 1
         if progress_cb is not None and call_count[0] % 50 == 0:
             frac = min(call_count[0] / max_calls_est, 0.95)
-            progress_cb(frac, score)
+            progress_cb(frac, iou)
         return -score
 
-    # ── Stage 1 : Differential Evolution ─────────────────────────────────────
-    bounds = [
-        (tx_init - search_tx_px,  tx_init + search_tx_px),
-        (ty_init - search_ty_px,  ty_init + search_ty_px),
-        (-search_rot_deg,          search_rot_deg),
+    # ── Multi-resolution pyramid (64 → 128 → 512 px) ────────────────────────────
+    # Cascade resolutions with tightening bounds
+    pyramid = [(64, 150, 12), (128, 100, 8), (512, 50, 6)]
+    tx_best, ty_best, rot_best, scale_best = tx_init, ty_init, 0.0, 1.0
+    bounds_current = [
+        (tx_init - search_tx_px, tx_init + search_tx_px),
+        (ty_init - search_ty_px, ty_init + search_ty_px),
+        (-search_rot_deg, search_rot_deg),
         (max(0.1, 1.0 - search_scale_range), 1.0 + search_scale_range),
     ]
-    res_de = differential_evolution(
-        objective, bounds=bounds,
-        maxiter=300, popsize=15, seed=42,
-        tol=1e-5, mutation=(0.5, 1.0), recombination=0.7,
-        workers=1, disp=False,
-    )
 
-    # ── Stage 2 : Nelder-Mead raffinement ────────────────────────────────────
+    cv2.setNumThreads(2)  # Avoid OpenCV/joblib contention with workers=4
+
+    for res, maxiter, popsize in pyramid:
+        # Resize masks to current resolution
+        scale_factor = res / 512.0
+        mf_r = cv2.resize(mask_fixed, (res, res), interpolation=cv2.INTER_NEAREST)
+        mm_r = cv2.resize(mask_moving, (res, res), interpolation=cv2.INTER_NEAREST)
+
+        # Rescale images if provided
+        drr_r = drr_float
+        fluoro_r = fluoro_float
+        if drr_float is not None:
+            drr_r = cv2.resize(drr_float, (res, res), interpolation=cv2.INTER_LINEAR)
+        if fluoro_float is not None:
+            fluoro_r = cv2.resize(fluoro_float, (res, res), interpolation=cv2.INTER_LINEAR)
+
+        # Update centroid for scaled resolution
+        cx_mov_r, cy_mov_r = centroid(mm_r)
+
+        # Rescale bounds for current resolution
+        bounds_r = [
+            (bounds_current[0][0] * scale_factor, bounds_current[0][1] * scale_factor),
+            (bounds_current[1][0] * scale_factor, bounds_current[1][1] * scale_factor),
+            bounds_current[2],  # Angle invariant
+            bounds_current[3],  # Scale invariant
+        ]
+
+        def objective_r(params):
+            tx, ty, angle, scale = params
+            moved = apply_transform(mm_r, tx, ty, angle, (cx_mov_r, cy_mov_r), scale)
+            iou = iou_score(moved, mf_r)
+
+            if metric == 'combined' and drr_r is not None and fluoro_r is not None:
+                h, w = drr_r.shape[:2]
+                M = cv2.getRotationMatrix2D((cx_mov_r, cy_mov_r), angle, scale)
+                M[0, 2] += tx
+                M[1, 2] += ty
+                drr_warped = cv2.warpAffine(
+                    drr_r.astype(np.float32), M, (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                )
+                ncc = ncc_score(drr_warped, fluoro_r)
+                grad_corr = gradient_correlation(drr_warped, fluoro_r)
+                score = 0.6 * iou + 0.3 * ncc + 0.1 * grad_corr
+            else:
+                score = iou
+
+            iou_history.append(iou)
+            call_count[0] += 1
+            if progress_cb is not None and call_count[0] % 50 == 0:
+                frac = min(call_count[0] / (sum(m*p for _, m, p in pyramid) * 15), 0.95)
+                progress_cb(frac, iou)
+            return -score
+
+        # Differential Evolution at this resolution
+        res_de = differential_evolution(
+            objective_r, bounds=bounds_r,
+            maxiter=maxiter, popsize=popsize, seed=42,
+            tol=1e-5, mutation=(0.5, 1.0), recombination=0.7,
+            workers=4, disp=False,
+        )
+
+        # Extract best solution and rescale back to 512px coordinates
+        tx_best = res_de.x[0] / scale_factor if res < 512 else res_de.x[0]
+        ty_best = res_de.x[1] / scale_factor if res < 512 else res_de.x[1]
+        rot_best = res_de.x[2]
+        scale_best = res_de.x[3]
+
+        # Tighten bounds for next level
+        if res < 512:
+            bounds_current = _tight_bounds(
+                np.array([tx_best, ty_best, rot_best, scale_best]),
+                tx_init, ty_init, factor=0.25
+            )
+
+    # ── Final Nelder-Mead refinement at 512px ───────────────────────────────────
     res_nm = minimize(
-        objective, x0=res_de.x, method='Nelder-Mead',
-        options={'xatol': 0.05, 'fatol': 1e-6, 'maxiter': 3000, 'disp': False}
+        objective, x0=np.array([tx_best, ty_best, rot_best, scale_best]),
+        method='Nelder-Mead',
+        options={'xatol': 0.5, 'fatol': 1e-6, 'maxiter': 3000, 'disp': False}
     )
 
     tx_f, ty_f, rot_f, scale_f = res_nm.x
@@ -204,8 +347,8 @@ def apply_full_transform(img_f32: np.ndarray, result: dict) -> np.ndarray:
 def register_elastic(
     mask_moving: np.ndarray,
     mask_fixed: np.ndarray,
-    grid_size: int = 4,
-    max_disp_frac: float = 0.20,
+    grid_size: int = 8,
+    max_disp_frac: float = 0.05,
     smooth_weight: float = 0.05,
     progress_cb: Optional[Callable[[float, float], None]] = None,
 ) -> dict:
@@ -237,14 +380,22 @@ def register_elastic(
     def objective(params):
         moved = _apply_ctrl_pts(rigid_mask, params, ng, h, w)
         score = iou_score(moved, mask_fixed)
-        # Smoothness + magnitude regularisation
+        # Smoothness + bending energy regularisation
         dx = params[:n_pts].reshape(ng, ng)
         dy = params[n_pts:].reshape(ng, ng)
-        reg = smooth_weight * (
-            float(np.sum(dx ** 2) + np.sum(dy ** 2)) +
-            float(np.sum(np.diff(dx, axis=0) ** 2) + np.sum(np.diff(dx, axis=1) ** 2) +
-                  np.sum(np.diff(dy, axis=0) ** 2) + np.sum(np.diff(dy, axis=1) ** 2))
-        ) / (max_disp ** 2 + 1e-8)
+        # L2 norm of displacements
+        l2 = float(np.sum(dx ** 2) + np.sum(dy ** 2))
+        # First-order derivatives (gradient smoothness)
+        grad = float(np.sum(np.diff(dx, axis=0) ** 2) + np.sum(np.diff(dx, axis=1) ** 2) +
+                     np.sum(np.diff(dy, axis=0) ** 2) + np.sum(np.diff(dy, axis=1) ** 2))
+        # Second-order derivatives (bending energy - curvature)
+        ddx = np.diff(dx, n=2, axis=0) if ng > 2 else np.array([[0.0]])
+        ddy = np.diff(dx, n=2, axis=1) if ng > 2 else np.array([[0.0]])
+        ddx_y = np.diff(dy, n=2, axis=0) if ng > 2 else np.array([[0.0]])
+        ddy_y = np.diff(dy, n=2, axis=1) if ng > 2 else np.array([[0.0]])
+        bending = float(np.sum(ddx ** 2) + np.sum(ddy ** 2) +
+                       np.sum(ddx_y ** 2) + np.sum(ddy_y ** 2))
+        reg = smooth_weight * (l2 + grad + 0.1 * bending) / (max_disp ** 2 + 1e-8)
         call_count[0] += 1
         if progress_cb and call_count[0] % 30 == 0:
             frac = min(0.5 + call_count[0] / 5000 * 0.5, 0.98)
