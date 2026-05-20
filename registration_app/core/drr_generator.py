@@ -544,22 +544,28 @@ def project_mask_3d(
         vol_shape=vol.shape
     )
 
-    # Remplir le masque 2D en accumulant les hits des voxels
-    mask_2d = np.zeros((output_size, output_size), dtype=np.float32)
+    # Créer un masque binaire 2D : marquer chaque pixel projeté comme "inside"
+    # Méthode simple: rasteriser les indices projetés en tant que points épais
+    mask_2d = np.zeros((output_size, output_size), dtype=np.uint8)
     valid = ~np.isnan(coords).any(axis=1)
 
     if np.any(valid):
         coords_valid = coords[valid].astype(np.int32)
-        for i, (px, py) in enumerate(coords_valid):
-            # Clipper aux limites du masque
+        # Marquer les pixels dans le masque avec un rayon petite (anti-aliasing pour épaissseur)
+        for px, py in coords_valid:
             if 0 <= px < output_size and 0 <= py < output_size:
-                mask_2d[py, px] += 1.0
+                # Marquer le pixel et ses voisins immédiats pour créer une région solide
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        nx, ny = px + dx, py + dy
+                        if 0 <= nx < output_size and 0 <= ny < output_size:
+                            mask_2d[ny, nx] = 255
 
-    # Normaliser pour obtenir un masque binaire [0, 1]
-    if mask_2d.max() > 0:
-        mask_2d = np.clip(mask_2d / mask_2d.max(), 0.0, 1.0)
+    # Dilater légèrement pour combler les petits trous dus à la projection discrète
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_2d = cv2.dilate(mask_2d, kernel, iterations=1)
 
-    return mask_2d.astype(np.float32)
+    return (mask_2d > 0).astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
