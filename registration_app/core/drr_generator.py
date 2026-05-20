@@ -412,6 +412,88 @@ def _generate_drr_diffdrr(
     return _postprocess(img_np, postprocess_kw)
 
 
+def _rotation_matrix_for_mask(lao_deg: float, cran_deg: float, table_angle: float) -> np.ndarray:
+    """Retourne matrice de rotation 3×3 pour projection de masque.
+
+    Convention : LAO autour de Z, CRAN autour de X, TABLE autour de Y.
+    Appliquée dans l'ordre : Rz(LAO) @ Rx(CRAN) @ Ry(TABLE).
+    """
+    import math
+    lao = math.radians(float(lao_deg))
+    cran = math.radians(float(cran_deg))
+    table = math.radians(float(table_angle))
+
+    cz, sz = math.cos(lao), math.sin(lao)
+    cx, sx = math.cos(cran), math.sin(cran)
+    cy, sy = math.cos(table), math.sin(table)
+
+    rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    return ry @ rx @ rz
+
+
+def _project_voxel_indices_cone_beam(
+    voxel_indices: np.ndarray,
+    rotation: np.ndarray,
+    output_size: int,
+    sid_mm: float,
+    sod_mm: float,
+    pix_mm: float,
+    vol_shape: tuple = None,
+) -> np.ndarray:
+    """Projette des indices de voxels via le modèle cone-beam.
+
+    Les indices voxels sont d'abord centrés (soustraits de vol_shape/2) pour
+    obtenir des coordonnées autour du centre du volume (isocentre).
+
+    Args:
+        voxel_indices : (N, 3) indices [x, y, z]
+        rotation : (3, 3) matrice de rotation
+        output_size : résolution de sortie
+        sid_mm, sod_mm : distance source-détecteur, source-isocentre
+        pix_mm : taille pixel au détecteur
+        vol_shape : (nx, ny, nz) forme du volume pour centrer les indices
+
+    Returns:
+        (N, 2) coordonnées pixel [px, py], ou None si projection invalide
+    """
+    # Convertir indices en coordonnées centrées sur l'isocentre
+    verts = voxel_indices.astype(np.float64)
+    if vol_shape is not None:
+        center = np.array([vol_shape[0]/2.0, vol_shape[1]/2.0, vol_shape[2]/2.0])
+        verts = verts - center
+
+    # Appliquer rotation
+    verts_rot = (rotation @ verts.T).T  # (N, 3)
+
+    # Source à [0, -SOD, 0], détecteur à y = SID - SOD
+    src = np.array([0.0, -float(sod_mm), 0.0], dtype=np.float64)
+    det_y = float(sid_mm) - float(sod_mm)
+
+    # Paramètre de rayon pour chaque vertex
+    dy = verts_rot[:, 1] - src[1]
+    valid = np.abs(dy) > 1e-6
+
+    t = np.zeros_like(dy)
+    t[valid] = (det_y - src[1]) / dy[valid]
+    valid &= t > 0
+
+    # Projection : intersection rayon-détecteur
+    proj = src + (verts_rot - src) * t[:, None]  # (N, 3)
+
+    u = proj[:, 0]
+    v = proj[:, 2]
+
+    px = (float(output_size) * 0.5) + (u / float(pix_mm))
+    py = (float(output_size) * 0.5) - (v / float(pix_mm))
+
+    coords = np.column_stack([px, py]).astype(np.float32)
+    coords[~valid] = np.nan  # marquer les projections invalides
+
+    return coords
+
+
 def project_mask_3d(
     mask_3d: np.ndarray,
     ct_affine: np.ndarray,
@@ -427,65 +509,57 @@ def project_mask_3d(
     renderer: str = "siddon",
 ) -> np.ndarray:
     """
-    Projette un masque 3D binaire → masque 2D.
+    Projette un masque 3D binaire → masque 2D via projection cone-beam.
 
-    Entièrement en mémoire (scipy rotate + max-projection sur l'axe AP).
-    Aucune I/O disque, aucune dépendance DiffDRR → ~10 ms au lieu de minutes.
-    La signature est identique pour rétro-compatibilité ; ct_path non utilisé.
+    Nouvelle implémentation P1 : projection cone-beam géométriquement correcte
+    au lieu de la max-projection orthographique précédente.
+    La signature reste inchangée pour rétro-compatibilité.
     """
-    vol = (mask_3d > 0).astype(np.float32)
+    vol = (mask_3d > 0).astype(np.uint8)
 
-    # Downsample ×2 sur chaque axe : 8× moins de voxels, qualité identique pour un masque binaire
+    # Downsample ×2 sur chaque axe pour réduire les voxels à traiter
+    stride = 1
     if vol.shape[0] > 64:
-        vol = vol[::2, ::2, ::2]
+        stride = 2
+        vol = vol[::stride, ::stride, ::stride]
 
-    # Même convention d'axes que _generate_drr_cpu :
-    # axis0=R-L  axis1=A-P  axis2=S-I
-    # order=0 (plus proche voisin) : correct pour binaire et 3× plus rapide que order=1
-    if abs(lao_deg) > 0.1:
-        vol = _ndrot(vol, -lao_deg,    axes=(0, 1), reshape=False, order=0)
-    if abs(cran_deg) > 0.1:
-        vol = _ndrot(vol,  cran_deg,   axes=(1, 2), reshape=False, order=0)
-    if abs(table_angle) > 0.1:
-        vol = _ndrot(vol,  table_angle, axes=(0, 2), reshape=False, order=0)
+    # Extraire les indices des voxels non-nuls
+    indices = np.argwhere(vol > 0).astype(np.float64)
+    if indices.shape[0] == 0:
+        return np.zeros((output_size, output_size), dtype=np.float32)
 
-    # Max-projection le long de l'axe AP : vrai si AU MOINS un voxel est dans le masque
-    proj = vol.max(axis=1).astype(np.float32)   # (X, Z)
-    proj = np.ascontiguousarray(proj.T)          # (Z, X) → même orientation que le DRR
+    # Compenser le downsampling : rescaler les indices
+    if stride > 1:
+        indices *= float(stride)
 
-    proj = cv2.resize(proj, (output_size, output_size),
-                      interpolation=cv2.INTER_LINEAR)
+    # Matrice de rotation cone-beam
+    rotation = _rotation_matrix_for_mask(lao_deg, cran_deg, table_angle)
 
-    # Correction d'échelle physique : la projection rapide ci-dessus mappe
-    # implicitement toute la largeur CT sur l'image de sortie. Le DRR, lui,
-    # est paramétré par un FOV physique (à l'isocentre). On ajuste donc la
-    # taille apparente pour que masque et DRR partagent la même échelle.
-    if fov_mm is not None and fov_mm > 0 and ct_affine is not None:
-        try:
-            vx = float(abs(ct_affine[0, 0]))
-            vz = float(abs(ct_affine[2, 2]))
-            nx = int(mask_3d.shape[0])
-            nz = int(mask_3d.shape[2])
-            ct_span_mm = max(nx * vx, nz * vz, 1e-6)
-            scale = float(ct_span_mm / float(fov_mm))
-            scale = float(np.clip(scale, 0.25, 4.0))
+    # Pixel spacing au détecteur
+    pix_mm = _compute_delx(fov_mm, sid_mm, sod_mm, output_size)
 
-            if abs(scale - 1.0) > 0.02:
-                c = output_size * 0.5
-                M = cv2.getRotationMatrix2D((c, c), 0.0, scale)
-                proj = cv2.warpAffine(
-                    proj,
-                    M,
-                    (output_size, output_size),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-        except Exception:
-            # Fallback silencieux : on conserve la projection rapide sans correction.
-            pass
+    # Projeter les voxels (passer la forme du volume original pour le centrage)
+    coords = _project_voxel_indices_cone_beam(
+        indices, rotation, output_size, sid_mm, sod_mm, pix_mm,
+        vol_shape=vol.shape
+    )
 
-    return (proj > 0.3).astype(np.float32)
+    # Remplir le masque 2D en accumulant les hits des voxels
+    mask_2d = np.zeros((output_size, output_size), dtype=np.float32)
+    valid = ~np.isnan(coords).any(axis=1)
+
+    if np.any(valid):
+        coords_valid = coords[valid].astype(np.int32)
+        for i, (px, py) in enumerate(coords_valid):
+            # Clipper aux limites du masque
+            if 0 <= px < output_size and 0 <= py < output_size:
+                mask_2d[py, px] += 1.0
+
+    # Normaliser pour obtenir un masque binaire [0, 1]
+    if mask_2d.max() > 0:
+        mask_2d = np.clip(mask_2d / mask_2d.max(), 0.0, 1.0)
+
+    return mask_2d.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
