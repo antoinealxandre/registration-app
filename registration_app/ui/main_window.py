@@ -2919,7 +2919,7 @@ class MainWindow(QMainWindow):
 
     def _load_yolo_default(self):
         """Charge automatiquement le modèle YOLO par défaut s'il existe."""
-        default_path = 'data/model/best (2).pt'
+        default_path = 'data/model/best (3).pt'
         if os.path.exists(default_path):
             try:
                 yolo_load(default_path)
