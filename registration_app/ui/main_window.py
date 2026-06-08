@@ -514,18 +514,32 @@ class MainWindow(QMainWindow):
         stent_info.setObjectName('dim'); stent_info.setWordWrap(True)
         sec_stent.addWidget(stent_info)
 
+        lbl_sapien = QLabel('Edwards SAPIEN 3 Transcatheter Heart Valve')
+        lbl_sapien.setWordWrap(True)
+        sec_stent.addWidget(lbl_sapien)
+
+        self.cb_stent_preset = QComboBox()
+        self.cb_stent_preset.addItem('20 mm × 15.5 mm', (20.0, 15.5))
+        self.cb_stent_preset.addItem('23 mm × 18 mm',   (23.0, 18.0))
+        self.cb_stent_preset.addItem('26 mm × 20 mm',   (26.0, 20.0))
+        self.cb_stent_preset.addItem('29 mm × 22.5 mm', (29.0, 22.5))
+        self.cb_stent_preset.addItem('Custom', None)
+        self.cb_stent_preset.currentIndexChanged.connect(self._on_stent_preset_changed)
+        sec_stent.addWidget(self.cb_stent_preset)
+
         stent_params = QHBoxLayout(); stent_params.setSpacing(6)
         stent_params.addWidget(_lbl('Diam (mm)'), 0)
         self.sp_stent_D = QDoubleSpinBox(); self.sp_stent_D.setRange(3, 40)
-        self.sp_stent_D.setValue(20); self.sp_stent_D.setSingleStep(0.5)
+        self.sp_stent_D.setValue(20.0); self.sp_stent_D.setSingleStep(0.5)
         stent_params.addWidget(self.sp_stent_D, 0)
         stent_params.addWidget(_lbl('Long (mm)'), 0)
         self.sp_stent_L = QDoubleSpinBox(); self.sp_stent_L.setRange(5, 60)
-        self.sp_stent_L.setValue(15); self.sp_stent_L.setSingleStep(1)
+        self.sp_stent_L.setValue(15.5); self.sp_stent_L.setSingleStep(1)
         self.sp_stent_L.valueChanged.connect(lambda _v: self._ms_recompute())
         stent_params.addWidget(self.sp_stent_L, 0)
         stent_params.addStretch()
         sec_stent.addLayout(stent_params)
+        self._on_stent_preset_changed(0)
 
         stent_btns = QHBoxLayout(); stent_btns.setSpacing(6)
         self.btn_stent_gen = QPushButton('Generer stent')
@@ -595,7 +609,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_tavi)
 
         # ── DETECTION YOLO ────────────────────────────────────────────────────
-        sec_yolo = CollapsibleSection('DETECTION YOLO', starts_open=True)
+        sec_yolo = CollapsibleSection('DETECTION YOLO', starts_open=False)
 
         row_yolo_load = QHBoxLayout(); row_yolo_load.setSpacing(4)
         self.btn_load_yolo = QPushButton('Charger un autre modèle')
@@ -727,7 +741,7 @@ class MainWindow(QMainWindow):
 
 
         # ── RESULTATS ─────────────────────────────────────────────────────────
-        sec_res = CollapsibleSection('RESULTATS', starts_open=False)
+        sec_res = CollapsibleSection('RESULTATS', starts_open=True)
 
         metrics_row = QHBoxLayout(); metrics_row.setSpacing(10)
         m_iou = QWidget(); m_iou.setStyleSheet(f'background:{CARD_BG};border-radius:6px;border:1px solid {BORDER2};')
@@ -970,6 +984,15 @@ class MainWindow(QMainWindow):
         self.btn_reg.setEnabled(bool(has_fl and has_drr))
 
     # ── Stent placement ─────────────────────────────────────────────────────
+
+    def _on_stent_preset_changed(self, idx: int):
+        dims = self.cb_stent_preset.itemData(idx)
+        is_custom = dims is None
+        self.sp_stent_D.setEnabled(is_custom)
+        self.sp_stent_L.setEnabled(is_custom)
+        if not is_custom:
+            self.sp_stent_D.setValue(dims[0])
+            self.sp_stent_L.setValue(dims[1])
 
     def _set_stent_mode(self, active: bool, update_button: bool = True):
         self._stent_mode_active = active
