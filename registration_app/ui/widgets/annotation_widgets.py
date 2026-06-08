@@ -2787,7 +2787,7 @@ class FinalOverlayPanel(QWidget):
                 level = r.get('risk_level')
                 pm_rate = r.get('pm_dependency_rate')
             if delta is not None:
-                risk_text_lines.append(f'dMSID = {delta:+.2f} mm  (seuil {DELTA_MSID_THRESHOLD_MM:.1f})')
+                risk_text_lines.append(f'dMSID = {delta:+.2f} mm  (< {DELTA_MSID_THRESHOLD_MM:.1f} = HAUT)')
             else:
                 risk_text_lines.append('dMSID = --')
             if level == 'HIGH':

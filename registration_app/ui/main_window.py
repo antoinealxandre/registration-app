@@ -571,11 +571,19 @@ class MainWindow(QMainWindow):
         # ── TAVI RISK (MS length + ΔMSID + risque PM-dependency) ─────────────
         sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
         tavi_info = QLabel(
-            'Marquer manuellement les 4 reperes anatomiques sur le CT\n'
-            '(coupes Seg CT ou directement sur la vue 3D, touche P).\n'
-            'ID auto-calcule depuis la pose 3D du stent recale dans le CT.')
+            'Auto : les 2 hinges (ligne annulaire) sont deduits des nadirs\n'
+            'des cusps L1/L2/L3 segmentes. Reste a cliquer MS apex et NCC.')
         tavi_info.setObjectName('dim'); tavi_info.setWordWrap(True)
         sec_tavi.addWidget(tavi_info)
+
+        self.btn_auto_hinges = QPushButton('Auto-placer les hinges')
+        self.btn_auto_hinges.setObjectName('primary')
+        self.btn_auto_hinges.setToolTip(
+            'Detecte le nadir (point le plus ventriculaire) de chaque cusp segmente '
+            '(L1/L2/L3) et place hinge L / hinge R = les 2 nadirs les plus ecartes. '
+            'Necessite au moins 2 cusps/leaflets segmentes.')
+        self.btn_auto_hinges.clicked.connect(self._auto_place_hinges)
+        sec_tavi.addWidget(self.btn_auto_hinges)
 
         self.btn_ms_h1 = QPushButton('1. Hinge L (cusp gauche)'); self.btn_ms_h1.setCheckable(True)
         self.btn_ms_h2 = QPushButton('2. Hinge R (cusp droit)'); self.btn_ms_h2.setCheckable(True)
@@ -586,6 +594,7 @@ class MainWindow(QMainWindow):
                           (self.btn_ms_apex, 'ms'),
                           (self.btn_ncc, 'ncc')):
             btn.toggled.connect(lambda c, k=key: self._ms_arm(k if c else None))
+            btn.setToolTip(self._MS_HINT.get(key, ''))
             sec_tavi.addWidget(btn)
 
         self.btn_ms_reset = QPushButton('Reinitialiser les points')
@@ -1225,6 +1234,101 @@ class MainWindow(QMainWindow):
                 return world_from_voxel(centroid, self.ct_aff)
         return self._ct_center_world()
 
+    def _collect_cusp_masks(self):
+        """Masques individuels des cusps/leaflets (L1/L2/L3), root global exclu."""
+        if not self.seg_masks:
+            return {}
+        import re
+        l_token = re.compile(r'(?:^|[^a-z0-9])l[123](?:$|[^a-z0-9])')
+        kw = ('leaflet', 'cusp')
+        cusps = {}
+        for name, m in self.seg_masks.items():
+            n = str(name).lower()
+            if 'aortic_root' in n:           # le root global n'est pas un cusp isole
+                continue
+            hit = any(k in n for k in kw) or bool(l_token.search(n))
+            if hit and getattr(m, 'ndim', 0) == 3 and (m > 0).any():
+                cusps[name] = (m > 0)
+        return cusps
+
+    def _aortic_axis_world(self, world_cloud):
+        """Axe aortique unitaire (normale au plan annulaire), oriente cranialement.
+
+        = plus petite composante PCA du nuage de cusps (les cusps s'etalent dans
+        le plan annulaire et sont minces le long de l'axe). Oriente vers l'aorte
+        (craniale) si disponible, sinon vers +z monde.
+        """
+        centroid = world_cloud.mean(axis=0)
+        cov = np.cov((world_cloud - centroid).T)
+        _, eigvec = np.linalg.eigh(cov)      # colonnes triees par valeur propre croissante
+        u = eigvec[:, 0]                     # plus petite variance = normale annulaire
+        cranial_ref = None
+        if self.ct_aff is not None:
+            for name, m in self.seg_masks.items():
+                n = str(name).lower()
+                if ('aorta' in n and 'pulmonary' not in n
+                        and getattr(m, 'ndim', 0) == 3 and (m > 0).any()):
+                    a_idx = np.argwhere(m > 0).astype(np.float64)
+                    a_world = (np.asarray(self.ct_aff) @ np.column_stack(
+                        [a_idx, np.ones(len(a_idx))]).T).T[:, :3]
+                    cranial_ref = a_world.mean(axis=0) - centroid
+                    break
+        if cranial_ref is None:
+            cranial_ref = np.array([0.0, 0.0, 1.0])   # +z monde ~ cranial
+        if np.dot(u, cranial_ref) < 0:
+            u = -u
+        n = float(np.linalg.norm(u))
+        return u / n if n > 1e-9 else u
+
+    def _auto_place_hinges(self):
+        """Place hinge1/hinge2 = nadirs des 2 cusps les plus ecartes (ligne annulaire)."""
+        if self.ct_aff is None:
+            self._err('Charger un CT + segmentation avant l\'auto-placement.')
+            return
+        cusps = self._collect_cusp_masks()
+        if len(cusps) < 2:
+            self._err('Auto-hinges : au moins 2 cusps/leaflets segmentes (L1/L2/L3) requis.')
+            return
+
+        aff = np.asarray(self.ct_aff)
+
+        def to_world(vox_idx):
+            v = np.column_stack([vox_idx, np.ones(len(vox_idx))])
+            return (aff @ v.T).T[:, :3]
+
+        # Nuage combine (sous-echantillonne) pour l'axe aortique
+        all_idx = np.vstack([np.argwhere(mk) for mk in cusps.values()]).astype(np.float64)
+        if len(all_idx) > 20000:
+            sel = np.random.default_rng(0).choice(len(all_idx), 20000, replace=False)
+            all_idx = all_idx[sel]
+        u = self._aortic_axis_world(to_world(all_idx))
+
+        # Nadir de chaque cusp = voxel le plus caudal (projection minimale sur u)
+        nadirs = {}
+        for name, mk in cusps.items():
+            idx = np.argwhere(mk).astype(np.float64)
+            w = to_world(idx)
+            nadirs[name] = w[int(np.argmin(w @ u))]
+
+        # Paire de nadirs la plus ecartee = corde annulaire la plus large
+        names = list(nadirs)
+        best, best_d = None, -1.0
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                d = float(np.linalg.norm(nadirs[names[i]] - nadirs[names[j]]))
+                if d > best_d:
+                    best_d, best = d, (names[i], names[j])
+        na, nb = nadirs[best[0]], nadirs[best[1]]
+        # Etiquetage L/R : x monde croissant = colonne des vues coronales
+        if na[0] > nb[0]:
+            na, nb = nb, na
+        self._set_ms_point('hinge1', na)
+        self._set_ms_point('hinge2', nb)
+        self.tabs.setCurrentWidget(self.seg_review_panel)
+        self._status(
+            f'Hinges auto-places (cusps {best[0]} / {best[1]}, ecart {best_d:.1f} mm). '
+            f'Cliquez maintenant MS apex puis NCC pour completer le score.')
+
     def _stent_pix_mm(self):
         """Retourne le mm/pixel calibre sur le stent affiche (source de verite metrique).
 
@@ -1302,7 +1406,12 @@ class MainWindow(QMainWindow):
         d1 = math.hypot(e1[0] - ncc_fl[0], e1[1] - ncc_fl[1])
         d2 = math.hypot(e2[0] - ncc_fl[0], e2[1] - ncc_fl[1])
         bot = e1 if d1 < d2 else e2
-        return math.hypot(bot[0] - ncc_fl[0], bot[1] - ncc_fl[1]) * pix_mm
+        # ID = profondeur le long de l'axe du stent (composante axiale), et non la
+        # distance brute 2D : un NCC decale lateralement ne gonfle plus la mesure.
+        ang = math.radians(self._stent_axis_deg)
+        ax_x, ax_y = math.cos(ang), -math.sin(ang)   # meme convention que les endpoints
+        depth_px = abs((ncc_fl[0] - bot[0]) * ax_x + (ncc_fl[1] - bot[1]) * ax_y)
+        return depth_px * pix_mm
 
     def _ms_recompute(self):
         if not hasattr(self, 'lbl_ms_value'):

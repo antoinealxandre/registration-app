@@ -3,8 +3,8 @@
 Référence clinique : Nai Fovino et al., "Anatomical Predictors of Pacemaker
 Dependency After TAVR", Circ Arrhythm Electrophysiol. 2021;14:e009028.
 
-Le risque dépend principalement de ΔMSID = ID − MS_length (cut-off 3 mm,
-OR 7.58, sensibilité 84 %, spécificité 69 %).
+Le risque dépend principalement de ΔMSID = MS_length − ID (cut-off 3 mm,
+OR 7.58, sensibilité 84 %, spécificité 69 %). ΔMSID < 3 mm ⇒ risque ÉLEVÉ.
 
 REPÈRES ANATOMIQUES (Landmarks) :
 ═════════════════════════════════════════════════════════════════════════════
@@ -59,8 +59,8 @@ import numpy as np
 
 
 DELTA_MSID_THRESHOLD_MM = 3.0
-PM_DEPENDENCY_LOW = 0.027   # ΔMSID < 3 mm
-PM_DEPENDENCY_HIGH = 0.70   # ΔMSID ≥ 3 mm
+PM_DEPENDENCY_HIGH = 0.70   # ΔMSID < 3 mm  → implant bas vs septum membraneux
+PM_DEPENDENCY_LOW = 0.027   # ΔMSID ≥ 3 mm  → implant haut, marge suffisante
 
 
 def inverse_register_point_2d(point_xy, reg_result):
@@ -370,17 +370,21 @@ def risk_assessment(ms_length_mm, implantation_depth_mm=None):
     }
     if implantation_depth_mm is None:
         return out
-    d = float(implantation_depth_mm) - float(ms_length_mm)
+    # ΔMSID = MS_length − ID  (convention Nai Fovino 2021).
+    # ΔMSID PETIT (implant descend au niveau/sous le septum membraneux) =>
+    #   conduction auriculo-ventriculaire comprimee => risque ELEVE.
+    # ΔMSID GRAND (implant haut, marge sous le MS) => risque FAIBLE.
+    d = float(ms_length_mm) - float(implantation_depth_mm)
     out['implantation_depth_mm'] = round(float(implantation_depth_mm), 2)
     out['delta_msid_mm'] = round(d, 2)
-    if d >= DELTA_MSID_THRESHOLD_MM:
+    if d < DELTA_MSID_THRESHOLD_MM:
         out['risk_level'] = 'HIGH'
         out['pm_dependency_rate'] = PM_DEPENDENCY_HIGH
-        out['reason'] = (f'DeltaMSID = {d:.1f} mm >= {DELTA_MSID_THRESHOLD_MM:g} mm : '
+        out['reason'] = (f'DeltaMSID = {d:.1f} mm < {DELTA_MSID_THRESHOLD_MM:g} mm : '
                          f'OR 7.58, ~{PM_DEPENDENCY_HIGH:.0%} de PM dependency.')
     else:
         out['risk_level'] = 'LOW'
         out['pm_dependency_rate'] = PM_DEPENDENCY_LOW
-        out['reason'] = (f'DeltaMSID = {d:.1f} mm < {DELTA_MSID_THRESHOLD_MM:g} mm : '
+        out['reason'] = (f'DeltaMSID = {d:.1f} mm >= {DELTA_MSID_THRESHOLD_MM:g} mm : '
                          f'risque faible (~{PM_DEPENDENCY_LOW:.1%}).')
     return out
