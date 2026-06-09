@@ -79,6 +79,7 @@ from ui.theme import (
     DEFAULT_FOV_MM,
     AUTO_PIPELINE_FOV_MM,
     STRUCT,
+    color_for_structure,
     BORDER,
     BORDER2,
     ACCENT,
@@ -572,7 +573,8 @@ class MainWindow(QMainWindow):
         sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
         tavi_info = QLabel(
             'Auto : les 2 hinges (ligne annulaire) sont deduits des nadirs\n'
-            'des cusps L1/L2/L3 segmentes. Reste a cliquer MS apex et NCC.')
+            'des cusps L1/L2/L3 segmentes. Reste a cliquer le MS apex.\n'
+            'ID = distance ligne annulaire -> base du stent (pas de NCC).')
         tavi_info.setObjectName('dim'); tavi_info.setWordWrap(True)
         sec_tavi.addWidget(tavi_info)
 
@@ -588,11 +590,9 @@ class MainWindow(QMainWindow):
         self.btn_ms_h1 = QPushButton('1. Hinge L (cusp gauche)'); self.btn_ms_h1.setCheckable(True)
         self.btn_ms_h2 = QPushButton('2. Hinge R (cusp droit)'); self.btn_ms_h2.setCheckable(True)
         self.btn_ms_apex = QPushButton('3. MS apex (septum)'); self.btn_ms_apex.setCheckable(True)
-        self.btn_ncc = QPushButton('4. NCC (cusp non-coronaire)'); self.btn_ncc.setCheckable(True)
         for btn, key in ((self.btn_ms_h1, 'hinge1'),
                           (self.btn_ms_h2, 'hinge2'),
-                          (self.btn_ms_apex, 'ms'),
-                          (self.btn_ncc, 'ncc')):
+                          (self.btn_ms_apex, 'ms')):
             btn.toggled.connect(lambda c, k=key: self._ms_arm(k if c else None))
             btn.setToolTip(self._MS_HINT.get(key, ''))
             sec_tavi.addWidget(btn)
@@ -1130,23 +1130,21 @@ class MainWindow(QMainWindow):
 
     # ── TAVI risk (MS length + ΔMSID + risque PM-dependency) ────────────────
 
-    _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex', 'btn_ncc')
-    _MS_ORDER = ('hinge1', 'hinge2', 'ms', 'ncc')
+    _MS_BUTTONS = ('btn_ms_h1', 'btn_ms_h2', 'btn_ms_apex')
+    _MS_ORDER = ('hinge1', 'hinge2', 'ms')
     _MS_HINT = {
         'hinge1': 'Hinge L (cusp gauche) — base de la valve aortique côté gauche. Repérez sur coupe coronale (axe vertical) : c\'est la jonction valve-paroi ventriculaire. Cliquez pour marquer.',
-        'hinge2': 'Hinge R (cusp droit) — base de la valve aortique côté droit. Même coupe coronale que Hinge L. Complète la ligne annulaire qui servira de référence pour MS.',
+        'hinge2': 'Hinge R (cusp droit) — base de la valve aortique côté droit. Même coupe coronale que Hinge L. Complète la ligne annulaire (plan de référence pour MS et ID).',
         'ms':     'MS (Membranous Septum) — apex/pointe du septum membraneux à la base du cusp non-coronaire. C\'est le début du septum musculaire. Marque le haut du risque de conduction cardiaque.',
-        'ncc':    'NCC (Non-Coronary Cusp) — base/jonction inférieure du cusp non-coronaire. Référence pour mesurer l\'implantation profonde (ID = distance stent-NCC). Repérez sous la ligne hinge-hinge.',
     }
     _MS_MARKER = {
         'hinge1': ((100, 200, 255), 'Hinge L'),
         'hinge2': ((255, 200, 100), 'Hinge R'),
         'ms':     ((255, 100, 100), 'MS'),
-        'ncc':    ((180, 120, 255), 'NCC'),
     }
 
     def _ms_arm(self, key):
-        """Arme le prochain clic sur la coupe pour ``key`` (hinge1/hinge2/ms/ncc)."""
+        """Arme le prochain clic sur la coupe pour ``key`` (hinge1/hinge2/ms)."""
         for name, k in zip(self._MS_BUTTONS, self._MS_ORDER):
             btn = getattr(self, name)
             btn.blockSignals(True)
@@ -1327,7 +1325,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.seg_review_panel)
         self._status(
             f'Hinges auto-places (cusps {best[0]} / {best[1]}, ecart {best_d:.1f} mm). '
-            f'Cliquez maintenant MS apex puis NCC pour completer le score.')
+            f'Cliquez maintenant MS apex pour completer le score.')
 
     def _stent_pix_mm(self):
         """Retourne le mm/pixel calibre sur le stent affiche (source de verite metrique).
@@ -1386,32 +1384,56 @@ class MainWindow(QMainWindow):
             registration_result=reg,
         )
 
-    def _compute_id_mm(self):
-        """ID = distance 2D fluoroscopie (mm) entre bas du stent et NCC projete depuis CT.
+    @staticmethod
+    def _id_depth_px(stent_ends, h1, h2, ms_fl=None):
+        """Profondeur (px) de la base du stent sous la ligne annulaire h1-h2.
 
-        Convention clinique de l'article (Nai Fovino 2021) : mesure 2D sur
-        l'angiogramme. NCC marque sur le CT puis projete sur la fluoro via la
-        camera DRR + le recalage 2D/3D.
+        = distance perpendiculaire signee de l'extremite ventriculaire du stent
+        a la ligne annulaire. Le cote ventriculaire est determine par le MS si
+        fourni (le septum membraneux descend du cote ventricule) ; sinon on prend
+        la plus grande distance perpendiculaire absolue.
         """
-        if 'ncc' not in self._ms_world:
+        h1 = np.asarray(h1, dtype=np.float64); h2 = np.asarray(h2, dtype=np.float64)
+        u = h2 - h1
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:
+            return None
+        u = u / nu
+        n = np.array([-u[1], u[0]])                 # normale a la ligne annulaire
+        e1 = np.asarray(stent_ends[0], dtype=np.float64)
+        e2 = np.asarray(stent_ends[1], dtype=np.float64)
+        if ms_fl is not None:
+            mid = 0.5 * (h1 + h2)
+            if float(np.dot(np.asarray(ms_fl, dtype=np.float64) - mid, n)) < 0:
+                n = -n                              # n pointe vers le ventricule
+            d1 = float(np.dot(e1 - h1, n)); d2 = float(np.dot(e2 - h1, n))
+            return max(0.0, d1, d2)                 # base = extremite la plus ventriculaire
+        d1 = abs(float(np.dot(e1 - h1, n))); d2 = abs(float(np.dot(e2 - h1, n)))
+        return max(d1, d2)
+
+    def _compute_id_mm(self):
+        """ID = profondeur d'implantation (mm) = distance du plan annulaire
+        (ligne hinge1-hinge2) a la base ventriculaire du stent, mesuree
+        perpendiculairement a la ligne annulaire, sur la fluoroscopie.
+
+        Le NCC n'est plus requis : la ligne hinge-hinge EST le plan de reference
+        de l'article (Nai Fovino 2021). Les hinges CT sont projetes sur la fluoro
+        via la camera DRR + recalage, comme les meshes.
+        """
+        if not all(k in self._ms_world for k in ('hinge1', 'hinge2')):
             return None
         ends = self._stent_endpoints_fluoro()
         if ends is None:
             return None
-        ncc_fl = self._project_world_to_fluoro(self._ms_world['ncc'])
-        if ncc_fl is None:
+        h1 = self._project_world_to_fluoro(self._ms_world['hinge1'])
+        h2 = self._project_world_to_fluoro(self._ms_world['hinge2'])
+        if h1 is None or h2 is None:
             return None
-        pix_mm = self._stent_pix_mm()
-        e1, e2 = ends
-        d1 = math.hypot(e1[0] - ncc_fl[0], e1[1] - ncc_fl[1])
-        d2 = math.hypot(e2[0] - ncc_fl[0], e2[1] - ncc_fl[1])
-        bot = e1 if d1 < d2 else e2
-        # ID = profondeur le long de l'axe du stent (composante axiale), et non la
-        # distance brute 2D : un NCC decale lateralement ne gonfle plus la mesure.
-        ang = math.radians(self._stent_axis_deg)
-        ax_x, ax_y = math.cos(ang), -math.sin(ang)   # meme convention que les endpoints
-        depth_px = abs((ncc_fl[0] - bot[0]) * ax_x + (ncc_fl[1] - bot[1]) * ax_y)
-        return depth_px * pix_mm
+        ms_fl = self._project_world_to_fluoro(self._ms_world['ms']) if 'ms' in self._ms_world else None
+        id_px = self._id_depth_px(ends, h1, h2, ms_fl)
+        if id_px is None:
+            return None
+        return id_px * self._stent_pix_mm()
 
     def _ms_recompute(self):
         if not hasattr(self, 'lbl_ms_value'):
@@ -2234,13 +2256,7 @@ class MainWindow(QMainWindow):
             mesh = pv.PolyData(verts.astype(np.float32), faces_vtk)
             mesh = mesh.clean(tolerance=0.0)
 
-            if name in STRUCT:
-                rgb = STRUCT[name]['rgb']
-            else:
-                # Couleur deterministe pour les labels hors STRUCT
-                h = abs(hash(name))
-                rgb = (80 + (h % 150), 80 + ((h // 3) % 150), 80 + ((h // 7) % 150))
-
+            rgb = color_for_structure(name)
             color = tuple(c / 255.0 for c in rgb)
             plotter.add_mesh(mesh, color=color, opacity=0.45, name=f'{name}_{idx}')
             added += 1
@@ -2271,7 +2287,7 @@ class MainWindow(QMainWindow):
             """Redessine markers, ligne annulaire, segments MS/ID et labels dans le plotter ouvert."""
             present = set()
             marker_pts = {}
-            for name in ('hinge1', 'hinge2', 'ms', 'ncc'):
+            for name in ('hinge1', 'hinge2', 'ms'):
                 world = self._ms_world.get(name)
                 if world is None:
                     continue
@@ -2313,7 +2329,7 @@ class MainWindow(QMainWindow):
             # Voir l'onglet Overlay -> Vue 3D pour la visualisation du stent + ID.
 
             # Retirer les acteurs orphelins (point supprime via reset)
-            for nm in ('hinge1', 'hinge2', 'ms', 'ncc'):
+            for nm in ('hinge1', 'hinge2', 'ms'):
                 for suf in ('_marker', '_label'):
                     actor = f'{nm}{suf}'
                     if actor not in present:

@@ -1804,47 +1804,14 @@ class ResultPanel(QWidget):
 # Panneau final : Fluoroscopie + Segmentations 3D projetées et recalées
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Palette médicale par nom de structure
-_MEDICAL_COLORS = {
-    'myocardium':               (206, 110,  84),
-    'left atrium':              (203, 108,  81),
-    'left ventricle':           (152,  55,  13),
-    'left ventricle of heart':  (152,  55,  13),
-    'right atrium':             (210, 115,  89),
-    'right ventricle':          (181,  85,  57),
-    'right ventricle of heart': (181,  85,  57),
-    'aorta':                    (224,  97,  76),
-    'pulmonary artery':         (  0, 122, 171),
-    'pulmonary venous system':  (186,  77,  64),
-    'atrial_appendage_left':    (142, 192,  72),
-    'left atrial appendage':    (142, 192,  72),
-    'superior_vena_cava':       (115, 176, 130),
-    'superior vena cava':       (115, 176, 130),
-    'inferior vena cava':       (  0, 151, 206),
-    'heart':                    (206, 110,  84),
-    'spleen':                   (157, 108, 162),
-    'liver':                    (221, 130, 101),
-    'stomach':                  (216, 132, 105),
-    'esophagus':                (211, 171, 143),
-    'trachea':                  (182, 228, 255),
-    'portal/splenic vein':      (  0, 151, 206),
-}
+def _color_for_structure(name: str, index: int = 0) -> tuple:
+    """Couleur (R,G,B) stable d'une structure — delegue a theme.color_for_structure.
 
-_VERTEBRA_COLOR = (226, 202, 134)   # Jaune os pour les vertèbres
-
-
-def _color_for_structure(name: str, index: int) -> tuple:
-    """Retourne (R,G,B) pour une structure anatomique."""
-    key = name.lower().strip()
-    if key in _MEDICAL_COLORS:
-        return _MEDICAL_COLORS[key]
-    # Vertèbres : T6, T7, L1 … pattern
-    if 'vertebra' in key or 'vertebr' in key:
-        return _VERTEBRA_COLOR
-    # Poumons
-    if 'lung' in key:
-        return (172, 138, 115)
-    return _SEG_PALETTE[index % len(_SEG_PALETTE)]
+    L'argument ``index`` n'est conserve que pour compatibilite d'appel ; la
+    couleur ne depend que du NOM, pour rester identique dans toutes les vues.
+    """
+    from ui.theme import color_for_structure
+    return color_for_structure(name)
 
 
 class FinalOverlayPanel(QWidget):
@@ -1882,7 +1849,7 @@ class FinalOverlayPanel(QWidget):
         # Données TAVI optionnelles affichées dans la vue 3D post-recalage
         self._tavi_stent_pose = None        # dict {center_px, axis_deg, length_mm, diameter_mm, pix_mm}
         self._tavi_ms_world = {}
-        self._tavi_ref_voxel = {}           # {'hinge1','hinge2','ms','ncc'} -> (vx, vy, vz) en coords voxel CT
+        self._tavi_ref_voxel = {}           # {'hinge1','hinge2','ms'} -> (vx, vy, vz) en coords voxel CT
         self._tavi_ct_shape = None          # forme du volume CT (nx, ny, nz) pour la projection
         self._tavi_id_mm = None
         self._tavi_ms_length = None
@@ -2075,8 +2042,9 @@ class FinalOverlayPanel(QWidget):
                        MEME pipeline que les meshes de segmentation pour s'aligner
                        parfaitement avec elles dans l'overlay 3D.
         ct_shape     : forme (nx, ny, nz) du volume CT, utile pour la projection.
-        id_mm        : valeur affichee si NCC + stent valides.
-        ms_length_mm : valeur affichee si 3 reperes annulaires valides.
+        id_mm        : ID initial (distance ligne annulaire -> base du stent) ;
+                       recalcule en live quand on bouge la profondeur en 3D.
+        ms_length_mm : valeur affichee si hinge1/hinge2/MS valides.
         """
         self._tavi_stent_pose = stent_fluoro
         self._tavi_ms_world = dict(ms_world or {})
@@ -2266,7 +2234,10 @@ class FinalOverlayPanel(QWidget):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (r, g, b), 1, cv2.LINE_AA)
                 rgb = rgb_u8.astype(np.float32)
 
-        self._full_image = np.clip(rgb, 0, 255).astype(np.uint8)
+        rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+        # Geometrie TAVI (ligne annulaire, MS, base stent, ID) reportee en 2D.
+        self._draw_tavi_2d(rgb_u8, S)
+        self._full_image = rgb_u8
 
         # Zoom et pan
         h, w = self._full_image.shape[:2]
@@ -2288,6 +2259,92 @@ class FinalOverlayPanel(QWidget):
         h2, w2 = display.shape[:2]
         qi = QImage(display.data, w2, h2, w2 * 3, QImage.Format_RGB888)
         self._lbl_img.setPixmap(QPixmap.fromImage(qi).copy())
+
+    def _put_label_2d(self, img, text, pos, color):
+        """Petit label avec contour noir, taille fixe, a la position (px) donnee."""
+        x = int(round(pos[0])); y = int(round(pos[1]))
+        H, W = img.shape[:2]
+        x = max(2, min(W - 80, x)); y = max(12, min(H - 4, y))
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    def _draw_tavi_2d(self, img, side):
+        """Reporte la geometrie de la metrique MSID sur l'overlay 2D.
+
+        Ligne annulaire (hinge1-hinge2), cote MS perpendiculaire, extremites du
+        stent (points), base ventriculaire et cote ID perpendiculaire a la ligne
+        annulaire — avec fleches, segments, points et labels en mm. Cela rend la
+        geometrie du calcul verifiable a l'oeil, exactement comme en 3D.
+        """
+        refs = self._tavi_ref_voxel
+        if not refs or self._tavi_ct_shape is None:
+            return
+        H, W = img.shape[:2]
+
+        def ipt(p):
+            return (int(round(float(p[0]))), int(round(float(p[1]))))
+
+        def ok(p):
+            return -4 * side < p[0] < 4 * side and -4 * side < p[1] < 4 * side
+
+        proj = {}
+        for k in ('hinge1', 'hinge2', 'ms'):
+            if k in refs:
+                pp = self._project_voxel_to_view(refs[k], self._tavi_ct_shape, side)
+                if pp is not None and ok(pp):
+                    proj[k] = np.array([pp[0], pp[1]], dtype=np.float64)
+
+        h1 = proj.get('hinge1'); h2 = proj.get('hinge2'); ms = proj.get('ms')
+        pix_mm = self._tavi_pix_mm()
+
+        if h1 is not None and h2 is not None:
+            cv2.line(img, ipt(h1), ipt(h2), (90, 220, 240), 2, cv2.LINE_AA)
+            u = h2 - h1
+            nu = float(np.linalg.norm(u))
+            if nu > 1e-6:
+                u = u / nu
+                n = np.array([-u[1], u[0]])
+                # ── MS : perpendiculaire annulus -> MS (valeur = px projetes * pix_mm) ──
+                if ms is not None:
+                    foot = h1 + np.dot(ms - h1, u) * u
+                    if ok(foot):
+                        cv2.arrowedLine(img, ipt(foot), ipt(ms), (255, 90, 90), 2,
+                                        cv2.LINE_AA, tipLength=0.22)
+                        ms_mm = (float(np.linalg.norm(ms - foot)) * pix_mm) if pix_mm else self._tavi_ms_length
+                        if ms_mm is not None:
+                            self._put_label_2d(img, f'MS={ms_mm:.1f}mm',
+                                               0.5 * (foot + ms) + np.array([6, -6]), (255, 120, 120))
+                    if np.dot(ms - 0.5 * (h1 + h2), n) < 0:
+                        n = -n   # n pointe vers le ventricule (cote MS)
+                # ── Stent : extremites + base ventriculaire + cote ID ──
+                sp = self._tavi_stent_pose
+                if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
+                    import math as _m
+                    cx, cy = sp['center_px']
+                    halfpx = float(sp['length_mm']) * 0.5 / max(float(sp['pix_mm']), 1e-6)
+                    a = _m.radians(float(sp['axis_deg']))
+                    e1 = np.array([cx + _m.cos(a) * halfpx, cy - _m.sin(a) * halfpx])
+                    e2 = np.array([cx - _m.cos(a) * halfpx, cy + _m.sin(a) * halfpx])
+                    for e in (e1, e2):
+                        if ok(e):
+                            cv2.circle(img, ipt(e), 4, (250, 210, 60), -1, cv2.LINE_AA)
+                    d1 = float(np.dot(e1 - h1, n)); d2 = float(np.dot(e2 - h1, n))
+                    base = e1 if d1 >= d2 else e2
+                    foot_id = h1 + np.dot(base - h1, u) * u
+                    if ok(base) and ok(foot_id):
+                        cv2.arrowedLine(img, ipt(foot_id), ipt(base), (255, 160, 50), 2,
+                                        cv2.LINE_AA, tipLength=0.22)
+                        id_mm = (float(np.linalg.norm(base - foot_id)) * pix_mm) if pix_mm else self._tavi_id_mm
+                        if id_mm is not None:
+                            self._put_label_2d(img, f'ID={id_mm:.1f}mm',
+                                               0.5 * (foot_id + base) + np.array([6, 6]), (255, 180, 90))
+
+        # Points de repere par-dessus
+        for k, c in (('hinge1', (120, 210, 255)), ('hinge2', (255, 210, 120)),
+                     ('ms', (255, 110, 110))):
+            if k in proj and ok(proj[k]):
+                cv2.circle(img, ipt(proj[k]), 6, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(img, ipt(proj[k]), 4, c, -1, cv2.LINE_AA)
 
     def _export(self):
         if self._full_image is None: return
@@ -2390,48 +2447,46 @@ class FinalOverlayPanel(QWidget):
             return None
 
         vol = (mask_3d > 0).astype(np.float32)
-        if vol.sum() == 0:
-            return None
-
-        # Adaptive downsample for interactive meshing on large volumes.
-        stride = 1
-        while (max(vol.shape) / stride) > 220:
-            stride *= 2
-        if stride > 1:
-            vol = vol[::stride, ::stride, ::stride]
-
-        # Important: do not reapply C-arm angles on the 3D mesh here.
-        # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
-        # Reapplying those angles in this step causes an apparent double obliquity
-        # in the final 3D registered overlay.
-
         if vol.sum() < 8:
             return None
 
         from skimage import measure
 
+        # Maillage PLEINE RESOLUTION, comme la vue Seg CT 3D (qui est nette) :
+        # on ne sous-echantillonne le masque que pour les volumes enormes.
+        # NB : surtout PAS de smooth_taubin(normalize_coordinates=True) ici : la
+        # normalisation en cube unite ecrase l'axe de profondeur (mince) et
+        # APLATIT les structures. Marching cubes step_size=1 pleine resolution suffit.
+        if vol.size > 180_000_000:
+            vol = vol[::2, ::2, ::2]
         try:
             verts, faces, _, _ = measure.marching_cubes(
-                vol,
-                level=0.5,
-                step_size=1,
-                allow_degenerate=False,
-            )
+                vol, level=0.5, step_size=1, allow_degenerate=False)
         except Exception:
             return None
-
         if verts.shape[0] < 3 or faces.shape[0] == 0:
             return None
 
+        # Important: do not reapply C-arm angles on the 3D mesh here.
+        # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
+
+        faces_vtk = np.hstack([
+            np.full((faces.shape[0], 1), 3, dtype=np.int64),
+            faces.astype(np.int64),
+        ]).ravel()
+        mesh = pv.PolyData(verts.astype(np.float32), faces_vtk).clean(tolerance=0.0)
+
+        if mesh.n_points < 3:
+            return None
+
+        # Projection des sommets (meme convention que project_mask_3d).
+        v = np.asarray(mesh.points, dtype=np.float64)
         nx, ny, nz = vol.shape
         reg_size = float(self._reg_size)
 
-        # Projection to DRR in-plane coordinates (same convention as project_mask_3d).
-        x_plane = verts[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
-        y_plane = verts[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
-
-        # Match DRR projection convention (cran UI offset includes +180 in PA mode):
-        # this corresponds to a superior/inferior flip in 2D image coordinates.
+        x_plane = v[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
+        y_plane = v[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
+        # Convention DRR (offset cran +180 en PA) = flip superieur/inferieur.
         y_plane = (reg_size - 1.0) - y_plane
 
         fov_scale = self._fov_scale_for_mask(mask_3d)
@@ -2442,45 +2497,49 @@ class FinalOverlayPanel(QWidget):
 
         pts_plane = np.column_stack([x_plane, y_plane]).astype(np.float32)
         pts_plane = self._apply_registration_to_points(pts_plane)
-
-        # Overlay panel displays on fluoroscopy native size.
         if side != self._reg_size:
-            sf = float(side) / float(self._reg_size)
-            pts_plane *= sf
+            pts_plane *= float(side) / float(self._reg_size)
 
-        # Use AP axis (axis 1) as real depth axis.
-        vy = 1.0
+        # ── Profondeur (axe AP = axis 1) ──────────────────────────────────────
+        # CRUCIAL pour ne PAS aplatir : la profondeur doit avoir EXACTEMENT le
+        # meme facteur "monde par millimetre" que le plan. Le plan subit
+        # (reg_size/nx) * fov_scale * scale_recalage * (side/reg_size) ; si la
+        # profondeur n'utilise que side/nx (ancien code) elle rate scale et
+        # fov_scale (souvent >1) -> structure en crepe. On reconstruit le facteur
+        # in-plane par mm, puis on l'applique a la profondeur physique en mm.
+        vx = vy = 1.0
         if self._ct_affine is not None:
             try:
-                vy = float(abs(self._ct_affine[1, 1])) * float(stride)
+                vx = float(abs(self._ct_affine[0, 0])) or 1.0
+                vy = float(abs(self._ct_affine[1, 1])) or 1.0
             except Exception:
-                vy = 1.0
-        depth = (verts[:, 1] - ((ny - 1.0) * 0.5)) * vy
-        
-        # Determine exact XYZ scaling to prevent flattening the 3D model
-        # The 2D projection scaled X by (side / nx), we match that depth-wise
-        depth_scale = float(side) / max(nx, 1) if nx > 0 else 1.0
-        z_world = 10.0 + depth * depth_scale
+                vx = vy = 1.0
+        scale_reg = 1.0
+        if self._result is not None:
+            try:
+                scale_reg = float(self._result.get('scale', 1.0)) or 1.0
+            except Exception:
+                scale_reg = 1.0
+        # Unites monde par voxel le long de l'axe 0 in-plane (jusqu'a l'espace side) :
+        f_vox0 = (((reg_size - 1.0) / max(nx - 1, 1)) * fov_scale
+                  * scale_reg * (float(side) / reg_size))
+        # Unites monde par mm in-plane, puis profondeur physique (mm) -> monde.
+        world_per_mm = f_vox0 / max(vx, 1e-6)
+        depth_mm = (v[:, 1] - ((ny - 1.0) * 0.5)) * vy
+        z_world = 10.0 + depth_mm * world_per_mm
 
-        points_world = np.column_stack([
+        mesh.points = np.column_stack([
             pts_plane[:, 0],
             (side - 1.0) - pts_plane[:, 1],
             z_world,
         ]).astype(np.float32)
 
-        faces_vtk = np.hstack([
-            np.full((faces.shape[0], 1), 3, dtype=np.int64),
-            faces.astype(np.int64),
-        ]).ravel()
-        mesh = pv.PolyData(points_world, faces_vtk)
         mesh = mesh.clean(tolerance=0.0)
-
-        if mesh.n_points > 250000:
+        if mesh.n_points > 300000:
             try:
-                mesh = mesh.decimate_pro(0.65, preserve_topology=True)
+                mesh = mesh.decimate_pro(0.6, preserve_topology=True)
             except Exception:
                 pass
-
         return mesh
 
     def _open_3d_view(self):
@@ -2586,43 +2645,8 @@ class FinalOverlayPanel(QWidget):
             )
             return
 
-        # ── Stent recale (fils tresses 3D dans le plan fluoroscopie) ────────
-        # center_px et pix_mm sont DEJA en coords canvas fluoro (= ``side``).
-        # Ne pas appliquer de facteur side/reg_size : ce facteur n'est valable
-        # que pour les maillages anatomiques projetes initialement au reg_size.
-        stent_added = False
-        sp = self._tavi_stent_pose
-        if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
-            import math as _math
-            try:
-                from core.stent_model import braided_stent_world
-                cx, cy = sp['center_px']
-                pix_mm = float(sp['pix_mm'])
-                length_px = float(sp['length_mm']) / pix_mm
-                diameter_px = float(sp['diameter_mm']) / pix_mm
-                ang = _math.radians(float(sp['axis_deg']))
-                # Y est inverse (cranien en haut) ; Z = profondeur fictive du plan
-                axis_world = np.array([_math.cos(ang), _math.sin(ang), 0.0], dtype=np.float64)
-                center_world = np.array([float(cx), float((side - 1.0) - cy), 8.0], dtype=np.float64)
-                verts_w, faces = braided_stent_world(
-                    diameter_mm=float(diameter_px),
-                    length_mm=float(length_px),
-                    center_world=center_world,
-                    axis_world=axis_world,
-                    n_wires=24, braid_angle_deg=45.0,
-                    wire_radius_mm=max(0.5, 0.18 / max(pix_mm, 1e-6)),
-                    n_pts=110, tube_sides=5,
-                )
-                faces_pv = np.hstack([
-                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
-                    faces.astype(np.int64),
-                ]).ravel()
-                stent_pv = pv.PolyData(verts_w.astype(np.float32), faces_pv)
-                plotter.add_mesh(stent_pv, color=(0.98, 0.85, 0.25), opacity=0.92,
-                                  smooth_shading=True, name='stent_recale')
-                stent_added = True
-            except Exception:
-                pass
+        # NB : le stent (et la mesure ID) est rendu APRES les reperes, car il a
+        # besoin de ref_3d (hinges + MS) pour orienter la profondeur et l'ID.
 
         # ── Reperes voxel CT projetes dans le plan fluoro via le pipeline des meshes ──
         # On utilise EXACTEMENT la meme chaine de projection que les segmentations
@@ -2634,10 +2658,8 @@ class FinalOverlayPanel(QWidget):
                 'hinge1': (100/255, 200/255, 255/255),
                 'hinge2': (255/255, 200/255, 100/255),
                 'ms':     (255/255, 100/255, 100/255),
-                'ncc':    (180/255, 120/255, 255/255),
             }
-            ref_labels = {'hinge1': 'Hinge L', 'hinge2': 'Hinge R',
-                          'ms': 'MS', 'ncc': 'NCC'}
+            ref_labels = {'hinge1': 'Hinge L', 'hinge2': 'Hinge R', 'ms': 'MS'}
             for k, voxel in self._tavi_ref_voxel.items():
                 pix = self._project_voxel_to_view(voxel, self._tavi_ct_shape, side)
                 if pix is None:
@@ -2655,161 +2677,304 @@ class FinalOverlayPanel(QWidget):
                 ref_3d[k] = np.asarray(pt, dtype=np.float64)
                 ref_added += 1
 
-        # ── Mesures TAVI visuelles (accolades + fleches + callout risque) ──
-        self._draw_tavi_measurements(plotter, pv, ref_3d, side)
+        # ── Mesure MS (statique : ligne annulaire + cote perpendiculaire) ──
+        self._draw_ms_measurement(plotter, pv, ref_3d, side)
 
-        # Slider profondeur fluoroscopie
+        # ── Stent (fils tresses) + ID, avec profondeur ajustable a la main ──
+        stent_added = False
+        sp = self._tavi_stent_pose
+        if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
+            import math as _math
+            try:
+                from core.stent_model import braided_stent_world
+                cx, cy = sp['center_px']
+                pix_mm = float(sp['pix_mm'])
+                length_px = float(sp['length_mm']) / pix_mm
+                diameter_px = float(sp['diameter_mm']) / pix_mm
+                ang = _math.radians(float(sp['axis_deg']))
+                axis_plot = np.array([_math.cos(ang), _math.sin(ang), 0.0], dtype=np.float64)
+                center0 = np.array([float(cx), float((side - 1.0) - cy), 8.0], dtype=np.float64)
+                half = length_px * 0.5
+                # Direction ventriculaire le long de l'axe (vers le MS si dispo)
+                vent = axis_plot.copy()
+                ms_pt = ref_3d.get('ms')
+                if ms_pt is not None and float(np.dot(np.asarray(ms_pt) - center0, axis_plot)) < 0:
+                    vent = -axis_plot
+                verts_w, faces = braided_stent_world(
+                    diameter_mm=float(diameter_px), length_mm=float(length_px),
+                    center_world=center0, axis_world=axis_plot,
+                    n_wires=24, braid_angle_deg=45.0,
+                    wire_radius_mm=max(0.5, 0.18 / max(pix_mm, 1e-6)),
+                    n_pts=110, tube_sides=5)
+                faces_pv = np.hstack([
+                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                    faces.astype(np.int64)]).ravel()
+                stent_actor = plotter.add_mesh(
+                    pv.PolyData(verts_w.astype(np.float32), faces_pv),
+                    color=(0.98, 0.85, 0.25), opacity=0.92,
+                    smooth_shading=True, name='stent_recale')
+                stent_added = True
+            except Exception:
+                stent_actor = None
+
+        # ── Mesure ID + slider de profondeur (hors du try ci-dessus pour que le
+        #    slider ne soit JAMAIS avale par une exception de construction du mesh) ──
+        if stent_added:
+            # ID initial au repos
+            ends0 = (center0 + axis_plot * half, center0 - axis_plot * half)
+            id_mm0 = self._id_mm_from_plot(ref_3d, ends0, pix_mm)
+            self._draw_id_and_risk(plotter, pv, ref_3d, side, ends0, id_mm0)
+
+            def _update_stent_z(z_val):
+                try:
+                    stent_actor.SetPosition(0.0, 0.0, float(z_val))
+                except Exception:
+                    pass
+                try:
+                    plotter.render()
+                except Exception:
+                    pass
+
+            try:
+                plotter.add_slider_widget(
+                    _update_stent_z,
+                    rng=[-side * 0.4, side * 0.4], value=0.0,
+                    title='Stent Z',
+                    pointa=(0.73, 0.13), pointb=(0.97, 0.13),
+                    color='#f0d020', style='modern', event_type='always')
+            except TypeError:
+                plotter.add_slider_widget(
+                    _update_stent_z,
+                    rng=[-side * 0.4, side * 0.4], value=0.0,
+                    title='Stent Z',
+                    pointa=(0.73, 0.13), pointb=(0.97, 0.13),
+                    color='#f0d020', style='modern')
+        else:
+            self._draw_id_and_risk(plotter, pv, ref_3d, side, None, self._tavi_id_mm)
+
+        # Slider profondeur fluoroscopie (bas gauche)
         def _set_fluoro_depth(value):
             fluoro_actor.SetPosition(0, 0, float(value))
 
-        plotter.add_slider_widget(
-            _set_fluoro_depth,
-            rng=[-side * 0.4, side * 0.4],
-            value=0.0,
-            title='Profondeur fluoro',
-            pointa=(0.02, 0.06), pointb=(0.28, 0.06),
-            color='#8fa5cc',
-            style='modern',
-        )
+        try:
+            plotter.add_slider_widget(
+                _set_fluoro_depth,
+                rng=[-side * 0.4, side * 0.4], value=0.0,
+                title='Fluoro Z',
+                pointa=(0.03, 0.13), pointb=(0.27, 0.13),
+                color='#8fa5cc', style='modern', event_type='always')
+        except TypeError:
+            plotter.add_slider_widget(
+                _set_fluoro_depth,
+                rng=[-side * 0.4, side * 0.4], value=0.0,
+                title='Fluoro Z',
+                pointa=(0.03, 0.13), pointb=(0.27, 0.13),
+                color='#8fa5cc', style='modern')
 
         plotter.enable_parallel_projection()
-        title = 'Maillages anatomiques 3D recales sur fluoroscopie'
+        title = 'Overlay 3D recale'
         if stent_added:
-            title += ' + Stent (fils tresses)'
+            title += ' + Stent'
         if ref_added:
-            title += f' + {ref_added} repere(s) TAVI'
-        plotter.add_text(title, font_size=10)
+            title += f' + {ref_added} reperes TAVI'
+        title += '  |  R = vue de face'
+        plotter.add_text(title, font_size=9)
         plotter.add_axes(line_width=2)
-        plotter.camera_position = [
-            (side * 0.5, side * 0.5, side * 1.7),
-            (side * 0.5, side * 0.5, 0.0),
-            (0.0, -1.0, 0.0),
-        ]
+
+        # Vue de face : Y vers le haut, X vers la droite, Z = profondeur AP.
+        cx, cy = side * 0.5, side * 0.5
+        def _reset_view(*args):
+            plotter.camera_position = [
+                (cx, cy, side * 2.0),
+                (cx, cy, 10.0),
+                (0.0, 1.0, 0.0),
+            ]
+            try:
+                plotter.camera.zoom(0.55)   # dezoom plus large
+            except Exception:
+                pass
+            plotter.render()
+
+        _reset_view()
+        # Bouton cliquable (haut gauche) + raccourci 'r' : recadre la vue de face.
+        try:
+            plotter.add_checkbox_button_widget(
+                _reset_view, value=False, position=(12, 12), size=34,
+                color_on='#4f9cf9', color_off='#4f9cf9', border_size=2)
+            plotter.add_text('Reset vue de face (ou R)', position=(54, 18),
+                             font_size=10, color='#cdd5e8', name='reset_hint')
+        except Exception:
+            pass
+        plotter.add_key_event('r', lambda: _reset_view())
         plotter.show(title='Vue 3D - Overlay recale', auto_close=True)
 
-    def _draw_tavi_measurements(self, plotter, pv, ref_3d, side):
-        """Dessine MS / ID avec accolades + ticks + fleches + callout du risque.
+    def _add_dim_bracket(self, plotter, pv, p_a, p_b, label, color, name_prefix, side,
+                         line_width=4, tick_factor=0.014, label_offset_z=4.0):
+        """Dessine une "cote" entre p_a et p_b : segment + ticks + label decale.
 
-        MS : ligne annulaire (hinge1-hinge2, cyan) + segment MS perpendiculaire
-             (rouge) avec tick marks aux deux extremites + label decale.
-        ID : double-fleche stent_bas -> NCC (orange) avec tick marks + label decale.
-        Risque : callout texte en haut a gauche avec MS, ID, dMSID, niveau de risque.
+        Acteurs nommes ``{name_prefix}_main/_tick_a/_tick_b/_label`` : un meme
+        prefixe rappele REMPLACE l'ancien (utile pour le recalcul live de l'ID).
         """
-        # Helper local : dessine une "cote" entre p_a et p_b (segment + ticks + label decale)
-        def add_dim_bracket(p_a, p_b, label, color, name_prefix,
-                             line_width=4, tick_factor=0.014, label_offset_z=4.0):
-            p_a = np.asarray(p_a, dtype=np.float64)
-            p_b = np.asarray(p_b, dtype=np.float64)
-            plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=line_width,
-                              name=f'{name_prefix}_main')
-            axis = p_b - p_a
-            n = float(np.linalg.norm(axis))
-            if n > 1e-6:
-                u = axis / n
-                # Perpendiculaire dans le plan ecran (Z reste constant en projection parallele)
+        p_a = np.asarray(p_a, dtype=np.float64)
+        p_b = np.asarray(p_b, dtype=np.float64)
+        plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=line_width,
+                          name=f'{name_prefix}_main')
+        axis = p_b - p_a
+        n = float(np.linalg.norm(axis))
+        if n > 1e-6:
+            u = axis / n
+            perp = np.array([-u[1], u[0], 0.0])
+            pn = float(np.linalg.norm(perp))
+            if pn > 1e-6:
+                perp /= pn
+            tick_len = max(8.0, side * float(tick_factor))
+            for end_pt, suf in ((p_a, 'a'), (p_b, 'b')):
+                plotter.add_mesh(pv.Line(end_pt + perp * tick_len, end_pt - perp * tick_len),
+                                  color=color, line_width=line_width,
+                                  name=f'{name_prefix}_tick_{suf}')
+            mid = 0.5 * (p_a + p_b)
+            label_pt = mid + perp * (tick_len * 2.2) + np.array([0.0, 0.0, float(label_offset_z)])
+        else:
+            label_pt = 0.5 * (p_a + p_b) + np.array([0.0, 0.0, float(label_offset_z)])
+        plotter.add_point_labels(
+            np.array([label_pt], dtype=np.float32), [label],
+            font_size=15, point_color=color, text_color='white',
+            shape='rounded_rect', shape_color='black', shape_opacity=0.65,
+            always_visible=True, name=f'{name_prefix}_label')
+
+    def _draw_ms_measurement(self, plotter, pv, ref_3d, side):
+        """Ligne annulaire (cyan) + cote MS perpendiculaire (rouge). Statique."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms_pt = ref_3d.get('ms')
+        if h1 is None or h2 is None:
+            return
+        plotter.add_mesh(pv.Line(h1, h2), color=(90/255, 220/255, 240/255),
+                          line_width=3, name='annulus_line')
+        axis = h2 - h1
+        n_axis = float(np.linalg.norm(axis))
+        if n_axis > 1e-6 and ms_pt is not None:
+            u_an = axis / n_axis
+            proj = h1 + np.dot(ms_pt - h1, u_an) * u_an
+            pix_mm = self._tavi_pix_mm()
+            ms_mm = self._ms_mm_from_plot(ref_3d, pix_mm) if pix_mm else self._tavi_ms_length
+            ms_label = f'MS = {ms_mm:.2f} mm' if ms_mm is not None else 'MS'
+            self._add_dim_bracket(plotter, pv, proj, ms_pt, ms_label,
+                                  (255/255, 90/255, 90/255), 'ms_dim', side, line_width=4)
+
+    def _tavi_pix_mm(self):
+        """mm/pixel calibre sur le stent (None si pas de stent)."""
+        sp = self._tavi_stent_pose
+        if sp and sp.get('pix_mm', 0) > 0:
+            return float(sp['pix_mm'])
+        return None
+
+    def _ms_mm_from_plot(self, ref_3d, pix_mm):
+        """MS (mm) = distance perpendiculaire du MS a la ligne annulaire, calculee
+        dans le MEME repere projete que les points dessines (coherence geometrie<->valeur)."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms = ref_3d.get('ms')
+        if h1 is None or h2 is None or ms is None or not pix_mm:
+            return None
+        h1 = np.asarray(h1, dtype=np.float64)[:2]
+        h2 = np.asarray(h2, dtype=np.float64)[:2]
+        ms = np.asarray(ms, dtype=np.float64)[:2]
+        u = h2 - h1
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:
+            return None
+        u = u / nu
+        rel = ms - h1
+        perp = float(np.linalg.norm(rel - np.dot(rel, u) * u))
+        return perp * float(pix_mm)
+
+    def _id_mm_from_plot(self, ref_3d, stent_ends, pix_mm):
+        """ID (mm) = distance perpendiculaire de la base ventriculaire du stent a
+        la ligne annulaire, calculee dans le repere du plotter (px canvas)."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2')
+        if h1 is None or h2 is None or stent_ends is None:
+            return None
+        h1 = np.asarray(h1, dtype=np.float64)[:2]
+        h2 = np.asarray(h2, dtype=np.float64)[:2]
+        e1 = np.asarray(stent_ends[0], dtype=np.float64)[:2]
+        e2 = np.asarray(stent_ends[1], dtype=np.float64)[:2]
+        u = h2 - h1
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:
+            return None
+        u = u / nu
+        n = np.array([-u[1], u[0]])
+        ms_pt = ref_3d.get('ms')
+        if ms_pt is not None:
+            ms2 = np.asarray(ms_pt, dtype=np.float64)[:2]
+            if float(np.dot(ms2 - 0.5 * (h1 + h2), n)) < 0:
+                n = -n
+            d = max(0.0, float(np.dot(e1 - h1, n)), float(np.dot(e2 - h1, n)))
+        else:
+            d = max(abs(float(np.dot(e1 - h1, n))), abs(float(np.dot(e2 - h1, n))))
+        return d * float(pix_mm)
+
+    def _draw_id_and_risk(self, plotter, pv, ref_3d, side, stent_ends, id_mm):
+        """Cote ID (base ventriculaire du stent -> ligne annulaire) + callout risque.
+
+        Redessinable a chaque changement de profondeur : les acteurs portent des
+        noms fixes donc PyVista remplace les anciens proprement.
+        """
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms_pt = ref_3d.get('ms')
+        if (stent_ends is not None and h1 is not None and h2 is not None
+                and id_mm is not None):
+            h1a = np.asarray(h1, dtype=np.float64)
+            h2a = np.asarray(h2, dtype=np.float64)
+            e1 = np.asarray(stent_ends[0], dtype=np.float64)
+            e2 = np.asarray(stent_ends[1], dtype=np.float64)
+            u = h2a - h1a
+            nu = float(np.linalg.norm(u))
+            if nu > 1e-6:
+                u = u / nu
                 perp = np.array([-u[1], u[0], 0.0])
                 pn = float(np.linalg.norm(perp))
                 if pn > 1e-6:
                     perp /= pn
-                tick_len = max(8.0, side * float(tick_factor))
-                for end_pt, suf in ((p_a, 'a'), (p_b, 'b')):
-                    t1 = end_pt + perp * tick_len
-                    t2 = end_pt - perp * tick_len
-                    plotter.add_mesh(pv.Line(t1, t2), color=color, line_width=line_width,
-                                      name=f'{name_prefix}_tick_{suf}')
-                # Label decale perpendiculairement (legible meme si segment court)
-                mid = 0.5 * (p_a + p_b)
-                label_pt = mid + perp * (tick_len * 2.2)
-                label_pt = label_pt + np.array([0.0, 0.0, float(label_offset_z)])
-            else:
-                label_pt = 0.5 * (p_a + p_b) + np.array([0.0, 0.0, float(label_offset_z)])
-            plotter.add_point_labels(
-                np.array([label_pt], dtype=np.float32), [label],
-                font_size=15, point_color=color, text_color='white',
-                shape='rounded_rect', shape_color='black', shape_opacity=0.65,
-                always_visible=True, name=f'{name_prefix}_label')
+                if ms_pt is not None and float(np.dot(np.asarray(ms_pt) - 0.5 * (h1a + h2a), perp)) < 0:
+                    perp = -perp
+                # base ventriculaire = extremite la plus du cote MS
+                base = e1 if float(np.dot(e1 - h1a, perp)) >= float(np.dot(e2 - h1a, perp)) else e2
+                foot = h1a + np.dot(base - h1a, u) * u   # pied de la perpendiculaire
+                foot[2] = base[2]                        # cote bien dans le plan du stent
+                self._add_dim_bracket(plotter, pv, foot, base, f'ID = {id_mm:.2f} mm',
+                                      (255/255, 160/255, 50/255), 'id_dim', side, line_width=4)
+        pix_mm = self._tavi_pix_mm()
+        ms_mm = self._ms_mm_from_plot(ref_3d, pix_mm) if pix_mm else self._tavi_ms_length
+        self._draw_risk_callout(plotter, ms_mm, id_mm)
 
-        # ── MS : ligne annulaire + segment MS perpendiculaire avec accolade ──
-        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms_pt = ref_3d.get('ms')
-        ms_color = (255/255, 90/255, 90/255)
-        annu_color = (90/255, 220/255, 240/255)
-        if h1 is not None and h2 is not None:
-            plotter.add_mesh(pv.Line(h1, h2), color=annu_color, line_width=3,
-                              name='annulus_line')
-            # Petites cotes aux extremites de la ligne annulaire
-            axis = h2 - h1
-            n_axis = float(np.linalg.norm(axis))
-            if n_axis > 1e-6 and ms_pt is not None:
-                u_an = axis / n_axis
-                # Projection orthogonale du MS sur la ligne annulaire (pied de la perpendiculaire)
-                proj = h1 + np.dot(ms_pt - h1, u_an) * u_an
-                ms_label = f'MS = {self._tavi_ms_length:.2f} mm' if self._tavi_ms_length is not None else 'MS'
-                add_dim_bracket(proj, ms_pt, ms_label, ms_color,
-                                 name_prefix='ms_dim', line_width=4)
-
-        # ── ID : stent_bas <-> NCC avec double-fleche ──
-        sp_d = self._tavi_stent_pose
-        ncc_p = ref_3d.get('ncc')
-        id_color = (255/255, 160/255, 50/255)
-        if ncc_p is not None and sp_d and self._tavi_id_mm is not None:
-            import math as _math2
-            cx, cy = sp_d['center_px']
-            pix_mm = float(sp_d.get('pix_mm', 1.0))
-            half = float(sp_d['length_mm']) * 0.5 / max(pix_mm, 1e-6)
-            ang = _math2.radians(float(sp_d['axis_deg']))
-            e1 = (cx + _math2.cos(ang) * half, cy - _math2.sin(ang) * half)
-            e2 = (cx - _math2.cos(ang) * half, cy + _math2.sin(ang) * half)
-            e1p = np.array([e1[0], (side - 1.0) - e1[1], 10.0], dtype=np.float64)
-            e2p = np.array([e2[0], (side - 1.0) - e2[1], 10.0], dtype=np.float64)
-            bot = e1p if np.linalg.norm(e1p - ncc_p) < np.linalg.norm(e2p - ncc_p) else e2p
-            id_label = f'ID = {self._tavi_id_mm:.2f} mm'
-            add_dim_bracket(bot, ncc_p, id_label, id_color,
-                             name_prefix='id_dim', line_width=4)
-
-        # ── Callout du risque : MS / ID / dMSID / niveau ──
-        ms_v = self._tavi_ms_length
-        id_v = self._tavi_id_mm
-        if ms_v is not None or id_v is not None:
-            try:
-                from core.measurements import risk_assessment, DELTA_MSID_THRESHOLD_MM
-            except Exception:
-                risk_assessment = None
-                DELTA_MSID_THRESHOLD_MM = 3.0
-            risk_text_lines = []
-            risk_text_lines.append(f'MS  = {ms_v:.2f} mm' if ms_v is not None else 'MS  = --')
-            risk_text_lines.append(f'ID   = {id_v:.2f} mm' if id_v is not None else 'ID   = --')
-            level = None
-            pm_rate = None
-            delta = None
-            if ms_v is not None and id_v is not None and risk_assessment is not None:
-                r = risk_assessment(ms_v, id_v)
-                delta = r.get('delta_msid_mm')
-                level = r.get('risk_level')
-                pm_rate = r.get('pm_dependency_rate')
-            if delta is not None:
-                risk_text_lines.append(f'dMSID = {delta:+.2f} mm  (< {DELTA_MSID_THRESHOLD_MM:.1f} = HAUT)')
-            else:
-                risk_text_lines.append('dMSID = --')
-            if level == 'HIGH':
-                risk_text_lines.append(f'Risque PM : HAUT  (~{pm_rate:.0%})' if pm_rate else 'Risque PM : HAUT')
-                callout_color = 'red'
-            elif level == 'LOW':
-                risk_text_lines.append(f'Risque PM : BAS   (~{pm_rate:.1%})' if pm_rate else 'Risque PM : BAS')
-                callout_color = '#5ed16a'
-            else:
-                risk_text_lines.append('Risque PM : --')
-                callout_color = 'white'
-            try:
-                plotter.add_text(
-                    '\n'.join(risk_text_lines),
-                    position='upper_left',
-                    font_size=12,
-                    color=callout_color,
-                    shadow=True,
-                    name='risk_callout',
-                )
-            except Exception:
-                pass
+    def _draw_risk_callout(self, plotter, ms_v, id_v):
+        """Callout texte (haut gauche) : MS / ID / dMSID / niveau de risque PM."""
+        if ms_v is None and id_v is None:
+            return
+        try:
+            from core.measurements import risk_assessment, DELTA_MSID_THRESHOLD_MM
+        except Exception:
+            risk_assessment = None
+            DELTA_MSID_THRESHOLD_MM = 3.0
+        lines = [f'MS  = {ms_v:.2f} mm' if ms_v is not None else 'MS  = --',
+                 f'ID   = {id_v:.2f} mm' if id_v is not None else 'ID   = --']
+        level = pm_rate = delta = None
+        if ms_v is not None and id_v is not None and risk_assessment is not None:
+            r = risk_assessment(ms_v, id_v)
+            delta = r.get('delta_msid_mm'); level = r.get('risk_level')
+            pm_rate = r.get('pm_dependency_rate')
+        lines.append(f'dMSID = {delta:+.2f} mm  (< {DELTA_MSID_THRESHOLD_MM:.1f} = HAUT)'
+                     if delta is not None else 'dMSID = --')
+        if level == 'HIGH':
+            lines.append(f'Risque PM : HAUT  (~{pm_rate:.0%})' if pm_rate else 'Risque PM : HAUT')
+            color = 'red'
+        elif level == 'LOW':
+            lines.append(f'Risque PM : BAS   (~{pm_rate:.1%})' if pm_rate else 'Risque PM : BAS')
+            color = '#5ed16a'
+        else:
+            lines.append('Risque PM : --'); color = 'white'
+        try:
+            plotter.add_text('\n'.join(lines), position='upper_left',
+                             font_size=12, color=color, shadow=True, name='risk_callout')
+        except Exception:
+            pass
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._render()

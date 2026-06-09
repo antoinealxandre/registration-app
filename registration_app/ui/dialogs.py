@@ -48,6 +48,7 @@ from ui.theme import (
     ERR,
     SEG_PALETTE as _SEG_PALETTE,
     YOLO_BOX_PALETTE as _YOLO_BOX_PALETTE,
+    color_for_structure as _color_for_structure,
 )
 
 def _img_to_rgb(img: np.ndarray) -> np.ndarray:
@@ -1024,7 +1025,7 @@ class SegOverlayWindow(QDialog):
         self._zoom = 1.0
         self._pan_x, self._pan_y = 0, 0
         names = list(proj_masks.keys())
-        self._colors = {n: _SEG_PALETTE[i % len(_SEG_PALETTE)] for i, n in enumerate(names)}
+        self._colors = {n: _color_for_structure(n) for n in names}
         self._chks: dict = {}
         self._opacity_sliders = {}
         self._line_width = 2

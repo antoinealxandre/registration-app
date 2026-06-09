@@ -67,6 +67,36 @@ MEDICAL_COLORS = {
 
 VERTEBRA_COLOR = (226, 202, 134)
 
+
+def color_for_structure(name: str) -> tuple:
+    """Couleur (R,G,B) STABLE et DISTINCTE pour une structure, identique partout.
+
+    Deterministe par NOM (independant du PYTHONHASHSEED et de l'ordre d'iteration)
+    afin que la meme structure ait exactement la meme couleur dans toutes les vues
+    (coupes, Seg CT 3D, overlay 2D/3D). Pour les structures non medicales on derive
+    une TEINTE CONTINUE depuis un hash FNV-1a bien disperse : deux noms differents
+    (meme proches comme L1/L2/L3) obtiennent des teintes nettement separees, sans
+    collision exacte comme le faisait l'ancien ``palette[hash % 15]``.
+    """
+    import colorsys
+    key = str(name).lower().strip()
+    if key in MEDICAL_COLORS:
+        return MEDICAL_COLORS[key]
+    if 'vertebra' in key or 'vertebr' in key:
+        return VERTEBRA_COLOR
+    if 'lung' in key:
+        return (172, 138, 115)
+    # FNV-1a : melange fortement meme pour des chaines tres proches.
+    h = 2166136261
+    for ch in key:
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    # Teinte etalee sur tout le cercle via un multiplicateur de Knuth.
+    hue = ((h * 2654435761) & 0xFFFFFFFF) / 4294967296.0
+    sat = 0.60 + ((h >> 9) % 28) / 100.0     # 0.60 .. 0.87
+    val = 0.82 + ((h >> 17) % 16) / 100.0    # 0.82 .. 0.97
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
 STYLE = f"""
 QMainWindow,QWidget{{background:{DARK_BG};color:{TEXT};font-family:'Segoe UI',sans-serif;font-size:12px;}}
 QScrollArea{{background:transparent;border:none;}}
