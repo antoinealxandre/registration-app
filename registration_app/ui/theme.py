@@ -67,19 +67,24 @@ MEDICAL_COLORS = {
 
 VERTEBRA_COLOR = (226, 202, 134)
 
+_CSV_COLOR_OVERRIDE: dict = {}
+
+
+def set_csv_colors(colors: dict) -> None:
+    """Enregistre les couleurs issues d'un NRRD/CSV Slicer (efface si dict vide)."""
+    global _CSV_COLOR_OVERRIDE
+    _CSV_COLOR_OVERRIDE = {str(k).lower().strip(): tuple(v) for k, v in colors.items()}
+
 
 def color_for_structure(name: str) -> tuple:
     """Couleur (R,G,B) STABLE et DISTINCTE pour une structure, identique partout.
 
-    Deterministe par NOM (independant du PYTHONHASHSEED et de l'ordre d'iteration)
-    afin que la meme structure ait exactement la meme couleur dans toutes les vues
-    (coupes, Seg CT 3D, overlay 2D/3D). Pour les structures non medicales on derive
-    une TEINTE CONTINUE depuis un hash FNV-1a bien disperse : deux noms differents
-    (meme proches comme L1/L2/L3) obtiennent des teintes nettement separees, sans
-    collision exacte comme le faisait l'ancien ``palette[hash % 15]``.
+    Priorite : couleurs NRRD/CSV chargees > MEDICAL_COLORS > hash FNV-1a.
     """
     import colorsys
     key = str(name).lower().strip()
+    if key in _CSV_COLOR_OVERRIDE:
+        return _CSV_COLOR_OVERRIDE[key]
     if key in MEDICAL_COLORS:
         return MEDICAL_COLORS[key]
     if 'vertebra' in key or 'vertebr' in key:

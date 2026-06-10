@@ -2804,7 +2804,7 @@ class FinalOverlayPanel(QWidget):
         if ref_added:
             title += f' + {ref_added} reperes TAVI'
         title += '  |  R = vue de face'
-        plotter.add_text(title, font_size=9)
+        plotter.add_text(title, position='upper_right', font_size=9, color='#8892b0')
         plotter.add_axes(line_width=2)
 
         # Vue de face : Y vers le haut, X vers la droite, Z = profondeur AP.
@@ -3046,26 +3046,36 @@ class FinalOverlayPanel(QWidget):
         except Exception:
             risk_assessment = None
             DELTA_MSID_THRESHOLD_MM = 3.0
-        lines = [f'MS  = {ms_v:.2f} mm' if ms_v is not None else 'MS  = --',
-                 f'ID   = {id_v:.2f} mm' if id_v is not None else 'ID   = --']
         level = pm_rate = delta = None
         if ms_v is not None and id_v is not None and risk_assessment is not None:
             r = risk_assessment(ms_v, id_v)
             delta = r.get('delta_msid_mm'); level = r.get('risk_level')
             pm_rate = r.get('pm_dependency_rate')
-        lines.append(f'dMSID = {delta:+.2f} mm  (< {DELTA_MSID_THRESHOLD_MM:.1f} = HAUT)'
-                     if delta is not None else 'dMSID = --')
+
         if level == 'HIGH':
-            lines.append(f'Risque PM : HAUT  (~{pm_rate:.0%})' if pm_rate else 'Risque PM : HAUT')
-            color = 'red'
+            color = '#e05060'
         elif level == 'LOW':
-            lines.append(f'Risque PM : BAS   (~{pm_rate:.1%})' if pm_rate else 'Risque PM : BAS')
-            color = '#5ed16a'
+            color = '#2ecc7a'
         else:
-            lines.append('Risque PM : --'); color = 'white'
+            color = '#cdd5e8'
+
+        lines = []
+        if delta is not None:
+            lines.append(f'ΔMSID = {delta:+.2f} mm')
+            if level == 'HIGH':
+                lines.append(f'Risque PM : HAUT  (~{pm_rate:.0%})' if pm_rate else 'Risque PM : HAUT')
+            elif level == 'LOW':
+                lines.append(f'Risque PM : BAS   (~{pm_rate:.1%})' if pm_rate else 'Risque PM : BAS')
+        lines += [
+            f'MS  = {ms_v:.2f} mm' if ms_v is not None else 'MS  = --',
+            f'ID   = {id_v:.2f} mm' if id_v is not None else 'ID   = --',
+        ]
+        if delta is None:
+            lines.append(f'ΔMSID = -- (< {DELTA_MSID_THRESHOLD_MM:.1f} mm = HAUT)')
+
         try:
             plotter.add_text('\n'.join(lines), position='upper_left',
-                             font_size=12, color=color, shadow=True, name='risk_callout')
+                             font_size=14, color=color, shadow=True, name='risk_callout')
         except Exception:
             pass
 

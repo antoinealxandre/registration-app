@@ -80,6 +80,7 @@ from ui.theme import (
     AUTO_PIPELINE_FOV_MM,
     STRUCT,
     color_for_structure,
+    set_csv_colors,
     BORDER,
     BORDER2,
     ACCENT,
@@ -1660,12 +1661,12 @@ class MainWindow(QMainWindow):
             self._on_files_dropped(files)
 
     def _read_segmentation_volume(self, path):
-        """Read NIfTI or NRRD segmentation and return (label_volume, affine, label_names)."""
+        """Read NIfTI or NRRD segmentation and return (label_volume, affine, label_names, label_colors)."""
         p = path.lower()
         if p.endswith('.nii') or p.endswith('.nii.gz'):
             seg_img = nib.load(path)
             sv = seg_img.get_fdata().astype(np.int16)
-            return sv, seg_img.affine, None
+            return sv, seg_img.affine, None, {}
 
         if not p.endswith('.nrrd'):
             raise ValueError(f'Format segmentation non supporte: {path}')
@@ -1690,6 +1691,7 @@ class MainWindow(QMainWindow):
         keys = set(img.GetMetaDataKeys())
         seg_defs = []
         idx = 0
+        seg_colors = {}
         while f'Segment{idx}_Name' in keys:
             name = img.GetMetaData(f'Segment{idx}_Name').strip() or f'segment_{idx + 1}'
             try:
@@ -1700,6 +1702,17 @@ class MainWindow(QMainWindow):
                 label_val = int(float(img.GetMetaData(f'Segment{idx}_LabelValue'))) if f'Segment{idx}_LabelValue' in keys else 1
             except Exception:
                 label_val = 1
+            color_str = img.GetMetaData(f'Segment{idx}_Color') if f'Segment{idx}_Color' in keys else None
+            if color_str:
+                try:
+                    parts = [float(x) for x in str(color_str).split()]
+                    if len(parts) >= 3:
+                        r = max(0, min(255, int(parts[0] * 255)))
+                        g = max(0, min(255, int(parts[1] * 255)))
+                        b = max(0, min(255, int(parts[2] * 255)))
+                        seg_colors[name] = (r, g, b)
+                except (ValueError, AttributeError):
+                    pass
             seg_defs.append((name, layer, label_val))
             idx += 1
 
@@ -1710,7 +1723,7 @@ class MainWindow(QMainWindow):
                 label_names = {}
                 for name, _, label_val in seg_defs:
                     label_names[int(label_val)] = name
-            return sv, aff, label_names
+            return sv, aff, label_names, seg_colors
 
         if arr.ndim != 4:
             raise ValueError(f'NRRD segmentation invalide (ndim={arr.ndim}), attendu 3D ou 4D')
@@ -1740,6 +1753,7 @@ class MainWindow(QMainWindow):
         sv = np.zeros(sample.shape, dtype=np.int16)
         label_names = {}
         out_idx = 1
+        out_seg_colors = {}
 
         if seg_defs:
             for name, layer, label_val in seg_defs:
@@ -1753,6 +1767,8 @@ class MainWindow(QMainWindow):
                     continue
                 sv[m] = out_idx
                 label_names[out_idx] = name
+                if name in seg_colors:
+                    out_seg_colors[name] = seg_colors[name]
                 out_idx += 1
         else:
             for layer in range(layer_dim):
@@ -1764,10 +1780,13 @@ class MainWindow(QMainWindow):
                 label_names[out_idx] = f'label_{out_idx}'
                 out_idx += 1
 
-        return sv, aff, label_names
+        return sv, aff, label_names, out_seg_colors
 
-    def _build_seg_masks(self, seg_volume, csv_path=None, label_names=None):
+    def _build_seg_masks(self, seg_volume, csv_path=None, label_names=None, label_colors=None):
         """Build per-structure binary masks from a multilabel segmentation volume."""
+        final_colors = {}
+        if label_colors:
+            final_colors.update(label_colors)
         masks = {}
 
         def _unique_name(base):
@@ -1822,9 +1841,10 @@ class MainWindow(QMainWindow):
 
     def _load_seg_auto(self, path, csv_path=None):
         try:
-            sv, aff, label_names = self._read_segmentation_volume(path)
+            sv, aff, label_names, seg_colors = self._read_segmentation_volume(path)
             self.seg_affine = aff
-            self.seg_masks = self._build_seg_masks(sv, csv_path=csv_path, label_names=label_names)
+            self.seg_masks = self._build_seg_masks(sv, csv_path=csv_path, label_names=label_names, label_colors=seg_colors)
+            set_csv_colors(seg_colors)
             n = len(self.seg_masks)
             self.lbl_seg.setText(f'Seg : {os.path.basename(path)} ({n})')
             if self.ct_vol is not None and self.seg_masks:
@@ -2427,16 +2447,37 @@ class MainWindow(QMainWindow):
                     if n > 1e-6:
                         u = axis / n
                         proj = h1 + np.dot(ms_pt - h1, u) * u
-                        plotter.add_mesh(pv.Line(proj, ms_pt), color='red', line_width=4,
-                                          name='ms_segment', render=False)
                         ms_mm = float(np.linalg.norm(ms_pt - proj))
                         mid = 0.5 * (proj + ms_pt)
+
+                        id_mm = self._compute_id_mm()
+                        r = risk_assessment(ms_mm, id_mm)
+                        delta = r.get('delta_msid_mm')
+                        risk_level = r.get('risk_level')
+                        if risk_level == 'HIGH':
+                            seg_color = '#e05060'
+                        elif risk_level == 'LOW':
+                            seg_color = '#2ecc7a'
+                        else:
+                            seg_color = '#f0b040'
+
+                        plotter.add_mesh(pv.Line(proj, ms_pt), color=seg_color, line_width=4,
+                                          name='ms_segment', render=False)
                         plotter.add_point_labels(
                             np.array([mid]), [f'MS = {ms_mm:.2f} mm'],
-                            font_size=14, point_color='red', text_color='white',
+                            font_size=14, point_color=seg_color, text_color='white',
                             shape='rounded_rect', shape_color='black', shape_opacity=0.55,
                             always_visible=True, name='ms_label', render=False)
                         present.add('ms_segment'); present.add('ms_label')
+
+                        if delta is not None:
+                            risk_str = 'HAUT' if risk_level == 'HIGH' else 'BAS'
+                            plotter.add_point_labels(
+                                np.array([ms_pt]), [f'ΔMSID = {delta:+.2f} mm  —  PM : {risk_str}'],
+                                font_size=13, point_color=seg_color, text_color=seg_color,
+                                shape='rounded_rect', shape_color='#0c0e14', shape_opacity=0.80,
+                                always_visible=True, name='delta_label', render=False)
+                            present.add('delta_label')
 
             # ID n'est pas affiche ici : c'est une mesure 2D sur la fluoroscopie.
             # Voir l'onglet Overlay -> Vue 3D pour la visualisation du stent + ID.
@@ -2448,7 +2489,7 @@ class MainWindow(QMainWindow):
                     if actor not in present:
                         try: plotter.remove_actor(actor, render=False)
                         except Exception: pass
-            for actor in ('annulus_line', 'ms_segment', 'ms_label'):
+            for actor in ('annulus_line', 'ms_segment', 'ms_label', 'delta_label'):
                 if actor not in present:
                     try: plotter.remove_actor(actor, render=False)
                     except Exception: pass
