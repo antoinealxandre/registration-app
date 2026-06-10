@@ -2452,20 +2452,33 @@ class FinalOverlayPanel(QWidget):
 
         from skimage import measure
 
-        # Maillage PLEINE RESOLUTION, comme la vue Seg CT 3D (qui est nette) :
-        # on ne sous-echantillonne le masque que pour les volumes enormes.
-        # NB : surtout PAS de smooth_taubin(normalize_coordinates=True) ici : la
-        # normalisation en cube unite ecrase l'axe de profondeur (mince) et
-        # APLATIT les structures. Marching cubes step_size=1 pleine resolution suffit.
-        if vol.size > 180_000_000:
+        # Garder les dimensions originales pour les projections
+        nx_orig, ny_orig, nz_orig = vol.shape
+
+        # ── Compromis qualité/vitesse adaptatif ──
+        # Petites structures (< 20M voxels) : step_size=1 (pleine résolution, rapide)
+        # Structures moyennes (20-100M) : step_size=2 (4x plus rapide, détail préservé)
+        # Grandes structures (>100M) : sous-échantillonnage voxel (8x plus rapide)
+        stride = 1
+        step_size = 1
+        if vol.size > 100_000_000:
+            stride = 2
             vol = vol[::2, ::2, ::2]
+            step_size = 1
+        elif vol.size > 20_000_000:
+            step_size = 2
+
         try:
             verts, faces, _, _ = measure.marching_cubes(
-                vol, level=0.5, step_size=1, allow_degenerate=False)
+                vol, level=0.5, step_size=step_size, allow_degenerate=False)
         except Exception:
             return None
         if verts.shape[0] < 3 or faces.shape[0] == 0:
             return None
+
+        # Si le volume a été sous-échantillonné, rescaler les verts à la grille originale.
+        if stride > 1:
+            verts = verts * stride
 
         # Important: do not reapply C-arm angles on the 3D mesh here.
         # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
@@ -2481,7 +2494,7 @@ class FinalOverlayPanel(QWidget):
 
         # Projection des sommets (meme convention que project_mask_3d).
         v = np.asarray(mesh.points, dtype=np.float64)
-        nx, ny, nz = vol.shape
+        nx, ny, nz = nx_orig, ny_orig, nz_orig
         reg_size = float(self._reg_size)
 
         x_plane = v[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
