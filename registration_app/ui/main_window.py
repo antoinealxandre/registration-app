@@ -47,7 +47,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup,
 )
 from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 
 from core.drr_generator import load_ct, DRR_POSTPROCESS_PRESETS, enhance_drr_image
 from core.measurements import (
@@ -203,7 +203,7 @@ class MainWindow(QMainWindow):
         ll = self._ll   # shorthand
 
         # ── DONNEES ───────────────────────────────────────────────────────────
-        sec_data = CollapsibleSection('DONNEES', starts_open=True)
+        self.sec_data = sec_data = CollapsibleSection('DONNEES', starts_open=True)
         self._drop_zone = DropZone()
         self._drop_zone.files_dropped.connect(self._on_files_dropped)
         sec_data.addWidget(self._drop_zone)
@@ -434,7 +434,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_drr)
 
         # ── ANNOTATION ────────────────────────────────────────────────────────
-        sec_ann = CollapsibleSection('ANNOTATION', starts_open=False)
+        self.sec_ann = sec_ann = CollapsibleSection('ANNOTATION', starts_open=False)
 
         self.chk_use_seg = QCheckBox('Utiliser la segmentation CT (contours auto sur DRR)')
         self.chk_use_seg.setChecked(False)
@@ -512,7 +512,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_ann)
 
         # ── STENT ──────────────────────────────────────────────────────────
-        sec_stent = CollapsibleSection('STENT', starts_open=False)
+        self.sec_stent = sec_stent = CollapsibleSection('STENT', starts_open=False)
         stent_info = QLabel(
             'Generer un stent (diametre + longueur) puis placer le centre et l axe sur la fluoroscopie.')
         stent_info.setObjectName('dim'); stent_info.setWordWrap(True)
@@ -573,7 +573,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_stent)
 
         # ── TAVI RISK (MS length + ΔMSID + risque PM-dependency) ─────────────
-        sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
+        self.sec_tavi = sec_tavi = CollapsibleSection('TAVI RISK', starts_open=False)
         tavi_info = QLabel(
             'Auto : les 2 hinges (ligne annulaire) sont deduits des nadirs\n'
             'des cusps L1/L2/L3 segmentes. Reste a cliquer le MS apex.\n'
@@ -671,7 +671,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(sec_yolo)
 
         # ── RECALAGE ──────────────────────────────────────────────────────────
-        sec_reg = CollapsibleSection('RECALAGE', starts_open=False)
+        self.sec_reg = sec_reg = CollapsibleSection('RECALAGE', starts_open=False)
 
         self.btn_reg = QPushButton('Lancer le recalage'); self.btn_reg.setObjectName('success')
         self.btn_reg.setEnabled(False); self.btn_reg.clicked.connect(self.run_registration)
@@ -933,23 +933,69 @@ class MainWindow(QMainWindow):
             'Visualisation et recalage 2D/3D pour la planification TAVI.\n'
             'Proof of Concept clinique.')
 
-    # Chemins d'icones Material (flat, monochrome, viewBox 0 0 24 24)
+    # Chemins d'icones Material (flat, monochrome, viewBox 0 0 24 24) — utilises
+    # comme PLACEHOLDER si aucun fichier d'icone custom n'est trouve dans
+    # registration_app/assets/icons/.
     _ICON_PANEL = 'M3 5h18v2H3V5m0 6h18v2H3v-2m0 6h12v2H3v-2z'
+    _ICON_DATA = 'M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z'
+    _ICON_ANNOT = ('M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39'
+                   '.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 '
+                   '3.75 1.83-1.83z')
+    _ICON_DRR = ('M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 '
+                 '2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z')
+    _ICON_TAVI = ('M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 '
+                  '0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 '
+                  '3.78-3.4 6.86-8.55 11.54L12 21.35z')
+    _ICON_REG = ('M5 15H3v4c0 1.1.9 2 2 2h4v-2H5v-4zM5 5h4V3H5c-1.1 0-2 .9-2 2v4h2V5zm14-2'
+                 'h-4v2h4v4h2V5c0-1.1-.9-2-2-2zm0 16h-4v2h4c1.1 0 2-.9 2-2v-4h-2v4zM12 9c'
+                 '-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z')
+    _ICON_ALL = ('M4 8h4V4H4v4zm6 12h4v-4h-4v4zm-6 0h4v-4H4v4zm0-6h4v-4H4v4zm6 0h4v-4h-4v4z'
+                 'm6-10v4h4V4h-4zm-6 4h4V4h-4v4zm6 6h4v-4h-4v4zm0 6h4v-4h-4v4z')
+
+    # Repertoire des icones custom (depose tes .png / .svg / .ico ici).
+    _ICON_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets', 'icons')
+
+    # filtre -> sections a afficher (attributs sur self). 'all' = tout.
+    _FILTER_GROUPS = {
+        'data':  ('sec_data',),
+        'drr':   ('sec_drr',),
+        'annot': ('sec_ann',),
+        'tavi':  ('sec_stent', 'sec_tavi'),
+        'reg':   ('sec_reg',),
+    }
+
+    def _load_tool_icon(self, name, fallback_path_d, color=TEXT_MID, size=24):
+        """Charge assets/icons/<name>.(png|svg|ico) si present, sinon le placeholder SVG.
+
+        Les .png/.ico sont charges tels quels (couleur d'origine conservee) ;
+        les .svg passent par le rendu monochrome standard.
+        """
+        try:
+            for ext in ('.svg', '.png', '.ico'):
+                path = os.path.join(self._ICON_DIR, name + ext)
+                if os.path.isfile(path):
+                    ic = QIcon(path)
+                    if not ic.isNull():
+                        return ic
+        except Exception:
+            pass
+        return _make_svg_icon(fallback_path_d, color=color, size=size)
 
     def _build_tool_dock(self):
-        """Dock lateral minimaliste : juste le toggle sidebar. Navigation via menu."""
+        """Dock lateral d'icones : toggle sidebar + raccourcis de filtrage des menus."""
         dock = QWidget()
         dock.setFixedWidth(52)
         dock.setStyleSheet(f'background:{DARK_BG};border-right:1px solid {BORDER};')
         v = QVBoxLayout(dock)
         v.setContentsMargins(6, 8, 6, 8)
         v.setSpacing(6)
+        self._filter_buttons = {}
 
-        def _tool_btn(path_d, tip, slot):
+        def _tool_btn(icon, tip, slot, filter_key=None):
             b = QPushButton()
-            ic = _make_svg_icon(path_d, color=TEXT_MID, size=22)
-            if ic is not None:
-                b.setIcon(ic)
+            if icon is not None:
+                b.setIcon(icon)
                 b.setIconSize(QSize(22, 22))
             else:
                 b.setText(tip[:1])
@@ -963,13 +1009,72 @@ class MainWindow(QMainWindow):
             )
             b.clicked.connect(slot)
             v.addWidget(b)
+            if filter_key is not None:
+                self._filter_buttons[filter_key] = b
             return b
 
-        _tool_btn(self._ICON_PANEL, 'Afficher / masquer le panneau lateral',
-                  self._toggle_sidebar)
+        # Toggle de la sidebar (en haut, isole).
+        _tool_btn(self._load_tool_icon('panel', self._ICON_PANEL),
+                  'Afficher / masquer le panneau lateral', self._toggle_sidebar)
+
+        # Separateur visuel.
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet(f'background:{BORDER2};margin:2px 4px;')
+        v.addWidget(sep)
+
+        # Raccourcis de filtrage des menus (ordre : data, DRR, annotation, TAVI, recalage).
+        _tool_btn(self._load_tool_icon('data', self._ICON_DATA),
+                  'Importation des donnees uniquement', lambda: self._set_section_filter('data'), 'data')
+        _tool_btn(self._load_tool_icon('drr', self._ICON_DRR),
+                  'Generation DRR uniquement', lambda: self._set_section_filter('drr'), 'drr')
+        _tool_btn(self._load_tool_icon('annot', self._ICON_ANNOT),
+                  'Annotations uniquement', lambda: self._set_section_filter('annot'), 'annot')
+        _tool_btn(self._load_tool_icon('tavi', self._ICON_TAVI),
+                  'TAVI (stent + risque) uniquement', lambda: self._set_section_filter('tavi'), 'tavi')
+        _tool_btn(self._load_tool_icon('reg', self._ICON_REG),
+                  'Recalage uniquement', lambda: self._set_section_filter('reg'), 'reg')
+
         v.addStretch()
 
+        # ALL (tous les menus) en bas — etat par defaut.
+        _tool_btn(self._load_tool_icon('all', self._ICON_ALL),
+                  'Tous les menus (defaut)', lambda: self._set_section_filter('all'), 'all')
+
         self._tool_dock = dock
+        self._active_filter = 'all'
+        self._refresh_filter_buttons()
+
+    def _set_section_filter(self, key):
+        """Affiche uniquement les sections du groupe ``key`` ('all' = tout afficher)."""
+        sections = self._left_outer.findChildren(CollapsibleSection)
+        if key == 'all':
+            for s in sections:
+                s.setVisible(True)
+        else:
+            group = [getattr(self, attr, None) for attr in self._FILTER_GROUPS.get(key, ())]
+            group = [g for g in group if g is not None]
+            for s in sections:
+                show = s in group
+                s.setVisible(show)
+                if show:
+                    s.set_open(True)
+        # S'assurer que la sidebar est visible quand on choisit un filtre.
+        if hasattr(self, '_left_outer') and self._left_outer.isHidden():
+            self._left_outer.setVisible(True)
+        self._active_filter = key
+        self._refresh_filter_buttons()
+
+    def _refresh_filter_buttons(self):
+        """Met en surbrillance le bouton de filtre actif."""
+        active = getattr(self, '_active_filter', 'all')
+        for key, b in getattr(self, '_filter_buttons', {}).items():
+            on = (key == active)
+            b.setStyleSheet(
+                f'QPushButton{{background:{ACCENT if on else "transparent"};'
+                f'border:none;border-radius:8px;}}'
+                f'QPushButton:hover{{background:{ACCENT if on else CARD_BG};}}'
+                f'QPushButton:pressed{{background:{BORDER2};}}'
+            )
 
     # ── Slots UI ──────────────────────────────────────────────────────────────
 
