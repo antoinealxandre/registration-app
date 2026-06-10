@@ -356,9 +356,9 @@ class BusyOverlay(QWidget):
         self._panel.setFixedSize(420, 140)
         self._panel.setStyleSheet(
             'QFrame{'
-            'border-radius:16px;'
-            'border:none;'
-            'background:qlineargradient(y1:0, y2:1, stop:0 rgba(25, 32, 48, 0.92), stop:1 rgba(16, 20, 30, 0.88));'
+            'border-radius:14px;'
+            'border:1px solid #1e2235;'
+            'background:#12151f;'
             '}'
         )
         shadow = QGraphicsDropShadowEffect(self._panel)
@@ -401,10 +401,7 @@ class BusyOverlay(QWidget):
             '}'
             'QProgressBar::chunk{'
             'border-radius:3px;'
-            'background:qlineargradient(x1:0, y1:0.5, x2:1, y2:0.5, '
-            'stop:0 rgba(0, 59, 87, 1), '
-            'stop:0.5 rgba(0, 212, 255, 0.98), '
-            'stop:1 rgba(0, 227, 163, 1));'
+            'background:#2ecc7a;'
             'margin:0px;'
             '}'
         )
@@ -2607,11 +2604,13 @@ class FinalOverlayPanel(QWidget):
         fluoro_actor = plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
 
         added_meshes = 0
+        # Acteurs par structure pour le gestionnaire de calques (oeil + opacite).
+        # On construit TOUTES les structures disponibles afin que le basculement
+        # de visibilite soit instantane dans la vue 3D (pas de reconstruction).
+        seg_actors = {}           # name -> [fill_actor, edge_actor?]
+        seg_base_opacity = min(0.9, max(0.2, self._alpha + 0.15))
 
         for idx, (name, _) in enumerate(self._proj_masks.items()):
-            if not self._vis.get(name, True):
-                continue
-
             vol = self._seg_volumes.get(name)
             if vol is None:
                 continue
@@ -2622,13 +2621,14 @@ class FinalOverlayPanel(QWidget):
 
             color = tuple(c / 255.0 for c in self._colors.get(name, (200, 200, 200)))
 
-            plotter.add_mesh(
+            fill_actor = plotter.add_mesh(
                 mesh,
                 color=color,
-                opacity=min(0.9, max(0.2, self._alpha + 0.15)),
+                opacity=seg_base_opacity,
                 smooth_shading=True,
                 name=f'{name}_{idx}',
             )
+            actors = [fill_actor]
             try:
                 edges = mesh.extract_feature_edges(
                     boundary_edges=True,
@@ -2637,15 +2637,25 @@ class FinalOverlayPanel(QWidget):
                     non_manifold_edges=False,
                 )
                 if edges.n_points > 0:
-                    plotter.add_mesh(
+                    edge_actor = plotter.add_mesh(
                         edges,
                         color=color,
                         line_width=max(1.2, self._lw),
                         opacity=0.95,
+                        name=f'{name}_edge_{idx}',
                     )
+                    actors.append(edge_actor)
             except Exception:
                 pass
 
+            # Visibilite initiale heritee du panneau 2D.
+            visible = bool(self._vis.get(name, True))
+            for a in actors:
+                try:
+                    a.SetVisibility(visible)
+                except Exception:
+                    pass
+            seg_actors[name] = actors
             added_meshes += 1
 
         if added_meshes == 0:
@@ -2784,6 +2794,9 @@ class FinalOverlayPanel(QWidget):
                 pointa=(0.03, 0.13), pointb=(0.27, 0.13),
                 color='#8fa5cc', style='modern')
 
+        # ── Gestionnaire de calques : visibilite (oeil) + opacite globale ──
+        self._add_layer_manager_3d(plotter, seg_actors, seg_base_opacity)
+
         plotter.enable_parallel_projection()
         title = 'Overlay 3D recale'
         if stent_added:
@@ -2820,6 +2833,73 @@ class FinalOverlayPanel(QWidget):
             pass
         plotter.add_key_event('r', lambda: _reset_view())
         plotter.show(title='Vue 3D - Overlay recale', auto_close=True)
+
+    def _add_layer_manager_3d(self, plotter, seg_actors, base_opacity):
+        """Gestionnaire de calques dans la vue 3D : un bouton oeil colore par
+        structure (afficher/masquer) + un slider d'opacite globale. Minimaliste,
+        ancre dans la fenetre de rendu sans surcharger la zone anatomique.
+        """
+        if not seg_actors:
+            return
+
+        # En-tete discret.
+        try:
+            plotter.add_text('CALQUES', position=(14, 868), font_size=10,
+                             color='#8fa5cc', name='layers_hdr')
+        except Exception:
+            pass
+
+        # Un bouton-case colore par structure, empile en haut a gauche.
+        y0, dy = 838, 30
+        for i, (name, actors) in enumerate(seg_actors.items()):
+            rgb = self._colors.get(name, (200, 200, 200))
+            hexcol = '#%02x%02x%02x' % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+            def _make_toggle(actor_list):
+                def _toggle(state):
+                    for a in actor_list:
+                        try:
+                            a.SetVisibility(bool(state))
+                        except Exception:
+                            pass
+                    plotter.render()
+                return _toggle
+
+            yi = y0 - i * dy
+            if yi < 150:        # evite de chevaucher les sliders du bas
+                break
+            try:
+                plotter.add_checkbox_button_widget(
+                    _make_toggle(actors), value=bool(self._vis.get(name, True)),
+                    position=(14, yi), size=20,
+                    color_on=hexcol, color_off='#2d3250', border_size=1)
+                plotter.add_text(str(name), position=(42, yi + 2),
+                                 font_size=9, color='#cdd5e8', name=f'layer_lbl_{i}')
+            except Exception:
+                pass
+
+        # Slider d'opacite globale des segmentations (bas centre, vert medical).
+        def _set_seg_opacity(val):
+            for actors in seg_actors.values():
+                for a in actors:
+                    try:
+                        a.GetProperty().SetOpacity(float(val))
+                    except Exception:
+                        pass
+            plotter.render()
+
+        try:
+            plotter.add_slider_widget(
+                _set_seg_opacity, rng=[0.1, 1.0], value=float(base_opacity),
+                title='Opacite segmentations',
+                pointa=(0.36, 0.13), pointb=(0.64, 0.13),
+                color='#2ecc7a', style='modern', event_type='always')
+        except TypeError:
+            plotter.add_slider_widget(
+                _set_seg_opacity, rng=[0.1, 1.0], value=float(base_opacity),
+                title='Opacite segmentations',
+                pointa=(0.36, 0.13), pointb=(0.64, 0.13),
+                color='#2ecc7a', style='modern')
 
     def _add_dim_bracket(self, plotter, pv, p_a, p_b, label, color, name_prefix, side,
                          line_width=4, tick_factor=0.014, label_offset_z=4.0):

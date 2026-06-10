@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         self._ms_world = {}              # {'hinge1','hinge2','ms'} -> np.array world mm
         self._ms_click_target = None     # nom du prochain point à capturer
         self._build_ui()
+        self._build_menu_bar()
         self._on_drr_preset_changed(self.cb_drr_preset.currentIndex())
         self._load_yolo_default()  # Charger modèle auto au démarrage
         self._status('Deposez vos fichiers pour commencer')
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(scroll_content)
         left_vbox.addWidget(scroll, 1)
         root.addWidget(left_outer)
+        self._left_outer = left_outer   # reference pour le dock (afficher/masquer)
 
         ll = self._ll   # shorthand
 
@@ -815,6 +817,11 @@ class MainWindow(QMainWindow):
             cv.set_tool('pencil'); cv.set_active('vertebrae')
 
         root.addWidget(self.tabs, 1)
+
+        # Dock lateral d'icones a l'extreme gauche (ouvre/ferme des panneaux).
+        self._build_tool_dock()
+        root.insertWidget(0, self._tool_dock)
+
         self._busy_overlay = BusyOverlay(cw)
         self._busy_overlay.setGeometry(cw.rect())
         self.setStatusBar(QStatusBar())
@@ -856,6 +863,112 @@ class MainWindow(QMainWindow):
         
         l.addWidget(cv, 1)
         return w
+
+    # ── Barre de menus + dock lateral (refonte "Photoshop medical") ────────────
+
+    def _build_menu_bar(self):
+        """Barre de menus standardisee, sobre, cablee aux actions existantes."""
+        mb = self.menuBar()
+        mb.setStyleSheet(
+            f'QMenuBar{{background:{PANEL_BG};color:{TEXT};border-bottom:1px solid {BORDER};'
+            f'padding:2px 4px;}}'
+            f'QMenuBar::item{{background:transparent;padding:5px 12px;border-radius:4px;}}'
+            f'QMenuBar::item:selected{{background:{CARD_BG};color:{ACCENT};}}'
+            f'QMenu{{background:{PANEL_BG};color:{TEXT};border:1px solid {BORDER2};padding:4px;}}'
+            f'QMenu::item{{padding:6px 24px 6px 14px;border-radius:4px;}}'
+            f'QMenu::item:selected{{background:{CARD_BG};color:{ACCENT};}}'
+            f'QMenu::separator{{height:1px;background:{BORDER};margin:4px 8px;}}'
+        )
+
+        # Fichier
+        m_file = mb.addMenu('Fichier')
+        m_file.addAction('Ouvrir des fichiers...', self._on_browse)
+        m_file.addAction('Parcourir...', self._on_browse)
+        m_file.addSeparator()
+        m_file.addAction('Exporter les masques', self._export_totalseg_masks)
+        m_file.addAction('Sauvegarder l\'iteration', self._save_iteration)
+        m_file.addSeparator()
+        m_file.addAction('Quitter', self.close)
+
+        # Edition
+        m_edit = mb.addMenu('Edition')
+        m_edit.addAction('Annuler', self._undo)
+        m_edit.addAction('Effacer les annotations', self._clear_all)
+
+        # Outils
+        m_tools = mb.addMenu('Outils')
+        m_tools.addAction('Segmentation (TotalSegmentator)', self._run_totalseg)
+        m_tools.addAction('Pipeline automatique', self._run_auto_pipeline)
+
+        # Affichage : navigation entre les onglets + sidebar
+        m_view = mb.addMenu('Affichage')
+        tab_names = ['Image fixe', 'Image mobile', 'Segmentation CT',
+                     'Resultat', 'Overlay']
+        for i, label in enumerate(tab_names):
+            m_view.addAction(label, lambda _=False, idx=i: self.tabs.setCurrentIndex(idx))
+        m_view.addSeparator()
+        m_view.addAction('Afficher / masquer le panneau lateral',
+                         self._toggle_sidebar)
+
+        # Fenetres : vues 3D
+        m_win = mb.addMenu('Fenetres')
+        m_win.addAction('Vue 3D segmentation CT', self._open_segmentation_3d)
+        m_win.addAction('Vue 3D overlay recale',
+                        lambda: self.overlay_panel._open_3d_view())
+
+        # Aide
+        m_help = mb.addMenu('Aide')
+        m_help.addAction('A propos', self._show_about)
+
+    def _toggle_sidebar(self):
+        if hasattr(self, '_left_outer'):
+            # isHidden() reflete l'etat explicite (independant des ancetres).
+            self._left_outer.setVisible(self._left_outer.isHidden())
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, 'A propos',
+            '2D/3D Registration\n\n'
+            'Visualisation et recalage 2D/3D pour la planification TAVI.\n'
+            'Proof of Concept clinique.')
+
+    # Chemins d'icones Material (flat, monochrome, viewBox 0 0 24 24)
+    _ICON_PANEL = 'M3 5h18v2H3V5m0 6h18v2H3v-2m0 6h12v2H3v-2z'
+
+    def _build_tool_dock(self):
+        """Dock lateral minimaliste : juste le toggle sidebar. Navigation via menu."""
+        dock = QWidget()
+        dock.setFixedWidth(52)
+        dock.setStyleSheet(f'background:{DARK_BG};border-right:1px solid {BORDER};')
+        v = QVBoxLayout(dock)
+        v.setContentsMargins(6, 8, 6, 8)
+        v.setSpacing(6)
+
+        def _tool_btn(path_d, tip, slot):
+            b = QPushButton()
+            ic = _make_svg_icon(path_d, color=TEXT_MID, size=22)
+            if ic is not None:
+                b.setIcon(ic)
+                b.setIconSize(QSize(22, 22))
+            else:
+                b.setText(tip[:1])
+            b.setToolTip(tip)
+            b.setFixedSize(40, 40)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                f'QPushButton{{background:transparent;border:none;border-radius:8px;}}'
+                f'QPushButton:hover{{background:{CARD_BG};}}'
+                f'QPushButton:pressed{{background:{BORDER2};}}'
+            )
+            b.clicked.connect(slot)
+            v.addWidget(b)
+            return b
+
+        _tool_btn(self._ICON_PANEL, 'Afficher / masquer le panneau lateral',
+                  self._toggle_sidebar)
+        v.addStretch()
+
+        self._tool_dock = dock
 
     # ── Slots UI ──────────────────────────────────────────────────────────────
 
