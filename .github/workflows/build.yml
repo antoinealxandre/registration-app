@@ -26,11 +26,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install opencv-python-headless pyinstaller
 
       - name: Build .exe with PyInstaller
         run: |
-          pyinstaller registration_app.spec
+          pyinstaller registration_app.spec --clean
 
       - name: Zip the .exe
         run: |
@@ -41,5 +41,7 @@ jobs:
         with:
           files: RegistrationApp_${{ github.ref_name }}_win64.zip
           prerelease: true
+          make_latest: false
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
