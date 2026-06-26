@@ -1,13 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+CV2_PATH = "C:\\Users\\antoi\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\cv2"
+
 block_cipher = None
 
 a = Analysis(
     ['registration_app/app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[
+        (CV2_PATH, 'cv2'),
+    ],
+    hiddenimports=[
+        'cv2',
+        'cv2.cv2',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -38,7 +45,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
-hiddenimports=[
-    'cv2',
-],
