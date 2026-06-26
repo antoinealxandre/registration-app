@@ -67,6 +67,41 @@ MEDICAL_COLORS = {
 
 VERTEBRA_COLOR = (226, 202, 134)
 
+_CSV_COLOR_OVERRIDE: dict = {}
+
+
+def set_csv_colors(colors: dict) -> None:
+    """Enregistre les couleurs issues d'un NRRD/CSV Slicer (efface si dict vide)."""
+    global _CSV_COLOR_OVERRIDE
+    _CSV_COLOR_OVERRIDE = {str(k).lower().strip(): tuple(v) for k, v in colors.items()}
+
+
+def color_for_structure(name: str) -> tuple:
+    """Couleur (R,G,B) STABLE et DISTINCTE pour une structure, identique partout.
+
+    Priorite : couleurs NRRD/CSV chargees > MEDICAL_COLORS > hash FNV-1a.
+    """
+    import colorsys
+    key = str(name).lower().strip()
+    if key in _CSV_COLOR_OVERRIDE:
+        return _CSV_COLOR_OVERRIDE[key]
+    if key in MEDICAL_COLORS:
+        return MEDICAL_COLORS[key]
+    if 'vertebra' in key or 'vertebr' in key:
+        return VERTEBRA_COLOR
+    if 'lung' in key:
+        return (172, 138, 115)
+    # FNV-1a : melange fortement meme pour des chaines tres proches.
+    h = 2166136261
+    for ch in key:
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    # Teinte etalee sur tout le cercle via un multiplicateur de Knuth.
+    hue = ((h * 2654435761) & 0xFFFFFFFF) / 4294967296.0
+    sat = 0.60 + ((h >> 9) % 28) / 100.0     # 0.60 .. 0.87
+    val = 0.82 + ((h >> 17) % 16) / 100.0    # 0.82 .. 0.97
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
 STYLE = f"""
 QMainWindow,QWidget{{background:{DARK_BG};color:{TEXT};font-family:'Segoe UI',sans-serif;font-size:12px;}}
 QScrollArea{{background:transparent;border:none;}}

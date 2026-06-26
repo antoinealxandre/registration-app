@@ -1,13 +1,36 @@
-"""Application launcher.
-
-Run this file to start the 2D/3D registration UI.
-"""
+# Copyright 2026 Antoine Alexandre, Hospices Civils de Lyon (HCL)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import sys
+import types
+
+
+def _patch_vtk_matplotlib():
+
+    name = 'vtkmodules.vtkRenderingMatplotlib'
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)
+    except ImportError:
+        sys.modules[name] = types.ModuleType(name)
+
+
+_patch_vtk_matplotlib()
 
 from ui.main_window import main
 
 
 if __name__ == '__main__':
     sys.exit(main())
-    

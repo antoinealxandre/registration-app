@@ -1,5 +1,6 @@
 ﻿"""Reusable annotation widgets and visualization panels."""
 
+import math
 import numpy as np
 import cv2
 
@@ -355,9 +356,9 @@ class BusyOverlay(QWidget):
         self._panel.setFixedSize(420, 140)
         self._panel.setStyleSheet(
             'QFrame{'
-            'border-radius:16px;'
-            'border:none;'
-            'background:qlineargradient(y1:0, y2:1, stop:0 rgba(25, 32, 48, 0.92), stop:1 rgba(16, 20, 30, 0.88));'
+            'border-radius:14px;'
+            'border:1px solid #1e2235;'
+            'background:#12151f;'
             '}'
         )
         shadow = QGraphicsDropShadowEffect(self._panel)
@@ -400,10 +401,7 @@ class BusyOverlay(QWidget):
             '}'
             'QProgressBar::chunk{'
             'border-radius:3px;'
-            'background:qlineargradient(x1:0, y1:0.5, x2:1, y2:0.5, '
-            'stop:0 rgba(0, 59, 87, 1), '
-            'stop:0.5 rgba(0, 212, 255, 0.98), '
-            'stop:1 rgba(0, 227, 163, 1));'
+            'background:#2ecc7a;'
             'margin:0px;'
             '}'
         )
@@ -490,6 +488,8 @@ class BusyOverlay(QWidget):
 class AnnotationCanvas(QLabel):
     mask_updated = pyqtSignal()
     wheel_scrolled = pyqtSignal(int)
+    stent_pose_changed = pyqtSignal(float, float, float)
+    point_picked = pyqtSignal(str, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -515,8 +515,25 @@ class AnnotationCanvas(QLabel):
         self._rect_cur   = None
         self._cursor_pos = None
         self._alpha      = 0.40
+        self._overlay_mask = None
+        self._overlay_color = (255, 200, 80)
+        self._overlay_alpha = 0.35
+        self._overlay_lw = 2
+        self._stent_mode_active = False
+        self._stent_center = None
+        self._stent_axis_deg = 0.0
+        self._stent_axis_len = None
+        self._stent_drag_mode = None
+        self._stent_drag_offset = None
+        self._stent_handle_radius = 12
+        self._tool_before_stent = None
+        self._pick_mode = None              # nom du point en attente de capture
+        self._point_markers = {}            # name -> {'xy', 'color', 'label'}
 
     # ── API ───────────────────────────────────────────────────────────────────
+
+    def image_size(self) -> int:
+        return int(self._size)
 
     def set_image(self, img: np.ndarray, preserve_masks: bool = False):
         if img is None:
@@ -565,6 +582,79 @@ class AnnotationCanvas(QLabel):
                 self._history[k] = []
         self._raw_pts=[]; self._poly_pts=[]
         self._refresh()
+
+    def set_overlay(self, mask: np.ndarray, color=(255, 200, 80), alpha: float = 0.35, line_width: int = 2):
+        if mask is None:
+            self._overlay_mask = None
+        else:
+            self._overlay_mask = mask.astype(np.float32)
+        self._overlay_color = tuple(int(v) for v in color)
+        self._overlay_alpha = float(alpha)
+        self._overlay_lw = int(max(1, line_width))
+        self._refresh()
+
+    def clear_overlay(self):
+        self._overlay_mask = None
+        self._refresh()
+
+    def set_stent_mode(self, active: bool):
+        if self._stent_mode_active == active:
+            return
+        self._stent_mode_active = active
+        if active:
+            self._tool_before_stent = self._tool
+            self.setCursor(QCursor(Qt.OpenHandCursor))
+        else:
+            if self._tool_before_stent:
+                self.set_tool(self._tool_before_stent)
+                self._tool_before_stent = None
+            else:
+                self.setCursor(QCursor(Qt.CrossCursor))
+        self._refresh()
+
+    def set_stent_pose(self, center_px=None, axis_deg=None):
+        if center_px is not None:
+            self._stent_center = (float(center_px[0]), float(center_px[1]))
+        if axis_deg is not None:
+            self._stent_axis_deg = float(axis_deg)
+        self._refresh()
+
+    def set_stent_axis_length_px(self, length_px):
+        self._stent_axis_len = None if length_px is None else float(length_px)
+        self._refresh()
+
+    def stent_pose(self):
+        return self._stent_center, float(self._stent_axis_deg)
+
+    def arm_pick(self, name: str):
+        """Arme la capture du prochain clic gauche pour le point ``name``."""
+        self._pick_mode = name
+        self.setCursor(QCursor(Qt.CrossCursor))
+
+    def disarm_pick(self):
+        self._pick_mode = None
+        if not self._stent_mode_active:
+            self.setCursor(QCursor(Qt.BlankCursor if self._tool == 'eraser' else Qt.CrossCursor))
+
+    def set_point_marker(self, name: str, xy, color=(80, 200, 255), label=None):
+        """Affiche/efface un marqueur ponctuel (ex: cusp NCC) sur l'image."""
+        if xy is None:
+            self._point_markers.pop(name, None)
+        else:
+            self._point_markers[name] = {
+                'xy': (float(xy[0]), float(xy[1])),
+                'color': tuple(int(c) for c in color),
+                'label': str(label or name),
+            }
+        self._refresh()
+
+    def clear_point_markers(self):
+        self._point_markers = {}
+        self._refresh()
+
+    def get_point_marker(self, name: str):
+        m = self._point_markers.get(name)
+        return None if m is None else m['xy']
 
     def set_tool(self, t):
         self._tool=t; self._raw_pts=[]; self._poly_pts=[]
@@ -634,6 +724,24 @@ class AnnotationCanvas(QLabel):
             h=self._history[self._active]; h.append(m.copy())
             if len(h)>30: h.pop(0)
 
+    def _emit_stent_pose(self):
+        if self._stent_center is None:
+            return
+        self.stent_pose_changed.emit(
+            float(self._stent_center[0]),
+            float(self._stent_center[1]),
+            float(self._stent_axis_deg),
+        )
+
+    def _update_stent_axis_from_point(self, ix: int, iy: int) -> None:
+        if self._stent_center is None:
+            return
+        dx = ix - self._stent_center[0]
+        dy = iy - self._stent_center[1]
+        if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+            return
+        self._stent_axis_deg = math.degrees(math.atan2(-dy, dx))
+
     def _m(self): return self._masks[self._active]
 
     # ── Dessin ────────────────────────────────────────────────────────────────
@@ -697,6 +805,46 @@ class AnnotationCanvas(QLabel):
         base=np.clip(base,0,255).astype(np.uint8)
         r,g,b=STRUCT[self._active]['rgb']
 
+        if self._overlay_mask is not None and self._overlay_mask.sum() > 0:
+            om = self._overlay_mask
+            if om.shape != (self._size, self._size):
+                om = cv2.resize(om.astype(np.float32), (self._size, self._size), interpolation=cv2.INTER_NEAREST)
+            binary = (om > 0.5).astype(np.uint8)
+            if binary.sum() > 0:
+                or_, og, ob = self._overlay_color
+                ov = base.copy()
+                ov[binary > 0] = [or_, og, ob]
+                base = cv2.addWeighted(base, 1 - self._overlay_alpha, ov, self._overlay_alpha, 0)
+                cnts, _ = cv2.findContours(binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                cv2.drawContours(base, cnts, -1, (or_, og, ob), self._overlay_lw, lineType=cv2.LINE_AA)
+
+        if self._stent_center is not None:
+            cx = int(round(self._stent_center[0]))
+            cy = int(round(self._stent_center[1]))
+            axis_len = self._stent_axis_len
+            if axis_len is None:
+                axis_len = max(60, int(self._size * 0.2))
+            half = int(round(axis_len * 0.5))
+            ang = math.radians(self._stent_axis_deg)
+            dx = int(round(math.cos(ang) * half))
+            dy = int(round(-math.sin(ang) * half))
+            p1 = (cx - dx, cy - dy)
+            p2 = (cx + dx, cy + dy)
+            cv2.line(base, p1, p2, (80, 200, 255), 2, lineType=cv2.LINE_AA)
+            cv2.circle(base, (cx, cy), 6, (80, 200, 255), -1, lineType=cv2.LINE_AA)
+            cv2.circle(base, (cx, cy), self._stent_handle_radius, (80, 200, 255), 1, lineType=cv2.LINE_AA)
+
+        # ── Marqueurs ponctuels (cusp NCC, etc.) ────────────────────────────
+        for nm, info in self._point_markers.items():
+            x, y = int(round(info['xy'][0])), int(round(info['xy'][1]))
+            col = info['color']
+            cv2.drawMarker(base, (x, y), col, cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+            cv2.circle(base, (x, y), 7, col, 2, cv2.LINE_AA)
+            lbl = info['label']
+            if lbl:
+                cv2.putText(base, lbl, (x + 10, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+
         # ── Preview crayon : tracé lissé en temps réel ────────────────────────
         if self._tool=='pencil' and len(self._raw_pts)>=2:
             smooth=catmull_rom_chain(self._raw_pts,n_interp=6)
@@ -755,6 +903,32 @@ class AnnotationCanvas(QLabel):
     def mousePressEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y())
+        if self._pick_mode and e.button() == Qt.LeftButton:
+            name = self._pick_mode
+            self._pick_mode = None
+            self.point_picked.emit(name, float(ix), float(iy))
+            self._refresh()
+            return
+        if self._stent_mode_active:
+            if e.button() != Qt.LeftButton:
+                return
+            if self._stent_center is None:
+                self._stent_center = (ix, iy)
+                self._stent_drag_mode = 'axis'
+                self._update_stent_axis_from_point(ix, iy)
+            else:
+                dx = ix - self._stent_center[0]
+                dy = iy - self._stent_center[1]
+                if math.hypot(dx, dy) <= self._stent_handle_radius:
+                    self._stent_drag_mode = 'center'
+                    self._stent_drag_offset = (self._stent_center[0] - ix, self._stent_center[1] - iy)
+                else:
+                    self._stent_drag_mode = 'axis'
+                    self._update_stent_axis_from_point(ix, iy)
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            self._emit_stent_pose()
+            self._refresh()
+            return
         if self._tool=='pencil':
             if e.button() != Qt.LeftButton:
                 return
@@ -786,6 +960,17 @@ class AnnotationCanvas(QLabel):
     def mouseMoveEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y()); self._cursor_pos=(ix,iy)
+        if self._stent_mode_active:
+            if self._stent_drag_mode == 'center':
+                off = self._stent_drag_offset or (0.0, 0.0)
+                self._stent_center = (ix + off[0], iy + off[1])
+                self._emit_stent_pose()
+                self._refresh()
+            elif self._stent_drag_mode == 'axis':
+                self._update_stent_axis_from_point(ix, iy)
+                self._emit_stent_pose()
+                self._refresh()
+            return
         if self._tool=='pencil' and self._drawing:
             if not self._raw_pts or abs(ix-self._raw_pts[-1][0])>1 or abs(iy-self._raw_pts[-1][1])>1:
                 self._raw_pts.append((ix,iy))
@@ -800,6 +985,13 @@ class AnnotationCanvas(QLabel):
     def mouseReleaseEvent(self,e):
         if self._img_np is None: return
         ix,iy=self._w2i(e.x(),e.y())
+        if self._stent_mode_active:
+            if self._stent_drag_mode is not None:
+                self._stent_drag_mode = None
+                self._stent_drag_offset = None
+                self.setCursor(QCursor(Qt.OpenHandCursor))
+                self._refresh()
+            return
         if self._tool=='pencil' and self._drawing:
             self._drawing=False
             if (ix,iy) not in self._raw_pts: self._raw_pts.append((ix,iy))
@@ -825,6 +1017,7 @@ class SegmentationReviewPanel(QWidget):
     """Segmentation panel: axial/coronal/sagittal + external 3D window."""
 
     request_3d_view = pyqtSignal()
+    view_clicked = pyqtSignal(str, float, float, int)   # plane, col, row, slice_idx
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -838,6 +1031,10 @@ class SegmentationReviewPanel(QWidget):
         self._hi = 1000.0
         self._struct_checks = {}
         self._struct_order = {}
+        self._click_mode = None             # nom du point à capturer (ou None)
+        self._markers = {}                  # name -> {'voxel': (x,y,z), 'color': rgb, 'label': str}
+        self._view_fit = {}                 # plane -> {'x0','y0','nw','nh','ow','oh'}
+        self._zoom = 1.0                    # facteur de zoom (CTRL+molette dans les vues)
         self._build_ui()
 
     def _build_ui(self):
@@ -1175,26 +1372,179 @@ class SegmentationReviewPanel(QWidget):
             cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             cv2.drawContours(rgb, cnts, -1, color, 1, lineType=cv2.LINE_AA)
 
+        self._draw_markers_on(rgb, plane, idx)
         return np.ascontiguousarray(rgb)
 
-    def _fit_to_label(self, rgb, lbl):
+    def _get_marker_data(self, plane, slice_idx):
+        """Retourne les données de marqueurs (sans appliquer l'échelle de zoom)."""
+        if not self._markers or self._ct_vol is None:
+            return {}, {}
+        from core.measurements import view_pixel_from_voxel
+        vol_shape = self._ct_vol.shape
+
+        # Calculer les pixel coords et ms_length une fois
+        pix = {}
+        for name, m in self._markers.items():
+            col, row, native_idx = view_pixel_from_voxel(plane, m['voxel'], vol_shape)
+            cx, cy = int(round(col)), int(round(row))
+            pix[name] = {'xy': (cx, cy), 'native': native_idx,
+                         'color': tuple(int(c) for c in m['color']),
+                         'label': m['label']}
+
+        # Pré-calculer les valeurs en mm (utilisées plus tard)
+        ms_info = {}
+        if 'hinge1' in pix and 'hinge2' in pix and 'ms' in pix:
+            h1w = self._markers['hinge1'].get('world_mm')
+            h2w = self._markers['hinge2'].get('world_mm')
+            msw = self._markers['ms'].get('world_mm')
+            if h1w is not None and h2w is not None and msw is not None:
+                from core.measurements import ms_length_from_hinges
+                mm = ms_length_from_hinges(h1w, h2w, msw)
+                ms_info['mm'] = mm
+                ms_info['hinge1_xy'] = pix['hinge1']['xy']
+                ms_info['hinge2_xy'] = pix['hinge2']['xy']
+                ms_info['ms_xy'] = pix['ms']['xy']
+
+        return pix, ms_info
+
+    def _draw_markers_on(self, rgb, plane, slice_idx):
+        """Dessine les segments TAVI (ligne annulaire, MS) sur la coupe AVANT le zoom."""
+        pix, ms_info = self._get_marker_data(plane, slice_idx)
+        if not pix:
+            return
+
+        r_h, r_w = rgb.shape[:2]
+        pix = {k: v for k, v in pix.items() if 0 <= v['xy'][0] < r_w and 0 <= v['xy'][1] < r_h}
+
+        # ── Ligne annulaire (cyan) + segment MS perpendiculaire (rouge) ─
+        if 'hinge1' in pix and 'hinge2' in pix:
+            p1 = pix['hinge1']['xy']; p2 = pix['hinge2']['xy']
+            cv2.line(rgb, p1, p2, (90, 220, 240), 1, cv2.LINE_AA)
+            if 'ms' in pix and ms_info.get('mm') is not None:
+                pm = pix['ms']['xy']
+                p1v = np.asarray(p1, dtype=np.float64); p2v = np.asarray(p2, dtype=np.float64)
+                pmv = np.asarray(pm, dtype=np.float64)
+                axis = p2v - p1v
+                n = float(np.linalg.norm(axis))
+                if n > 1e-6:
+                    u = axis / n
+                    proj = p1v + np.dot(pmv - p1v, u) * u
+                    proj_xy = (int(round(proj[0])), int(round(proj[1])))
+                    cv2.arrowedLine(rgb, proj_xy, pm, (90, 90, 255), 2, cv2.LINE_AA, tipLength=0.18)
+
+    def _draw_markers_overlay(self, canvas, plane, slice_idx, fit):
+        """Dessine les marqueurs et labels APRÈS le zoom, à taille fixe (en pixels canvas)."""
+        if fit is None or fit['nw'] <= 0 or fit['nh'] <= 0:
+            return
+
+        pix, ms_info = self._get_marker_data(plane, slice_idx)
+        if not pix:
+            return
+
+        # Remapper les coordonnées d'origine à l'espace du canvas après zoom
+        x0, y0, nw, nh = fit['x0'], fit['y0'], fit['nw'], fit['nh']
+        ow, oh = fit['ow'], fit['oh']
+
+        # ── Segment MS avec label en mm (à taille fixe) ────────────────────────
+        if ms_info.get('mm') is not None and 'hinge1' in pix and 'hinge2' in pix and 'ms' in pix:
+            p1 = np.asarray(pix['hinge1']['xy'], dtype=np.float64)
+            p2 = np.asarray(pix['hinge2']['xy'], dtype=np.float64)
+            pm = np.asarray(pix['ms']['xy'], dtype=np.float64)
+
+            axis = p2 - p1
+            n_axis = float(np.linalg.norm(axis))
+            if n_axis > 1e-6:
+                u = axis / n_axis
+                proj = p1 + np.dot(pm - p1, u) * u
+
+                # Transformer aux coords canvas
+                proj_c = np.array([x0 + (proj[0] * nw) / ow, y0 + (proj[1] * nh) / oh])
+                pm_c = np.array([x0 + (pm[0] * nw) / ow, y0 + (pm[1] * nh) / oh])
+
+                proj_xy = tuple(int(round(c)) for c in proj_c)
+                pm_xy = tuple(int(round(c)) for c in pm_c)
+
+                # Vérifier les limites du canvas
+                h_c, w_c = canvas.shape[:2]
+                if (0 <= proj_xy[0] < w_c and 0 <= proj_xy[1] < h_c and
+                    0 <= pm_xy[0] < w_c and 0 <= pm_xy[1] < h_c):
+                    cv2.arrowedLine(canvas, proj_xy, pm_xy, (90, 90, 255), 2, cv2.LINE_AA, tipLength=0.18)
+                    mid = ((proj_xy[0] + pm_xy[0]) // 2 + 6, (proj_xy[1] + pm_xy[1]) // 2)
+                    if 0 <= mid[0] < w_c and 0 <= mid[1] < h_c:
+                        cv2.putText(canvas, f'MS={ms_info["mm"]:.2f}mm', mid,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2, cv2.LINE_AA)
+                        cv2.putText(canvas, f'MS={ms_info["mm"]:.2f}mm', mid,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 255), 1, cv2.LINE_AA)
+
+        # ── Marqueurs à taille fixe (points + croix + halo + label) ────────────
+        h_c, w_c = canvas.shape[:2]
+        for name, info in pix.items():
+            cx_orig, cy_orig = info['xy']
+            native_idx = info['native']
+            on_slice = abs(native_idx - slice_idx) <= 1
+
+            # Transformer aux coords canvas (appliquer zoom via fit)
+            cx_c = x0 + (cx_orig * nw) / ow
+            cy_c = y0 + (cy_orig * nh) / oh
+
+            if not (0 <= cx_c < w_c and 0 <= cy_c < h_c):
+                continue
+
+            cx_c = int(round(cx_c))
+            cy_c = int(round(cy_c))
+            color = info['color']
+
+            if on_slice:
+                cv2.circle(canvas, (cx_c, cy_c), 7, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.drawMarker(canvas, (cx_c, cy_c), color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+                cv2.circle(canvas, (cx_c, cy_c), 6, color, 2, cv2.LINE_AA)
+                cv2.putText(canvas, info['label'], (cx_c + 8, cy_c - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(canvas, info['label'], (cx_c + 8, cy_c - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+            else:
+                overlay = canvas.copy()
+                cv2.circle(overlay, (cx_c, cy_c), 4, color, -1, cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.5, canvas, 0.5, 0, dst=canvas)
+
+    def _fit_to_label(self, rgb, lbl, plane=None, slice_idx=None):
         lh = max(96, lbl.height())
         lw = max(96, lbl.width())
         h, w = rgb.shape[:2]
         if h <= 0 or w <= 0:
-            return np.zeros((lh, lw, 3), dtype=np.uint8)
-        s = min(lw / float(w), lh / float(h))
+            return np.zeros((lh, lw, 3), dtype=np.uint8), None
+        s = min(lw / float(w), lh / float(h)) * float(self._zoom)
         nw = max(1, int(round(w * s)))
         nh = max(1, int(round(h * s)))
         resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
         canvas = np.full((lh, lw, 3), 16, dtype=np.uint8)
         y0 = (lh - nh) // 2
         x0 = (lw - nw) // 2
-        canvas[y0:y0 + nh, x0:x0 + nw] = resized
-        return canvas
+        # Letterbox si zoom < seuil ; recadrage centre si l'image depasse le label
+        src_x0 = max(0, -x0); src_y0 = max(0, -y0)
+        src_x1 = min(nw, lw - x0); src_y1 = min(nh, lh - y0)
+        dst_x0 = max(0, x0); dst_y0 = max(0, y0)
+        if src_x1 > src_x0 and src_y1 > src_y0:
+            canvas[dst_y0:dst_y0 + (src_y1 - src_y0),
+                   dst_x0:dst_x0 + (src_x1 - src_x0)] = resized[src_y0:src_y1, src_x0:src_x1]
 
-    def _set_lbl_img(self, lbl, rgb):
-        img = self._fit_to_label(rgb, lbl)
+        fit = {'x0': x0, 'y0': y0, 'nw': nw, 'nh': nh, 'ow': w, 'oh': h}
+
+        # Dessiner les marqueurs à taille fixe APRÈS le zoom
+        if plane is not None and slice_idx is not None:
+            self._draw_markers_overlay(canvas, plane, slice_idx, fit)
+
+        # Indicateur de zoom (coin sup. gauche) si zoom != 1
+        if abs(self._zoom - 1.0) > 0.05:
+            cv2.putText(canvas, f'{self._zoom:.1f}x', (8, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
+
+        return canvas, fit
+
+    def _set_lbl_img(self, lbl, rgb, plane=None, slice_idx=None):
+        img, fit = self._fit_to_label(rgb, lbl, plane=plane, slice_idx=slice_idx)
+        if plane is not None and fit is not None:
+            self._view_fit[plane] = fit
         img = np.ascontiguousarray(img)
         h, w = img.shape[:2]
         qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
@@ -1207,9 +1557,9 @@ class SegmentationReviewPanel(QWidget):
             self._sa_view['label'].clear()
             return
 
-        self._set_lbl_img(self._ax_view['label'], self._render_plane('axial'))
-        self._set_lbl_img(self._co_view['label'], self._render_plane('coronal'))
-        self._set_lbl_img(self._sa_view['label'], self._render_plane('sagittal'))
+        self._set_lbl_img(self._ax_view['label'], self._render_plane('axial'), 'axial', self._ax_idx)
+        self._set_lbl_img(self._co_view['label'], self._render_plane('coronal'), 'coronal', self._co_idx)
+        self._set_lbl_img(self._sa_view['label'], self._render_plane('sagittal'), 'sagittal', self._sa_idx)
 
     def _step_slider(self, slider, steps):
         new_val = max(slider.minimum(), min(slider.maximum(), slider.value() + int(steps)))
@@ -1220,6 +1570,12 @@ class SegmentationReviewPanel(QWidget):
         if event.type() == QEvent.Wheel and self._ct_vol is not None:
             delta = event.angleDelta().y()
             if delta == 0:
+                return True
+            # CTRL + molette = zoom sur la coupe (toutes vues partagent le facteur)
+            if event.modifiers() & Qt.ControlModifier:
+                factor = 1.18 if delta > 0 else 1.0 / 1.18
+                self._zoom = max(0.5, min(8.0, self._zoom * factor))
+                self._render_all()
                 return True
             steps = int(delta / 120)
             if steps == 0:
@@ -1235,7 +1591,51 @@ class SegmentationReviewPanel(QWidget):
                 self._step_slider(self._sl_sa, steps)
                 return True
 
+        if (event.type() == QEvent.MouseButtonPress
+                and self._click_mode is not None
+                and event.button() == Qt.LeftButton
+                and self._ct_vol is not None):
+            plane = obj.property('plane')
+            if plane in ('axial', 'coronal', 'sagittal'):
+                fit = self._view_fit.get(plane)
+                if fit is None:
+                    return True
+                px = event.pos().x() - fit['x0']
+                py = event.pos().y() - fit['y0']
+                if 0 <= px < fit['nw'] and 0 <= py < fit['nh'] and fit['nw'] > 0 and fit['nh'] > 0:
+                    col = px * fit['ow'] / fit['nw']
+                    row = py * fit['oh'] / fit['nh']
+                    slice_idx = {'axial': self._ax_idx,
+                                 'coronal': self._co_idx,
+                                 'sagittal': self._sa_idx}[plane]
+                    self.view_clicked.emit(plane, float(col), float(row), int(slice_idx))
+                return True
+
         return super().eventFilter(obj, event)
+
+    # ── API marqueurs ─────────────────────────────────────────────────────────
+    def set_click_mode(self, mode):
+        """Active la capture du prochain clic gauche pour ce mode (ou None pour arrêter)."""
+        self._click_mode = mode
+        cursor = Qt.CrossCursor if mode else Qt.ArrowCursor
+        for v in (self._ax_view, self._co_view, self._sa_view):
+            v['label'].setCursor(QCursor(cursor))
+
+    def set_marker(self, name: str, voxel_xyz, color=(80, 200, 255), label=None, world_mm=None):
+        if voxel_xyz is None:
+            self._markers.pop(name, None)
+        else:
+            self._markers[name] = {
+                'voxel': tuple(int(round(v)) for v in voxel_xyz),
+                'color': tuple(int(c) for c in color),
+                'label': str(label or name),
+                'world_mm': None if world_mm is None else np.asarray(world_mm, dtype=np.float64),
+            }
+        self._render_all()
+
+    def clear_markers(self):
+        self._markers = {}
+        self._render_all()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -1248,10 +1648,7 @@ class ResultPanel(QWidget):
     """
     MODES = [
         ('Fusion',          'Opacité DRR',   50),
-        ('Damier',          'Taille tuile',  30),
-        ('Différence',      'Contraste ×',   30),
         ('Avant / Après',   'Position (%)',  50),
-        ('Cyan / Magenta',  '',               0),
     ]
 
     def __init__(self, parent=None):
@@ -1339,10 +1736,7 @@ class ResultPanel(QWidget):
         if has_slider: self._sl.setValue(pval)
         hints = {
             0: 'Fluoro ←→ image mobile recalée via opacité',
-            1: 'Tuiles alternées Fluoro / image mobile',
-            2: 'Carte |Fluoro − mobile| (chaud = grande erreur)',
-            3: 'Glisser le curseur pour balayer Fluoro vs mobile',
-            4: 'Rose=Fluoro · Vert=Mobile · Blanc=overlap',
+            1: 'Glisser le curseur pour balayer Fluoro vs mobile',
         }
         self._lbl_hint.setText(hints.get(idx, ''))
         self._render()
@@ -1372,26 +1766,8 @@ class ResultPanel(QWidget):
             blended = (1 - alpha) * a + alpha * b
             rgb = cv2.cvtColor((blended * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
 
-        # ── Mode 1 : Damier ───────────────────────────────────────────────────
-        elif self._mode == 1:
-            tile = max(4, 4 + p // 2)   # 4 .. 54 px
-            rows = (np.arange(h) // tile) % 2
-            cols = (np.arange(w) // tile) % 2
-            mask = (rows[:, None] ^ cols[None, :]).astype(bool)
-            a8 = (a * 255).astype(np.uint8); b8 = (b * 255).astype(np.uint8)
-            ra = cv2.cvtColor(a8, cv2.COLOR_GRAY2RGB)
-            rb = cv2.cvtColor(b8, cv2.COLOR_GRAY2RGB)
-            rgb = np.where(mask[:, :, None], ra, rb).astype(np.uint8)
-
-        # ── Mode 2 : Différence ───────────────────────────────────────────────
-        elif self._mode == 2:
-            gain = 1.0 + p / 20.0          # 1 .. 6 ×
-            diff = np.clip(np.abs(a - b) * gain, 0, 1)
-            bgr  = cv2.applyColorMap((diff * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
-            rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-        # ── Mode 3 : Avant / Après ────────────────────────────────────────────
-        elif self._mode == 3:
+        # ── Mode 1 : Avant / Après ────────────────────────────────────────────
+        else:
             split = max(1, int(w * p / 100.0))
             a8 = (a * 255).astype(np.uint8); b8 = (b * 255).astype(np.uint8)
             ra = cv2.cvtColor(a8, cv2.COLOR_GRAY2RGB)
@@ -1402,17 +1778,6 @@ class ResultPanel(QWidget):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 190, 255), 1)
             cv2.putText(rgb, 'DRR reg.', (min(w - 90, split + 6), 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 255, 190), 1)
-
-        # ── Mode 4 : Cyan / Magenta ───────────────────────────────────────────
-        else:
-            a8 = (a * 255).astype(np.uint8)
-            b8 = (b * 255).astype(np.uint8)
-            # Fluoro → Magenta (R + B),  DRR → Cyan (G + B)
-            # Overlap → Blanc (R+G+B)
-            r_ch = a8
-            g_ch = b8
-            b_ch = np.clip(a8.astype(np.uint16) + b8.astype(np.uint16), 0, 255).astype(np.uint8)
-            rgb = np.stack([r_ch, g_ch, b_ch], axis=2)
 
         # ── Contours superposés ───────────────────────────────────────────────
         if self._show_cnt:
@@ -1436,47 +1801,14 @@ class ResultPanel(QWidget):
 # Panneau final : Fluoroscopie + Segmentations 3D projetées et recalées
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Palette médicale par nom de structure
-_MEDICAL_COLORS = {
-    'myocardium':               (206, 110,  84),
-    'left atrium':              (203, 108,  81),
-    'left ventricle':           (152,  55,  13),
-    'left ventricle of heart':  (152,  55,  13),
-    'right atrium':             (210, 115,  89),
-    'right ventricle':          (181,  85,  57),
-    'right ventricle of heart': (181,  85,  57),
-    'aorta':                    (224,  97,  76),
-    'pulmonary artery':         (  0, 122, 171),
-    'pulmonary venous system':  (186,  77,  64),
-    'atrial_appendage_left':    (142, 192,  72),
-    'left atrial appendage':    (142, 192,  72),
-    'superior_vena_cava':       (115, 176, 130),
-    'superior vena cava':       (115, 176, 130),
-    'inferior vena cava':       (  0, 151, 206),
-    'heart':                    (206, 110,  84),
-    'spleen':                   (157, 108, 162),
-    'liver':                    (221, 130, 101),
-    'stomach':                  (216, 132, 105),
-    'esophagus':                (211, 171, 143),
-    'trachea':                  (182, 228, 255),
-    'portal/splenic vein':      (  0, 151, 206),
-}
+def _color_for_structure(name: str, index: int = 0) -> tuple:
+    """Couleur (R,G,B) stable d'une structure — delegue a theme.color_for_structure.
 
-_VERTEBRA_COLOR = (226, 202, 134)   # Jaune os pour les vertèbres
-
-
-def _color_for_structure(name: str, index: int) -> tuple:
-    """Retourne (R,G,B) pour une structure anatomique."""
-    key = name.lower().strip()
-    if key in _MEDICAL_COLORS:
-        return _MEDICAL_COLORS[key]
-    # Vertèbres : T6, T7, L1 … pattern
-    if 'vertebra' in key or 'vertebr' in key:
-        return _VERTEBRA_COLOR
-    # Poumons
-    if 'lung' in key:
-        return (172, 138, 115)
-    return _SEG_PALETTE[index % len(_SEG_PALETTE)]
+    L'argument ``index`` n'est conserve que pour compatibilite d'appel ; la
+    couleur ne depend que du NOM, pour rester identique dans toutes les vues.
+    """
+    from ui.theme import color_for_structure
+    return color_for_structure(name)
 
 
 class FinalOverlayPanel(QWidget):
@@ -1511,6 +1843,13 @@ class FinalOverlayPanel(QWidget):
         self._pan_x = self._pan_y = 0
         self._pan_active = False
         self._pan_start = None
+        # Données TAVI optionnelles affichées dans la vue 3D post-recalage
+        self._tavi_stent_pose = None        # dict {center_px, axis_deg, length_mm, diameter_mm, pix_mm}
+        self._tavi_ms_world = {}
+        self._tavi_ref_voxel = {}           # {'hinge1','hinge2','ms'} -> (vx, vy, vz) en coords voxel CT
+        self._tavi_ct_shape = None          # forme du volume CT (nx, ny, nz) pour la projection
+        self._tavi_id_mm = None
+        self._tavi_ms_length = None
         self._build_ui()
 
     # ── Construction UI ───────────────────────────────────────────────────────
@@ -1680,9 +2019,73 @@ class FinalOverlayPanel(QWidget):
         self._vis = {}
         self._colors = {}
         self._chks = {}
+        self._tavi_stent_pose = None
+        self._tavi_ms_world = {}
+        self._tavi_ref_voxel = {}
+        self._tavi_ct_shape = None
+        self._tavi_id_mm = None
+        self._tavi_ms_length = None
         self._rebuild_list()
         self._lbl_img.clear()
         self._lbl_info.setText('En attente de données…')
+
+    def set_tavi_overlay(self, stent_fluoro=None, ms_world=None, ref_voxel=None,
+                          ct_shape=None, id_mm=None, ms_length_mm=None):
+        """Injecte les donnees TAVI a afficher dans la vue 3D recalee.
+
+        stent_fluoro : dict {center_px, axis_deg, length_mm, diameter_mm, pix_mm} pose 2D fluoro.
+        ms_world     : reperes CT-monde (informatif, non rendu en 2D ici).
+        ref_voxel    : reperes en coordonnees voxel CT. Projetes localement via le
+                       MEME pipeline que les meshes de segmentation pour s'aligner
+                       parfaitement avec elles dans l'overlay 3D.
+        ct_shape     : forme (nx, ny, nz) du volume CT, utile pour la projection.
+        id_mm        : ID initial (distance ligne annulaire -> base du stent) ;
+                       recalcule en live quand on bouge la profondeur en 3D.
+        ms_length_mm : valeur affichee si hinge1/hinge2/MS valides.
+        """
+        self._tavi_stent_pose = stent_fluoro
+        self._tavi_ms_world = dict(ms_world or {})
+        self._tavi_ref_voxel = dict(ref_voxel or {})
+        self._tavi_ct_shape = tuple(ct_shape) if ct_shape is not None else None
+        self._tavi_id_mm = id_mm
+        self._tavi_ms_length = ms_length_mm
+
+    def _project_voxel_to_view(self, voxel_xyz, ct_shape, side):
+        """Projette un voxel CT vers le pixel canvas overlay (= meme pipeline que les meshes).
+
+        Pipeline identique a ``_volume_to_registered_mesh`` :
+          1) voxel (vx, vy, vz) -> coords plan DRR (axis 0 -> x, axis 2 -> y),
+          2) flip vertical (convention DRR),
+          3) fov_scale autour du centre,
+          4) recalage 2D (rigide + elastique),
+          5) mise a l'echelle vers le canvas fluoro (side / reg_size).
+        """
+        if ct_shape is None or len(ct_shape) < 3:
+            return None
+        nx, _, nz = int(ct_shape[0]), int(ct_shape[1]), int(ct_shape[2])
+        reg_size = float(self._reg_size)
+        vx, vy, vz = float(voxel_xyz[0]), float(voxel_xyz[1]), float(voxel_xyz[2])
+        x_plane = vx * ((reg_size - 1.0) / max(nx - 1, 1))
+        y_plane = vz * ((reg_size - 1.0) / max(nz - 1, 1))
+        y_plane = (reg_size - 1.0) - y_plane
+        # fov_scale (utilise la pleine forme du CT, pas le mask downsample)
+        fov = self._view_fov_mm
+        if fov is not None and float(fov) > 0 and self._ct_affine is not None:
+            try:
+                vx_aff = float(abs(self._ct_affine[0, 0]))
+                vz_aff = float(abs(self._ct_affine[2, 2]))
+                ct_span_mm = max(nx * vx_aff, nz * vz_aff, 1e-6)
+                fov_scale = float(np.clip(ct_span_mm / float(fov), 0.25, 4.0))
+                if abs(fov_scale - 1.0) > 0.02:
+                    c = reg_size * 0.5
+                    x_plane = c + (x_plane - c) * fov_scale
+                    y_plane = c + (y_plane - c) * fov_scale
+            except Exception:
+                pass
+        pts = np.array([[x_plane, y_plane]], dtype=np.float32)
+        pts = self._apply_registration_to_points(pts)
+        sf = float(side) / float(reg_size) if reg_size > 0 else 1.0
+        return float(pts[0, 0] * sf), float(pts[0, 1] * sf)
 
     def has_data(self):
         return self._fluoro is not None and self._result is not None and bool(self._proj_masks)
@@ -1828,7 +2231,10 @@ class FinalOverlayPanel(QWidget):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (r, g, b), 1, cv2.LINE_AA)
                 rgb = rgb_u8.astype(np.float32)
 
-        self._full_image = np.clip(rgb, 0, 255).astype(np.uint8)
+        rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+        # Geometrie TAVI (ligne annulaire, MS, base stent, ID) reportee en 2D.
+        self._draw_tavi_2d(rgb_u8, S)
+        self._full_image = rgb_u8
 
         # Zoom et pan
         h, w = self._full_image.shape[:2]
@@ -1850,6 +2256,92 @@ class FinalOverlayPanel(QWidget):
         h2, w2 = display.shape[:2]
         qi = QImage(display.data, w2, h2, w2 * 3, QImage.Format_RGB888)
         self._lbl_img.setPixmap(QPixmap.fromImage(qi).copy())
+
+    def _put_label_2d(self, img, text, pos, color):
+        """Petit label avec contour noir, taille fixe, a la position (px) donnee."""
+        x = int(round(pos[0])); y = int(round(pos[1]))
+        H, W = img.shape[:2]
+        x = max(2, min(W - 80, x)); y = max(12, min(H - 4, y))
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    def _draw_tavi_2d(self, img, side):
+        """Reporte la geometrie de la metrique MSID sur l'overlay 2D.
+
+        Ligne annulaire (hinge1-hinge2), cote MS perpendiculaire, extremites du
+        stent (points), base ventriculaire et cote ID perpendiculaire a la ligne
+        annulaire — avec fleches, segments, points et labels en mm. Cela rend la
+        geometrie du calcul verifiable a l'oeil, exactement comme en 3D.
+        """
+        refs = self._tavi_ref_voxel
+        if not refs or self._tavi_ct_shape is None:
+            return
+        H, W = img.shape[:2]
+
+        def ipt(p):
+            return (int(round(float(p[0]))), int(round(float(p[1]))))
+
+        def ok(p):
+            return -4 * side < p[0] < 4 * side and -4 * side < p[1] < 4 * side
+
+        proj = {}
+        for k in ('hinge1', 'hinge2', 'ms'):
+            if k in refs:
+                pp = self._project_voxel_to_view(refs[k], self._tavi_ct_shape, side)
+                if pp is not None and ok(pp):
+                    proj[k] = np.array([pp[0], pp[1]], dtype=np.float64)
+
+        h1 = proj.get('hinge1'); h2 = proj.get('hinge2'); ms = proj.get('ms')
+        pix_mm = self._tavi_pix_mm()
+
+        if h1 is not None and h2 is not None:
+            cv2.line(img, ipt(h1), ipt(h2), (90, 220, 240), 2, cv2.LINE_AA)
+            u = h2 - h1
+            nu = float(np.linalg.norm(u))
+            if nu > 1e-6:
+                u = u / nu
+                n = np.array([-u[1], u[0]])
+                # ── MS : perpendiculaire annulus -> MS (valeur = px projetes * pix_mm) ──
+                if ms is not None:
+                    foot = h1 + np.dot(ms - h1, u) * u
+                    if ok(foot):
+                        cv2.arrowedLine(img, ipt(foot), ipt(ms), (255, 90, 90), 2,
+                                        cv2.LINE_AA, tipLength=0.22)
+                        ms_mm = (float(np.linalg.norm(ms - foot)) * pix_mm) if pix_mm else self._tavi_ms_length
+                        if ms_mm is not None:
+                            self._put_label_2d(img, f'MS={ms_mm:.1f}mm',
+                                               0.5 * (foot + ms) + np.array([6, -6]), (255, 120, 120))
+                    if np.dot(ms - 0.5 * (h1 + h2), n) < 0:
+                        n = -n   # n pointe vers le ventricule (cote MS)
+                # ── Stent : extremites + base ventriculaire + cote ID ──
+                sp = self._tavi_stent_pose
+                if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
+                    import math as _m
+                    cx, cy = sp['center_px']
+                    halfpx = float(sp['length_mm']) * 0.5 / max(float(sp['pix_mm']), 1e-6)
+                    a = _m.radians(float(sp['axis_deg']))
+                    e1 = np.array([cx + _m.cos(a) * halfpx, cy - _m.sin(a) * halfpx])
+                    e2 = np.array([cx - _m.cos(a) * halfpx, cy + _m.sin(a) * halfpx])
+                    for e in (e1, e2):
+                        if ok(e):
+                            cv2.circle(img, ipt(e), 4, (250, 210, 60), -1, cv2.LINE_AA)
+                    d1 = float(np.dot(e1 - h1, n)); d2 = float(np.dot(e2 - h1, n))
+                    base = e1 if d1 >= d2 else e2
+                    foot_id = h1 + np.dot(base - h1, u) * u
+                    if ok(base) and ok(foot_id):
+                        cv2.arrowedLine(img, ipt(foot_id), ipt(base), (255, 160, 50), 2,
+                                        cv2.LINE_AA, tipLength=0.22)
+                        id_mm = (float(np.linalg.norm(base - foot_id)) * pix_mm) if pix_mm else self._tavi_id_mm
+                        if id_mm is not None:
+                            self._put_label_2d(img, f'ID={id_mm:.1f}mm',
+                                               0.5 * (foot_id + base) + np.array([6, 6]), (255, 180, 90))
+
+        # Points de repere par-dessus
+        for k, c in (('hinge1', (120, 210, 255)), ('hinge2', (255, 210, 120)),
+                     ('ms', (255, 110, 110))):
+            if k in proj and ok(proj[k]):
+                cv2.circle(img, ipt(proj[k]), 6, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(img, ipt(proj[k]), 4, c, -1, cv2.LINE_AA)
 
     def _export(self):
         if self._full_image is None: return
@@ -1952,48 +2444,59 @@ class FinalOverlayPanel(QWidget):
             return None
 
         vol = (mask_3d > 0).astype(np.float32)
-        if vol.sum() == 0:
-            return None
-
-        # Adaptive downsample for interactive meshing on large volumes.
-        stride = 1
-        while (max(vol.shape) / stride) > 220:
-            stride *= 2
-        if stride > 1:
-            vol = vol[::stride, ::stride, ::stride]
-
-        # Important: do not reapply C-arm angles on the 3D mesh here.
-        # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
-        # Reapplying those angles in this step causes an apparent double obliquity
-        # in the final 3D registered overlay.
-
         if vol.sum() < 8:
             return None
 
         from skimage import measure
 
+        # Garder les dimensions originales pour les projections
+        nx_orig, ny_orig, nz_orig = vol.shape
+
+        # ── Compromis qualité/vitesse adaptatif ──
+        # Petites structures (< 20M voxels) : step_size=1 (pleine résolution, rapide)
+        # Structures moyennes (20-100M) : step_size=2 (4x plus rapide, détail préservé)
+        # Grandes structures (>100M) : sous-échantillonnage voxel (8x plus rapide)
+        stride = 1
+        step_size = 1
+        if vol.size > 100_000_000:
+            stride = 2
+            vol = vol[::2, ::2, ::2]
+            step_size = 1
+        elif vol.size > 20_000_000:
+            step_size = 2
+
         try:
             verts, faces, _, _ = measure.marching_cubes(
-                vol,
-                level=0.5,
-                step_size=1,
-                allow_degenerate=False,
-            )
+                vol, level=0.5, step_size=step_size, allow_degenerate=False)
         except Exception:
             return None
-
         if verts.shape[0] < 3 or faces.shape[0] == 0:
             return None
 
-        nx, ny, nz = vol.shape
+        # Si le volume a été sous-échantillonné, rescaler les verts à la grille originale.
+        if stride > 1:
+            verts = verts * stride
+
+        # Important: do not reapply C-arm angles on the 3D mesh here.
+        # DRR/projection geometry already encodes LAO/CRAN/Table upstream.
+
+        faces_vtk = np.hstack([
+            np.full((faces.shape[0], 1), 3, dtype=np.int64),
+            faces.astype(np.int64),
+        ]).ravel()
+        mesh = pv.PolyData(verts.astype(np.float32), faces_vtk).clean(tolerance=0.0)
+
+        if mesh.n_points < 3:
+            return None
+
+        # Projection des sommets (meme convention que project_mask_3d).
+        v = np.asarray(mesh.points, dtype=np.float64)
+        nx, ny, nz = nx_orig, ny_orig, nz_orig
         reg_size = float(self._reg_size)
 
-        # Projection to DRR in-plane coordinates (same convention as project_mask_3d).
-        x_plane = verts[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
-        y_plane = verts[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
-
-        # Match DRR projection convention (cran UI offset includes +180 in PA mode):
-        # this corresponds to a superior/inferior flip in 2D image coordinates.
+        x_plane = v[:, 0] * ((reg_size - 1.0) / max(nx - 1, 1))
+        y_plane = v[:, 2] * ((reg_size - 1.0) / max(nz - 1, 1))
+        # Convention DRR (offset cran +180 en PA) = flip superieur/inferieur.
         y_plane = (reg_size - 1.0) - y_plane
 
         fov_scale = self._fov_scale_for_mask(mask_3d)
@@ -2004,45 +2507,49 @@ class FinalOverlayPanel(QWidget):
 
         pts_plane = np.column_stack([x_plane, y_plane]).astype(np.float32)
         pts_plane = self._apply_registration_to_points(pts_plane)
-
-        # Overlay panel displays on fluoroscopy native size.
         if side != self._reg_size:
-            sf = float(side) / float(self._reg_size)
-            pts_plane *= sf
+            pts_plane *= float(side) / float(self._reg_size)
 
-        # Use AP axis (axis 1) as real depth axis.
-        vy = 1.0
+        # ── Profondeur (axe AP = axis 1) ──────────────────────────────────────
+        # CRUCIAL pour ne PAS aplatir : la profondeur doit avoir EXACTEMENT le
+        # meme facteur "monde par millimetre" que le plan. Le plan subit
+        # (reg_size/nx) * fov_scale * scale_recalage * (side/reg_size) ; si la
+        # profondeur n'utilise que side/nx (ancien code) elle rate scale et
+        # fov_scale (souvent >1) -> structure en crepe. On reconstruit le facteur
+        # in-plane par mm, puis on l'applique a la profondeur physique en mm.
+        vx = vy = 1.0
         if self._ct_affine is not None:
             try:
-                vy = float(abs(self._ct_affine[1, 1])) * float(stride)
+                vx = float(abs(self._ct_affine[0, 0])) or 1.0
+                vy = float(abs(self._ct_affine[1, 1])) or 1.0
             except Exception:
-                vy = 1.0
-        depth = (verts[:, 1] - ((ny - 1.0) * 0.5)) * vy
-        
-        # Determine exact XYZ scaling to prevent flattening the 3D model
-        # The 2D projection scaled X by (side / nx), we match that depth-wise
-        depth_scale = float(side) / max(nx, 1) if nx > 0 else 1.0
-        z_world = 10.0 + depth * depth_scale
+                vx = vy = 1.0
+        scale_reg = 1.0
+        if self._result is not None:
+            try:
+                scale_reg = float(self._result.get('scale', 1.0)) or 1.0
+            except Exception:
+                scale_reg = 1.0
+        # Unites monde par voxel le long de l'axe 0 in-plane (jusqu'a l'espace side) :
+        f_vox0 = (((reg_size - 1.0) / max(nx - 1, 1)) * fov_scale
+                  * scale_reg * (float(side) / reg_size))
+        # Unites monde par mm in-plane, puis profondeur physique (mm) -> monde.
+        world_per_mm = f_vox0 / max(vx, 1e-6)
+        depth_mm = (v[:, 1] - ((ny - 1.0) * 0.5)) * vy
+        z_world = 10.0 + depth_mm * world_per_mm
 
-        points_world = np.column_stack([
+        mesh.points = np.column_stack([
             pts_plane[:, 0],
             (side - 1.0) - pts_plane[:, 1],
             z_world,
         ]).astype(np.float32)
 
-        faces_vtk = np.hstack([
-            np.full((faces.shape[0], 1), 3, dtype=np.int64),
-            faces.astype(np.int64),
-        ]).ravel()
-        mesh = pv.PolyData(points_world, faces_vtk)
         mesh = mesh.clean(tolerance=0.0)
-
-        if mesh.n_points > 250000:
+        if mesh.n_points > 300000:
             try:
-                mesh = mesh.decimate_pro(0.65, preserve_topology=True)
+                mesh = mesh.decimate_pro(0.6, preserve_topology=True)
             except Exception:
                 pass
-
         return mesh
 
     def _open_3d_view(self):
@@ -2094,14 +2601,16 @@ class FinalOverlayPanel(QWidget):
             j_resolution=1,
         )
         plane.texture_map_to_plane(inplace=True)
-        plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
+        fluoro_actor = plotter.add_mesh(plane, texture=texture, name='fluoro_plane', lighting=False)
 
         added_meshes = 0
+        # Acteurs par structure pour le gestionnaire de calques (oeil + opacite).
+        # On construit TOUTES les structures disponibles afin que le basculement
+        # de visibilite soit instantane dans la vue 3D (pas de reconstruction).
+        seg_actors = {}           # name -> [fill_actor, edge_actor?]
+        seg_base_opacity = min(0.9, max(0.2, self._alpha + 0.15))
 
         for idx, (name, _) in enumerate(self._proj_masks.items()):
-            if not self._vis.get(name, True):
-                continue
-
             vol = self._seg_volumes.get(name)
             if vol is None:
                 continue
@@ -2112,13 +2621,14 @@ class FinalOverlayPanel(QWidget):
 
             color = tuple(c / 255.0 for c in self._colors.get(name, (200, 200, 200)))
 
-            plotter.add_mesh(
+            fill_actor = plotter.add_mesh(
                 mesh,
                 color=color,
-                opacity=min(0.9, max(0.2, self._alpha + 0.15)),
+                opacity=seg_base_opacity,
                 smooth_shading=True,
                 name=f'{name}_{idx}',
             )
+            actors = [fill_actor]
             try:
                 edges = mesh.extract_feature_edges(
                     boundary_edges=True,
@@ -2127,15 +2637,25 @@ class FinalOverlayPanel(QWidget):
                     non_manifold_edges=False,
                 )
                 if edges.n_points > 0:
-                    plotter.add_mesh(
+                    edge_actor = plotter.add_mesh(
                         edges,
                         color=color,
                         line_width=max(1.2, self._lw),
                         opacity=0.95,
+                        name=f'{name}_edge_{idx}',
                     )
+                    actors.append(edge_actor)
             except Exception:
                 pass
 
+            # Visibilite initiale heritee du panneau 2D.
+            visible = bool(self._vis.get(name, True))
+            for a in actors:
+                try:
+                    a.SetVisibility(visible)
+                except Exception:
+                    pass
+            seg_actors[name] = actors
             added_meshes += 1
 
         if added_meshes == 0:
@@ -2148,15 +2668,416 @@ class FinalOverlayPanel(QWidget):
             )
             return
 
+        # NB : le stent (et la mesure ID) est rendu APRES les reperes, car il a
+        # besoin de ref_3d (hinges + MS) pour orienter la profondeur et l'ID.
+
+        # ── Reperes voxel CT projetes dans le plan fluoro via le pipeline des meshes ──
+        # On utilise EXACTEMENT la meme chaine de projection que les segmentations
+        # (orthographique + recalage 2D) pour que les reperes suivent les structures.
+        ref_added = 0
+        ref_3d = {}
+        if self._tavi_ref_voxel and self._tavi_ct_shape is not None:
+            ref_palette = {
+                'hinge1': (100/255, 200/255, 255/255),
+                'hinge2': (255/255, 200/255, 100/255),
+                'ms':     (255/255, 100/255, 100/255),
+            }
+            ref_labels = {'hinge1': 'Hinge L', 'hinge2': 'Hinge R', 'ms': 'MS'}
+            for k, voxel in self._tavi_ref_voxel.items():
+                pix = self._project_voxel_to_view(voxel, self._tavi_ct_shape, side)
+                if pix is None:
+                    continue
+                px, py = pix
+                pt = (float(px), float((side - 1.0) - py), 10.0)
+                color = ref_palette.get(k, (1.0, 1.0, 1.0))
+                plotter.add_mesh(pv.Sphere(radius=max(3.0, side * 0.005), center=pt),
+                                  color=color, name=f'ref_{k}')
+                plotter.add_point_labels(
+                    np.array([pt], dtype=np.float32), [ref_labels.get(k, k)],
+                    font_size=12, point_color=color, text_color='white',
+                    shape_opacity=0.0, always_visible=True, name=f'ref_label_{k}',
+                )
+                ref_3d[k] = np.asarray(pt, dtype=np.float64)
+                ref_added += 1
+
+        # ── Mesure MS (statique : ligne annulaire + cote perpendiculaire) ──
+        self._draw_ms_measurement(plotter, pv, ref_3d, side)
+
+        # ── Stent (fils tresses) + ID, avec profondeur ajustable a la main ──
+        stent_added = False
+        sp = self._tavi_stent_pose
+        if sp and sp.get('center_px') and sp.get('pix_mm', 0) > 0:
+            import math as _math
+            try:
+                from core.stent_model import braided_stent_world
+                cx, cy = sp['center_px']
+                pix_mm = float(sp['pix_mm'])
+                length_px = float(sp['length_mm']) / pix_mm
+                diameter_px = float(sp['diameter_mm']) / pix_mm
+                ang = _math.radians(float(sp['axis_deg']))
+                axis_plot = np.array([_math.cos(ang), _math.sin(ang), 0.0], dtype=np.float64)
+                center0 = np.array([float(cx), float((side - 1.0) - cy), 8.0], dtype=np.float64)
+                half = length_px * 0.5
+                # Direction ventriculaire le long de l'axe (vers le MS si dispo)
+                vent = axis_plot.copy()
+                ms_pt = ref_3d.get('ms')
+                if ms_pt is not None and float(np.dot(np.asarray(ms_pt) - center0, axis_plot)) < 0:
+                    vent = -axis_plot
+                verts_w, faces = braided_stent_world(
+                    diameter_mm=float(diameter_px), length_mm=float(length_px),
+                    center_world=center0, axis_world=axis_plot,
+                    n_wires=24, braid_angle_deg=45.0,
+                    wire_radius_mm=max(0.5, 0.18 / max(pix_mm, 1e-6)),
+                    n_pts=110, tube_sides=5)
+                faces_pv = np.hstack([
+                    np.full((faces.shape[0], 1), 3, dtype=np.int64),
+                    faces.astype(np.int64)]).ravel()
+                stent_actor = plotter.add_mesh(
+                    pv.PolyData(verts_w.astype(np.float32), faces_pv),
+                    color=(0.98, 0.85, 0.25), opacity=0.92,
+                    smooth_shading=True, name='stent_recale')
+                stent_added = True
+            except Exception:
+                stent_actor = None
+
+        # ── Mesure ID + slider de profondeur (hors du try ci-dessus pour que le
+        #    slider ne soit JAMAIS avale par une exception de construction du mesh) ──
+        if stent_added:
+            # ID initial au repos
+            ends0 = (center0 + axis_plot * half, center0 - axis_plot * half)
+            id_mm0 = self._id_mm_from_plot(ref_3d, ends0, pix_mm)
+            self._draw_id_and_risk(plotter, pv, ref_3d, side, ends0, id_mm0)
+
+            def _update_stent_z(z_val):
+                try:
+                    stent_actor.SetPosition(0.0, 0.0, float(z_val))
+                except Exception:
+                    pass
+                try:
+                    plotter.render()
+                except Exception:
+                    pass
+
+            try:
+                plotter.add_slider_widget(
+                    _update_stent_z,
+                    rng=[-side * 0.4, side * 0.4], value=0.0,
+                    title='Stent Z',
+                    pointa=(0.73, 0.13), pointb=(0.97, 0.13),
+                    color='#f0d020', style='modern', event_type='always')
+            except TypeError:
+                plotter.add_slider_widget(
+                    _update_stent_z,
+                    rng=[-side * 0.4, side * 0.4], value=0.0,
+                    title='Stent Z',
+                    pointa=(0.73, 0.13), pointb=(0.97, 0.13),
+                    color='#f0d020', style='modern')
+        else:
+            self._draw_id_and_risk(plotter, pv, ref_3d, side, None, self._tavi_id_mm)
+
+        # Slider profondeur fluoroscopie (bas gauche)
+        def _set_fluoro_depth(value):
+            fluoro_actor.SetPosition(0, 0, float(value))
+
+        try:
+            plotter.add_slider_widget(
+                _set_fluoro_depth,
+                rng=[-side * 0.4, side * 0.4], value=0.0,
+                title='Fluoro Z',
+                pointa=(0.03, 0.13), pointb=(0.27, 0.13),
+                color='#8fa5cc', style='modern', event_type='always')
+        except TypeError:
+            plotter.add_slider_widget(
+                _set_fluoro_depth,
+                rng=[-side * 0.4, side * 0.4], value=0.0,
+                title='Fluoro Z',
+                pointa=(0.03, 0.13), pointb=(0.27, 0.13),
+                color='#8fa5cc', style='modern')
+
+        # ── Gestionnaire de calques : visibilite (oeil) + opacite globale ──
+        self._add_layer_manager_3d(plotter, seg_actors, seg_base_opacity)
+
         plotter.enable_parallel_projection()
-        plotter.add_text('Maillages anatomiques 3D recales sur fluoroscopie', font_size=10)
+        title = 'Overlay 3D recale'
+        if stent_added:
+            title += ' + Stent'
+        if ref_added:
+            title += f' + {ref_added} reperes TAVI'
+        title += '  |  R = vue de face'
+        plotter.add_text(title, position='upper_right', font_size=9, color='#8892b0')
         plotter.add_axes(line_width=2)
-        plotter.camera_position = [
-            (side * 0.5, side * 0.5, side * 1.7),
-            (side * 0.5, side * 0.5, 0.0),
-            (0.0, -1.0, 0.0),
-        ]
+
+        # Vue de face : Y vers le haut, X vers la droite, Z = profondeur AP.
+        cx, cy = side * 0.5, side * 0.5
+        def _reset_view(*args):
+            plotter.camera_position = [
+                (cx, cy, side * 2.0),
+                (cx, cy, 10.0),
+                (0.0, 1.0, 0.0),
+            ]
+            try:
+                plotter.camera.zoom(0.55)   # dezoom plus large
+            except Exception:
+                pass
+            plotter.render()
+
+        _reset_view()
+        # Bouton cliquable (haut gauche) + raccourci 'r' : recadre la vue de face.
+        try:
+            plotter.add_checkbox_button_widget(
+                _reset_view, value=False, position=(12, 12), size=34,
+                color_on='#4f9cf9', color_off='#4f9cf9', border_size=2)
+            plotter.add_text('Reset vue de face (ou R)', position=(54, 18),
+                             font_size=10, color='#cdd5e8', name='reset_hint')
+        except Exception:
+            pass
+        plotter.add_key_event('r', lambda: _reset_view())
         plotter.show(title='Vue 3D - Overlay recale', auto_close=True)
+
+    def _add_layer_manager_3d(self, plotter, seg_actors, base_opacity):
+        """Gestionnaire de calques dans la vue 3D : un bouton oeil colore par
+        structure (afficher/masquer) + un slider d'opacite globale. Minimaliste,
+        ancre dans la fenetre de rendu sans surcharger la zone anatomique.
+        """
+        if not seg_actors:
+            return
+
+        # En-tete discret.
+        try:
+            plotter.add_text('CALQUES', position=(14, 868), font_size=10,
+                             color='#8fa5cc', name='layers_hdr')
+        except Exception:
+            pass
+
+        # Un bouton-case colore par structure, empile en haut a gauche.
+        y0, dy = 838, 30
+        for i, (name, actors) in enumerate(seg_actors.items()):
+            rgb = self._colors.get(name, (200, 200, 200))
+            hexcol = '#%02x%02x%02x' % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+            def _make_toggle(actor_list):
+                def _toggle(state):
+                    for a in actor_list:
+                        try:
+                            a.SetVisibility(bool(state))
+                        except Exception:
+                            pass
+                    plotter.render()
+                return _toggle
+
+            yi = y0 - i * dy
+            if yi < 150:        # evite de chevaucher les sliders du bas
+                break
+            try:
+                plotter.add_checkbox_button_widget(
+                    _make_toggle(actors), value=bool(self._vis.get(name, True)),
+                    position=(14, yi), size=20,
+                    color_on=hexcol, color_off='#2d3250', border_size=1)
+                plotter.add_text(str(name), position=(42, yi + 2),
+                                 font_size=9, color='#cdd5e8', name=f'layer_lbl_{i}')
+            except Exception:
+                pass
+
+        # Slider d'opacite globale des segmentations (bas centre, vert medical).
+        def _set_seg_opacity(val):
+            for actors in seg_actors.values():
+                for a in actors:
+                    try:
+                        a.GetProperty().SetOpacity(float(val))
+                    except Exception:
+                        pass
+            plotter.render()
+
+        try:
+            plotter.add_slider_widget(
+                _set_seg_opacity, rng=[0.1, 1.0], value=float(base_opacity),
+                title='Opacite segmentations',
+                pointa=(0.36, 0.13), pointb=(0.64, 0.13),
+                color='#2ecc7a', style='modern', event_type='always')
+        except TypeError:
+            plotter.add_slider_widget(
+                _set_seg_opacity, rng=[0.1, 1.0], value=float(base_opacity),
+                title='Opacite segmentations',
+                pointa=(0.36, 0.13), pointb=(0.64, 0.13),
+                color='#2ecc7a', style='modern')
+
+    def _add_dim_bracket(self, plotter, pv, p_a, p_b, label, color, name_prefix, side,
+                         line_width=4, tick_factor=0.014, label_offset_z=4.0):
+        """Dessine une "cote" entre p_a et p_b : segment + ticks + label decale.
+
+        Acteurs nommes ``{name_prefix}_main/_tick_a/_tick_b/_label`` : un meme
+        prefixe rappele REMPLACE l'ancien (utile pour le recalcul live de l'ID).
+        """
+        p_a = np.asarray(p_a, dtype=np.float64)
+        p_b = np.asarray(p_b, dtype=np.float64)
+        plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=line_width,
+                          name=f'{name_prefix}_main')
+        axis = p_b - p_a
+        n = float(np.linalg.norm(axis))
+        if n > 1e-6:
+            u = axis / n
+            perp = np.array([-u[1], u[0], 0.0])
+            pn = float(np.linalg.norm(perp))
+            if pn > 1e-6:
+                perp /= pn
+            tick_len = max(8.0, side * float(tick_factor))
+            for end_pt, suf in ((p_a, 'a'), (p_b, 'b')):
+                plotter.add_mesh(pv.Line(end_pt + perp * tick_len, end_pt - perp * tick_len),
+                                  color=color, line_width=line_width,
+                                  name=f'{name_prefix}_tick_{suf}')
+            mid = 0.5 * (p_a + p_b)
+            label_pt = mid + perp * (tick_len * 2.2) + np.array([0.0, 0.0, float(label_offset_z)])
+        else:
+            label_pt = 0.5 * (p_a + p_b) + np.array([0.0, 0.0, float(label_offset_z)])
+        plotter.add_point_labels(
+            np.array([label_pt], dtype=np.float32), [label],
+            font_size=15, point_color=color, text_color='white',
+            shape='rounded_rect', shape_color='black', shape_opacity=0.65,
+            always_visible=True, name=f'{name_prefix}_label')
+
+    def _draw_ms_measurement(self, plotter, pv, ref_3d, side):
+        """Ligne annulaire (cyan) + cote MS perpendiculaire (rouge). Statique."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms_pt = ref_3d.get('ms')
+        if h1 is None or h2 is None:
+            return
+        plotter.add_mesh(pv.Line(h1, h2), color=(90/255, 220/255, 240/255),
+                          line_width=3, name='annulus_line')
+        axis = h2 - h1
+        n_axis = float(np.linalg.norm(axis))
+        if n_axis > 1e-6 and ms_pt is not None:
+            u_an = axis / n_axis
+            proj = h1 + np.dot(ms_pt - h1, u_an) * u_an
+            pix_mm = self._tavi_pix_mm()
+            ms_mm = self._ms_mm_from_plot(ref_3d, pix_mm) if pix_mm else self._tavi_ms_length
+            ms_label = f'MS = {ms_mm:.2f} mm' if ms_mm is not None else 'MS'
+            self._add_dim_bracket(plotter, pv, proj, ms_pt, ms_label,
+                                  (255/255, 90/255, 90/255), 'ms_dim', side, line_width=4)
+
+    def _tavi_pix_mm(self):
+        """mm/pixel calibre sur le stent (None si pas de stent)."""
+        sp = self._tavi_stent_pose
+        if sp and sp.get('pix_mm', 0) > 0:
+            return float(sp['pix_mm'])
+        return None
+
+    def _ms_mm_from_plot(self, ref_3d, pix_mm):
+        """MS (mm) = distance perpendiculaire du MS a la ligne annulaire, calculee
+        dans le MEME repere projete que les points dessines (coherence geometrie<->valeur)."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms = ref_3d.get('ms')
+        if h1 is None or h2 is None or ms is None or not pix_mm:
+            return None
+        h1 = np.asarray(h1, dtype=np.float64)[:2]
+        h2 = np.asarray(h2, dtype=np.float64)[:2]
+        ms = np.asarray(ms, dtype=np.float64)[:2]
+        u = h2 - h1
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:
+            return None
+        u = u / nu
+        rel = ms - h1
+        perp = float(np.linalg.norm(rel - np.dot(rel, u) * u))
+        return perp * float(pix_mm)
+
+    def _id_mm_from_plot(self, ref_3d, stent_ends, pix_mm):
+        """ID (mm) = distance perpendiculaire de la base ventriculaire du stent a
+        la ligne annulaire, calculee dans le repere du plotter (px canvas)."""
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2')
+        if h1 is None or h2 is None or stent_ends is None:
+            return None
+        h1 = np.asarray(h1, dtype=np.float64)[:2]
+        h2 = np.asarray(h2, dtype=np.float64)[:2]
+        e1 = np.asarray(stent_ends[0], dtype=np.float64)[:2]
+        e2 = np.asarray(stent_ends[1], dtype=np.float64)[:2]
+        u = h2 - h1
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:
+            return None
+        u = u / nu
+        n = np.array([-u[1], u[0]])
+        ms_pt = ref_3d.get('ms')
+        if ms_pt is not None:
+            ms2 = np.asarray(ms_pt, dtype=np.float64)[:2]
+            if float(np.dot(ms2 - 0.5 * (h1 + h2), n)) < 0:
+                n = -n
+            d = max(0.0, float(np.dot(e1 - h1, n)), float(np.dot(e2 - h1, n)))
+        else:
+            d = max(abs(float(np.dot(e1 - h1, n))), abs(float(np.dot(e2 - h1, n))))
+        return d * float(pix_mm)
+
+    def _draw_id_and_risk(self, plotter, pv, ref_3d, side, stent_ends, id_mm):
+        """Cote ID (base ventriculaire du stent -> ligne annulaire) + callout risque.
+
+        Redessinable a chaque changement de profondeur : les acteurs portent des
+        noms fixes donc PyVista remplace les anciens proprement.
+        """
+        h1 = ref_3d.get('hinge1'); h2 = ref_3d.get('hinge2'); ms_pt = ref_3d.get('ms')
+        if (stent_ends is not None and h1 is not None and h2 is not None
+                and id_mm is not None):
+            h1a = np.asarray(h1, dtype=np.float64)
+            h2a = np.asarray(h2, dtype=np.float64)
+            e1 = np.asarray(stent_ends[0], dtype=np.float64)
+            e2 = np.asarray(stent_ends[1], dtype=np.float64)
+            u = h2a - h1a
+            nu = float(np.linalg.norm(u))
+            if nu > 1e-6:
+                u = u / nu
+                perp = np.array([-u[1], u[0], 0.0])
+                pn = float(np.linalg.norm(perp))
+                if pn > 1e-6:
+                    perp /= pn
+                if ms_pt is not None and float(np.dot(np.asarray(ms_pt) - 0.5 * (h1a + h2a), perp)) < 0:
+                    perp = -perp
+                # base ventriculaire = extremite la plus du cote MS
+                base = e1 if float(np.dot(e1 - h1a, perp)) >= float(np.dot(e2 - h1a, perp)) else e2
+                foot = h1a + np.dot(base - h1a, u) * u   # pied de la perpendiculaire
+                foot[2] = base[2]                        # cote bien dans le plan du stent
+                self._add_dim_bracket(plotter, pv, foot, base, f'ID = {id_mm:.2f} mm',
+                                      (255/255, 160/255, 50/255), 'id_dim', side, line_width=4)
+        pix_mm = self._tavi_pix_mm()
+        ms_mm = self._ms_mm_from_plot(ref_3d, pix_mm) if pix_mm else self._tavi_ms_length
+        self._draw_risk_callout(plotter, ms_mm, id_mm)
+
+    def _draw_risk_callout(self, plotter, ms_v, id_v):
+        """Callout texte (haut gauche) : MS / ID / dMSID / niveau de risque PM."""
+        if ms_v is None and id_v is None:
+            return
+        try:
+            from core.measurements import risk_assessment, DELTA_MSID_THRESHOLD_MM
+        except Exception:
+            risk_assessment = None
+            DELTA_MSID_THRESHOLD_MM = 3.0
+        level = pm_rate = delta = None
+        if ms_v is not None and id_v is not None and risk_assessment is not None:
+            r = risk_assessment(ms_v, id_v)
+            delta = r.get('delta_msid_mm'); level = r.get('risk_level')
+            pm_rate = r.get('pm_dependency_rate')
+
+        if level == 'HIGH':
+            color = '#e05060'
+        elif level == 'LOW':
+            color = '#2ecc7a'
+        else:
+            color = '#cdd5e8'
+
+        lines = []
+        if delta is not None:
+            lines.append(f'ΔMSID = {delta:+.2f} mm')
+            if level == 'HIGH':
+                lines.append(f'Risque PM : HAUT  (~{pm_rate:.0%})' if pm_rate else 'Risque PM : HAUT')
+            elif level == 'LOW':
+                lines.append(f'Risque PM : BAS   (~{pm_rate:.1%})' if pm_rate else 'Risque PM : BAS')
+        lines += [
+            f'MS  = {ms_v:.2f} mm' if ms_v is not None else 'MS  = --',
+            f'ID   = {id_v:.2f} mm' if id_v is not None else 'ID   = --',
+        ]
+        if delta is None:
+            lines.append(f'ΔMSID = -- (< {DELTA_MSID_THRESHOLD_MM:.1f} mm = HAUT)')
+
+        try:
+            plotter.add_text('\n'.join(lines), position='upper_left',
+                             font_size=14, color=color, shadow=True, name='risk_callout')
+        except Exception:
+            pass
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._render()
