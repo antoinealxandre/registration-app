@@ -25,6 +25,12 @@ data/
 outputs/
 script/
 registration_app/__pycache__/
+stent.py
+PROJECT_CONTEXT.md
+STENT_FEATURE.md
+drr_mini.py
+.claude
+.github\copilot-instructions.md
 
 # Medical imaging / heavy binaries
 *.nii
