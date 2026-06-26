@@ -722,7 +722,7 @@ class MainWindow(QMainWindow):
         auto_info.setObjectName('dim'); auto_info.setWordWrap(True)
         sec_auto.addWidget(auto_info)
 
-        self.btn_auto = QPushButton('LANCER LE PIPELINE COMPLET')
+        self.btn_auto = QPushButton('RECALAGE AUTOMATIQUE');
         self.btn_auto.setObjectName('success')
         self.btn_auto.setStyleSheet(
             f'QPushButton{{background:#0d2a1a;border:2px solid {ACCENT2};color:{ACCENT2};'
