@@ -25,12 +25,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install numpy nibabel scipy scikit-image matplotlib PyQt5 pyqtgraph SimpleITK pandas pyvista nanodrr TotalSegmentator pynrrd
+          pip install opencv-python-headless
           pip install pyinstaller
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller registration_app.spec --clean
+          pyinstaller registration_app.spec --clean --collect-all cv2 --collect-all nibabel --collect-all SimpleITK --collect-all skimage --collect-all pyvista --collect-all TotalSegmentator --collect-all nanodrr
 
       - name: Zip the output folder
         run: |
