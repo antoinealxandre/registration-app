@@ -31,7 +31,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller registration_app.spec --clean --collect-all cv2 --collect-all nibabel --collect-all SimpleITK --collect-all skimage --collect-all pyvista --collect-all TotalSegmentator --collect-all nanodrr
+          pyinstaller registration_app.spec --clean
 
       - name: Zip the output folder
         run: |

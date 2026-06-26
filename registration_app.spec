@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas, binaries, hiddenimports = [], [], []
+
+for pkg in ['cv2', 'nibabel', 'SimpleITK', 'skimage', 'pyvista', 'TotalSegmentator', 'nanodrr', 'pandas', 'scipy', 'pyqtgraph', 'pynrrd']:
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
 
 a = Analysis(
     ['registration_app/app.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
